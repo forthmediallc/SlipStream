@@ -4,6 +4,11 @@
     "keywords": ["laravel", "deploy", "zero-downtime", "envoyer", "webhook"],
     "license": "MIT",
     "type": "library",
+    "homepage": "https://github.com/forthmediallc/SlipStream",
+    "support": {
+        "issues": "https://github.com/forthmediallc/SlipStream/issues",
+        "source": "https://github.com/forthmediallc/SlipStream"
+    },
     "authors": [
         {
             "name": "Slipstream"

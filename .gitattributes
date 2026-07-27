@@ -1,2 +1,18 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Keep development-only files out of the dist archive Composer downloads.
+# Everything below stays in the git repo — it just doesn't ship inside
+# vendor/slipstream/slipstream on every install.
+/.gitattributes     export-ignore
+/.gitignore         export-ignore
+/phpunit.xml.dist   export-ignore
+/testbench.yaml     export-ignore
+/package.json       export-ignore
+/package-lock.json  export-ignore
+/tests              export-ignore
+/preview            export-ignore
+
+# Tailwind source for the dashboard stylesheet. Only maintainers build it;
+# consumers get the pre-compiled public/app.css, which DOES ship.
+/resources/css      export-ignore
