@@ -1,0 +1,153 @@
+<?php
+
+namespace Slipstream;
+
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Support\Facades\Route;
+use Illuminate\Support\ServiceProvider;
+use Livewire\Livewire;
+use Slipstream\Console\Commands\DeployCommand;
+use Slipstream\Console\Commands\EnvApplyCommand;
+use Slipstream\Console\Commands\EnvNudgeCommand;
+use Slipstream\Console\Commands\HealthcheckCommand;
+use Slipstream\Console\Commands\HeartbeatCommand;
+use Slipstream\Console\Commands\InstallCommand;
+use Slipstream\Console\Commands\ProvisionCommand;
+use Slipstream\Console\Commands\PruneCommand;
+use Slipstream\Console\Commands\PublishCommand;
+use Slipstream\Console\Commands\RelayCommand;
+use Slipstream\Console\Commands\RollbackCommand;
+use Slipstream\Http\Middleware\AuthorizeSlipstream;
+use Slipstream\Livewire\DeployHooksPage;
+use Slipstream\Livewire\DeploymentShow;
+use Slipstream\Livewire\DeploymentsIndex;
+use Slipstream\Livewire\EnvironmentPage;
+use Slipstream\Livewire\PipelinesPage;
+use Slipstream\Livewire\ProjectChrome;
+use Slipstream\Livewire\ServersPage;
+use Slipstream\Livewire\SettingsPage;
+use Slipstream\Livewire\WebhookPage;
+use Slipstream\Settings\SettingsRepository;
+
+class SlipstreamServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this->mergeConfigFrom(__DIR__.'/../config/slipstream.php', 'slipstream');
+
+        $this->app->singleton(Slipstream::class, fn () => new Slipstream);
+        $this->app->singleton(SettingsRepository::class);
+    }
+
+    public function boot(): void
+    {
+        $this->registerPublishing();
+        $this->registerMigrations();
+        $this->registerCommands();
+        $this->registerRoutes();
+        $this->registerViews();
+        $this->registerLivewire();
+        $this->registerSchedule();
+    }
+
+    protected function registerPublishing(): void
+    {
+        if (! $this->app->runningInConsole()) {
+            return;
+        }
+
+        $this->publishes([
+            __DIR__.'/../config/slipstream.php' => config_path('slipstream.php'),
+        ], 'slipstream-config');
+
+        $this->publishes([
+            __DIR__.'/../public' => public_path('vendor/slipstream'),
+        ], 'slipstream-assets');
+
+        $this->publishes([
+            __DIR__.'/../database/migrations' => database_path('migrations'),
+        ], 'slipstream-migrations');
+    }
+
+    protected function registerMigrations(): void
+    {
+        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
+    }
+
+    protected function registerCommands(): void
+    {
+        if (! $this->app->runningInConsole()) {
+            return;
+        }
+
+        $this->commands([
+            InstallCommand::class,
+            PublishCommand::class,
+            DeployCommand::class,
+            RollbackCommand::class,
+            HealthcheckCommand::class,
+            ProvisionCommand::class,
+            HeartbeatCommand::class,
+            PruneCommand::class,
+            RelayCommand::class,
+            EnvApplyCommand::class,
+            EnvNudgeCommand::class,
+        ]);
+    }
+
+    protected function registerRoutes(): void
+    {
+        Route::group([
+            'domain' => config('slipstream.domain'),
+            'prefix' => config('slipstream.path', 'slipstream'),
+            'middleware' => config('slipstream.middleware', ['web']),
+        ], function () {
+            $this->loadRoutesFrom(__DIR__.'/../routes/web.php');
+        });
+    }
+
+    protected function registerViews(): void
+    {
+        $this->loadViewsFrom(__DIR__.'/../resources/views', 'slipstream');
+    }
+
+    protected function registerLivewire(): void
+    {
+        if (! class_exists(Livewire::class)) {
+            return;
+        }
+
+        // The dashboard gate runs on the initial GET via route middleware; make
+        // it persist onto Livewire's POST /livewire/update so actions can't be
+        // driven from a captured snapshot without re-passing the gate. Each
+        // component also re-checks in boot() as defence-in-depth.
+        Livewire::addPersistentMiddleware([
+            AuthorizeSlipstream::class,
+        ]);
+
+        Livewire::component('slipstream.project-chrome', ProjectChrome::class);
+        Livewire::component('slipstream.deployments-index', DeploymentsIndex::class);
+        Livewire::component('slipstream.deployment-show', DeploymentShow::class);
+        Livewire::component('slipstream.webhook-page', WebhookPage::class);
+        Livewire::component('slipstream.settings-page', SettingsPage::class);
+        Livewire::component('slipstream.servers-page', ServersPage::class);
+        Livewire::component('slipstream.pipelines-page', PipelinesPage::class);
+        Livewire::component('slipstream.deploy-hooks-page', DeployHooksPage::class);
+        Livewire::component('slipstream.environment-page', EnvironmentPage::class);
+    }
+
+    protected function registerSchedule(): void
+    {
+        $this->callAfterResolving(Schedule::class, function (Schedule $schedule) {
+            $schedule->command('slipstream:heartbeat')
+                ->everyMinute()
+                ->name('slipstream-heartbeat')
+                ->withoutOverlapping();
+
+            $schedule->command('slipstream:prune')
+                ->daily()
+                ->name('slipstream-prune')
+                ->withoutOverlapping();
+        });
+    }
+}

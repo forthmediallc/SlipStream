@@ -1,0 +1,9 @@
+# Recommended non-root deploy user sudoers snippet for Slipstream.
+# Install: /etc/sudoers.d/slipstream (chmod 440)
+#
+# Replace `deploy` with your deploy user and adjust service/program names
+# to match config/slipstream.php (services.fpm / horizon / reverb).
+
+deploy ALL=(root) NOPASSWD: /bin/systemctl reload php8.4-fpm, \
+                            /usr/bin/supervisorctl restart horizon, \
+                            /usr/bin/supervisorctl restart reverb

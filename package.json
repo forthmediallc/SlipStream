@@ -1,0 +1,13 @@
+{
+    "name": "slipstream-dashboard",
+    "private": true,
+    "description": "Build tooling for the Slipstream dashboard stylesheet. Maintainer-only — host apps consume the compiled public/app.css and never run this.",
+    "scripts": {
+        "build": "tailwindcss -i ./resources/css/app.css -o ./public/app.css --minify",
+        "dev": "tailwindcss -i ./resources/css/app.css -o ./public/app.css --watch"
+    },
+    "devDependencies": {
+        "@tailwindcss/cli": "^4.1.0",
+        "tailwindcss": "^4.1.0"
+    }
+}

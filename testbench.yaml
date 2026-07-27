@@ -1,0 +1,25 @@
+# Local preview harness — boots ONLY this package in a throwaway Laravel app
+# (via orchestra/testbench) so you can view the dashboard without installing
+# Slipstream into a real project. Not shipped/used at runtime.
+#
+#   composer install
+#   php vendor/bin/testbench package:discover
+#   php vendor/bin/testbench migrate --seed --seeder="Slipstream\\Preview\\PreviewSeeder" --force
+#   php vendor/bin/testbench vendor:publish --tag=slipstream-assets --force
+#   php vendor/bin/testbench serve
+#   → open http://127.0.0.1:8000/slipstream
+
+providers:
+  - Livewire\LivewireServiceProvider
+  - Slipstream\SlipstreamServiceProvider
+  - Slipstream\Preview\PreviewServiceProvider
+
+migrations:
+  - database/migrations
+
+env:
+  - APP_ENV=local
+  - APP_KEY="base64:YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
+  - DB_CONNECTION=sqlite
+  - DB_DATABASE="database/preview.sqlite"
+  - CACHE_STORE=array
