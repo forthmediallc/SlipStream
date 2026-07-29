@@ -119,6 +119,9 @@ class ServersPage extends SlipstreamComponent
             'drift' => $drift,
             'thisServer' => Slipstream::serverName(),
             'staleAfter' => $staleAfter,
+            // Drives the edit modal; a row removed from under an open modal
+            // resolves to null and simply closes it.
+            'editingServer' => $this->editingId ? Server::query()->find($this->editingId) : null,
             'pollingMs' => (int) config('slipstream.realtime.polling_ms', 1500),
         ]);
     }

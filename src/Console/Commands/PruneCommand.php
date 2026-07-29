@@ -52,6 +52,34 @@ class PruneCommand extends Command
         }
         $this->components->twoColumnDetail('Stuck deploys failed', (string) $stuck->count());
 
+        // Same watchdog for rows claimed but never started: a spawn that died
+        // before the Deployer marked "building" leaves "pending" forever.
+        // updated_at (not created_at) so a freshly claimed queued row isn't hit.
+        $n = Deployment::query()
+            ->where('status', Deployment::STATUS_PENDING)
+            ->where('updated_at', '<', now()->subMinutes($stuckMinutes))
+            ->update([
+                'status' => Deployment::STATUS_FAILED,
+                'failure_reason' => "Marked failed by watchdog: stuck in 'pending' for over {$stuckMinutes} minutes (spawned process never started).",
+                'finished_at' => now(),
+            ]);
+        $this->components->twoColumnDetail('Stuck pending deploys failed', (string) $n);
+
+        // Queued fleet actions to a server that never came back to claim them.
+        // Deploys are time-sensitive, so the window is hours, not days.
+        $queuedMaxHours = (int) config('slipstream.deploy.queued_max_hours', 24);
+        if ($queuedMaxHours > 0) {
+            $n = Deployment::query()
+                ->where('status', Deployment::STATUS_QUEUED)
+                ->where('created_at', '<', now()->subHours($queuedMaxHours))
+                ->update([
+                    'status' => Deployment::STATUS_FAILED,
+                    'failure_reason' => "Expired after {$queuedMaxHours}h queued (server offline, paused, or removed).",
+                    'finished_at' => now(),
+                ]);
+            $this->components->twoColumnDetail('Queued fleet actions expired (> '.$queuedMaxHours.'h)', (string) $n);
+        }
+
         $this->pruneEnvPushes();
 
         return self::SUCCESS;

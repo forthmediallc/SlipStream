@@ -4,6 +4,7 @@ namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
 use Slipstream\Environment\EnvSync;
+use Slipstream\Fleet\DeployQueue;
 use Slipstream\Fleet\Heartbeat;
 
 class HeartbeatCommand extends Command
@@ -12,7 +13,7 @@ class HeartbeatCommand extends Command
 
     protected $description = 'Register / refresh this node in the Slipstream fleet registry';
 
-    public function handle(Heartbeat $heartbeat, EnvSync $sync): int
+    public function handle(Heartbeat $heartbeat, EnvSync $sync, DeployQueue $queue): int
     {
         $server = $heartbeat->pulse();
 
@@ -31,6 +32,17 @@ class HeartbeatCommand extends Command
             }
         } catch (\Throwable $e) {
             $this->components->twoColumnDetail('env push', 'error: '.$e->getMessage());
+        }
+
+        // Same backstop for queued fleet deploys/rollbacks: claim this node's
+        // newest queued row and spawn it if the instant nudge never arrived.
+        try {
+            $claimed = $queue->processQueued();
+            if ($claimed) {
+                $this->components->twoColumnDetail('fleet action #'.$claimed->id, $claimed->trigger.' spawned');
+            }
+        } catch (\Throwable $e) {
+            $this->components->twoColumnDetail('fleet action', 'error: '.$e->getMessage());
         }
 
         return self::SUCCESS;

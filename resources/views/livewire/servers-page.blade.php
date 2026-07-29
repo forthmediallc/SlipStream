@@ -1,4 +1,5 @@
-<div @if($pollingMs > 0) wire:poll.{{ max($pollingMs, 5000) }}ms @endif>
+{{-- Polling pauses while the edit modal is open so a refresh can't land under it. --}}
+<div @if($pollingMs > 0 && ! $editingId) wire:poll.{{ max($pollingMs, 5000) }}ms @endif>
     @include('slipstream::livewire.partials.flash')
     <div class="ss-header">
         <div>
@@ -25,7 +26,7 @@
         </div>
     @endif
 
-    <div class="ss-card ss-card-flush">
+    <div class="ss-card ss-card-flush ss-card-overflow">
         <table class="ss-table">
             <thead>
                 <tr>
@@ -129,38 +130,52 @@
         </table>
     </div>
 
-    @if($editingId)
-        <div class="ss-card" style="margin-top:1.25rem">
-            <h2>Per-server settings</h2>
-            <div class="ss-field">
-                <label>Base URL (for webhook relay fan-out)</label>
-                <input type="url" class="ss-input" wire:model="base_url" placeholder="https://web-2.example.com">
-                @error('base_url') <span class="ss-err">{{ $message }}</span> @enderror
-                <p class="ss-muted ss-small">Directly addressable origin (no path). Required on peers when relay mode is on.</p>
-            </div>
-            <div class="ss-grid-3">
-                <div class="ss-field">
-                    <label>FPM service</label>
-                    <input type="text" class="ss-input" wire:model="fpm_service">
+    @if($editingServer)
+        <div class="ss-modal-overlay" wire:key="server-edit-modal" wire:click.self="cancelEdit"
+             x-data @keydown.escape.window="$wire.cancelEdit()">
+            <div class="ss-modal" role="dialog" aria-modal="true" aria-labelledby="ss-server-edit-title">
+                <div class="ss-modal-head">
+                    <h2 id="ss-server-edit-title">
+                        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M4 4a2 2 0 00-2 2v1h16V6a2 2 0 00-2-2H4zm14 5H2v5a2 2 0 002 2h12a2 2 0 002-2V9zM4 12a1 1 0 011-1h2a1 1 0 110 2H5a1 1 0 01-1-1z" clip-rule="evenodd"/></svg>
+                        {{ $editingServer->server_name }} settings
+                    </h2>
+                    <button type="button" class="ss-modal-close" wire:click="cancelEdit" aria-label="Close">&times;</button>
                 </div>
-                <div class="ss-field">
-                    <label>Horizon program</label>
-                    <input type="text" class="ss-input" wire:model="horizon_program">
-                </div>
-                <div class="ss-field">
-                    <label>Reverb program</label>
-                    <input type="text" class="ss-input" wire:model="reverb_program">
-                </div>
-            </div>
-            <div class="ss-field">
-                <label class="ss-check">
-                    <input type="checkbox" wire:model="run_migrations">
-                    Eligible to run fleet migrations (only one server per SHA actually migrates)
-                </label>
-            </div>
-            <div class="ss-actions">
-                <button type="button" class="ss-btn ss-btn-primary" wire:click="saveSettings">Save</button>
-                <button type="button" class="ss-btn" wire:click="cancelEdit">Cancel</button>
+                <form wire:submit="saveSettings">
+                    <div class="ss-modal-body">
+                        <div class="ss-field">
+                            <label>Base URL (for webhook relay fan-out)</label>
+                            <input type="url" class="ss-input" wire:model="base_url" placeholder="https://web-2.example.com">
+                            @error('base_url') <span class="ss-err">{{ $message }}</span> @enderror
+                            <p class="ss-muted ss-small">Directly addressable origin (no path). Required on peers when relay mode is on — it is also how this node gets instant relay, env, and deploy nudges instead of waiting for its next heartbeat.</p>
+                        </div>
+                        <div class="ss-field">
+                            <label>FPM service</label>
+                            <input type="text" class="ss-input" wire:model="fpm_service">
+                        </div>
+                        <div class="ss-field">
+                            <label>Horizon program</label>
+                            <input type="text" class="ss-input" wire:model="horizon_program">
+                        </div>
+                        <div class="ss-field">
+                            <label>Reverb program</label>
+                            <input type="text" class="ss-input" wire:model="reverb_program">
+                        </div>
+                        <div class="ss-field" style="margin-bottom:0">
+                            <label class="ss-check">
+                                <input type="checkbox" wire:model="run_migrations">
+                                Eligible to run fleet migrations (only one server per SHA actually migrates)
+                            </label>
+                        </div>
+                    </div>
+                    <div class="ss-modal-foot">
+                        <button type="button" class="ss-btn" wire:click="cancelEdit">Cancel</button>
+                        <button type="submit" class="ss-btn ss-btn-primary" wire:loading.attr="disabled">
+                            <span wire:loading.remove wire:target="saveSettings">Save</span>
+                            <span wire:loading wire:target="saveSettings">Saving…</span>
+                        </button>
+                    </div>
+                </form>
             </div>
         </div>
     @endif

@@ -118,6 +118,9 @@ return [
         // A deploy still "building" past this many minutes is treated as dead by
         // the prune watchdog and marked failed.
         'stuck_minutes' => (int) env('SLIPSTREAM_STUCK_MINUTES', 120),
+        // A fleet deploy/rollback queued for a server that never claims it
+        // (offline, paused, removed) expires after this many hours (0 = never).
+        'queued_max_hours' => (int) env('SLIPSTREAM_QUEUED_MAX_HOURS', 24),
     ],
 
     /*

@@ -248,6 +248,54 @@ class DashboardActionsTest extends TestCase
         $this->assertDatabaseHas('slipstream_activity_log', ['action' => 'server.removed']);
     }
 
+    public function test_server_edit_modal_opens_saves_and_closes(): void
+    {
+        $peer = Server::query()->create([
+            'server_name' => 'peer-edit', 'enabled' => true, 'paused' => false, 'run_migrations' => true,
+        ]);
+
+        Livewire::test(ServersPage::class)
+            ->call('edit', $peer->id)
+            ->assertSet('editingId', $peer->id)
+            ->assertViewHas('editingServer', fn ($s) => $s?->id === $peer->id)
+            ->set('base_url', 'https://peer-edit.example.com/')
+            ->set('run_migrations', false)
+            ->call('saveSettings')
+            ->assertHasNoErrors()
+            ->assertSet('editingId', null);
+
+        $peer->refresh();
+        $this->assertSame('https://peer-edit.example.com', $peer->base_url, 'trailing slash trimmed');
+        $this->assertFalse($peer->run_migrations);
+        $this->assertDatabaseHas('slipstream_activity_log', ['action' => 'server.settings_saved']);
+    }
+
+    public function test_server_edit_modal_stays_open_on_a_bad_base_url(): void
+    {
+        $peer = Server::query()->create([
+            'server_name' => 'peer-bad-url', 'enabled' => true, 'paused' => false,
+        ]);
+
+        Livewire::test(ServersPage::class)
+            ->call('edit', $peer->id)
+            ->set('base_url', 'not-a-url')
+            ->call('saveSettings')
+            ->assertHasErrors('base_url')
+            ->assertSet('editingId', $peer->id, 'modal must stay open so the error is visible');
+    }
+
+    public function test_server_edit_modal_closes_if_the_row_disappears(): void
+    {
+        $peer = Server::query()->create([
+            'server_name' => 'peer-vanishes', 'enabled' => true, 'paused' => false,
+        ]);
+
+        $component = Livewire::test(ServersPage::class)->call('edit', $peer->id);
+        $peer->delete();
+
+        $component->call('$refresh')->assertViewHas('editingServer', null);
+    }
+
     public function test_server_removal_cleans_up_env_pushes_and_snapshot(): void
     {
         $peer = Server::query()->create([

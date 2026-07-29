@@ -4,11 +4,10 @@ namespace Slipstream\Livewire;
 
 use Illuminate\Support\Collection;
 use Livewire\WithPagination;
-use Slipstream\Deploy\ProcessDetacher;
+use Slipstream\Fleet\DeployQueue;
 use Slipstream\Fleet\Drift;
 use Slipstream\Models\Deployment;
 use Slipstream\Settings\SettingsRepository;
-use Slipstream\Slipstream;
 use Slipstream\Support\Activity;
 
 class DeploymentsIndex extends SlipstreamComponent
@@ -19,37 +18,33 @@ class DeploymentsIndex extends SlipstreamComponent
 
     public string $viewMode = 'list'; // list | fleet
 
-    public function deployNow(SettingsRepository $settings, ProcessDetacher $detacher): void
+    /**
+     * Deploy the default branch on every eligible server: this node runs
+     * immediately, peers get a queued row + signed nudge (heartbeat backstop).
+     */
+    public function deployNow(SettingsRepository $settings, DeployQueue $queue): void
     {
-        $deployment = Deployment::query()->create([
-            'server_name' => Slipstream::serverName(),
+        $result = $queue->queue([
             'branch' => $settings->branch(),
             'trigger' => Deployment::TRIGGER_MANUAL,
-            'status' => Deployment::STATUS_PENDING,
             'initiator_user_id' => auth()->id(),
         ]);
 
-        try {
-            $detacher->spawnArtisan([
-                'slipstream:deploy',
-                '--deployment='.$deployment->id,
-            ]);
-            Activity::log('deploy.started', ['deployment' => $deployment->id]);
-            session()->flash('slipstream_status', "Deploy #{$deployment->id} started.");
-        } catch (\Throwable $e) {
-            $deployment->update([
-                'status' => Deployment::STATUS_FAILED,
-                'failure_reason' => $e->getMessage(),
-                'finished_at' => now(),
-            ]);
-            session()->flash('slipstream_error', 'Failed to start deploy: '.$e->getMessage());
-        }
+        Activity::log('deploy.started', [
+            'deployment' => $result['local']?->id,
+            'batch' => $result['batch'],
+            'queued_for' => $result['queued'],
+        ]);
+
+        $this->flashFleetResult('Deploy', $result);
     }
 
     /**
-     * Redeploy a specific past release by its SHA (fresh deployment record).
+     * Redeploy a specific past release by its SHA on every eligible server
+     * (fresh deployment records). The pinned SHA makes this the cleanest way
+     * to converge a drifted fleet.
      */
-    public function redeploy(int $deploymentId, ProcessDetacher $detacher): void
+    public function redeploy(int $deploymentId, DeployQueue $queue): void
     {
         $source = Deployment::query()->find($deploymentId);
         if (! $source || ! $source->sha) {
@@ -58,61 +53,43 @@ class DeploymentsIndex extends SlipstreamComponent
             return;
         }
 
-        $deployment = Deployment::query()->create([
-            'server_name' => Slipstream::serverName(),
+        $result = $queue->queue([
             'sha' => $source->sha,
             'branch' => $source->branch,
             'commit_message' => $source->commit_message,
             'commit_author' => $source->commit_author,
             'trigger' => Deployment::TRIGGER_MANUAL,
-            'status' => Deployment::STATUS_PENDING,
             'initiator_user_id' => auth()->id(),
         ]);
 
-        try {
-            $detacher->spawnArtisan([
-                'slipstream:deploy',
-                '--deployment='.$deployment->id,
-            ]);
-            Activity::log('deploy.redeploy', ['deployment' => $deployment->id, 'sha' => $source->sha]);
-            session()->flash('slipstream_status', "Redeploy #{$deployment->id} started ({$source->shortSha()}).");
-        } catch (\Throwable $e) {
-            $deployment->update([
-                'status' => Deployment::STATUS_FAILED,
-                'failure_reason' => $e->getMessage(),
-                'finished_at' => now(),
-            ]);
-            session()->flash('slipstream_error', 'Failed to start redeploy: '.$e->getMessage());
-        }
+        Activity::log('deploy.redeploy', [
+            'deployment' => $result['local']?->id,
+            'batch' => $result['batch'],
+            'sha' => $source->sha,
+            'queued_for' => $result['queued'],
+        ]);
+
+        $this->flashFleetResult("Redeploy of {$source->shortSha()}", $result);
     }
 
-    public function rollback(ProcessDetacher $detacher): void
+    /**
+     * Roll every eligible server back to its own previous release. After a
+     * uniform fleet deploy that is the same SHA everywhere.
+     */
+    public function rollback(DeployQueue $queue): void
     {
-        $deployment = Deployment::query()->create([
-            'server_name' => Slipstream::serverName(),
+        $result = $queue->queue([
             'trigger' => Deployment::TRIGGER_ROLLBACK,
-            'status' => Deployment::STATUS_PENDING,
             'initiator_user_id' => auth()->id(),
         ]);
 
-        try {
-            $detacher->spawnArtisan([
-                'slipstream:rollback',
-                '--deployment='.$deployment->id,
-            ]);
-            Activity::log('rollback.started', ['deployment' => $deployment->id]);
-            session()->flash(
-                'slipstream_status',
-                "Rollback #{$deployment->id} started. Note: code only — does not un-migrate."
-            );
-        } catch (\Throwable $e) {
-            $deployment->update([
-                'status' => Deployment::STATUS_FAILED,
-                'failure_reason' => $e->getMessage(),
-                'finished_at' => now(),
-            ]);
-            session()->flash('slipstream_error', 'Failed to start rollback: '.$e->getMessage());
-        }
+        Activity::log('rollback.started', [
+            'deployment' => $result['local']?->id,
+            'batch' => $result['batch'],
+            'queued_for' => $result['queued'],
+        ]);
+
+        $this->flashFleetResult('Rollback', $result);
     }
 
     public function render(Drift $drift)

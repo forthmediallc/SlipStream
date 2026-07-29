@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
 use Slipstream\Console\Commands\DeployCommand;
+use Slipstream\Console\Commands\DeployNudgeCommand;
 use Slipstream\Console\Commands\EnvApplyCommand;
 use Slipstream\Console\Commands\EnvNudgeCommand;
 use Slipstream\Console\Commands\HealthcheckCommand;
@@ -92,6 +93,7 @@ class SlipstreamServiceProvider extends ServiceProvider
             RelayCommand::class,
             EnvApplyCommand::class,
             EnvNudgeCommand::class,
+            DeployNudgeCommand::class,
         ]);
     }
 

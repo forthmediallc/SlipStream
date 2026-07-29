@@ -60,9 +60,9 @@
         </div>
         <div class="ss-actions">
             <button type="button" class="ss-btn ss-btn-danger" wire:click="rollback"
-                    wire:confirm="Rollback code only — this cannot un-migrate. Continue?"
+                    wire:confirm="Roll back ALL servers to their previous release? Code only — this cannot un-migrate."
                     wire:loading.attr="disabled">
-                Rollback
+                Rollback fleet
             </button>
         </div>
     </div>
@@ -78,11 +78,13 @@
     <div class="ss-toolbar ss-toolbar-split">
         <select wire:model.live="statusFilter" class="ss-input ss-input-auto">
             <option value="">All statuses</option>
+            <option value="queued">queued</option>
             <option value="pending">pending</option>
             <option value="building">building</option>
             <option value="deployed">deployed</option>
             <option value="failed">failed</option>
             <option value="rolled-back">rolled-back</option>
+            <option value="superseded">superseded</option>
         </select>
         <div class="ss-viewtoggle" role="group" aria-label="View mode">
             <button type="button" wire:click="$set('viewMode', 'list')" @class(['is-active' => $viewMode === 'list']) title="Table" aria-label="Table view" aria-pressed="{{ $viewMode === 'list' ? 'true' : 'false' }}">
@@ -117,7 +119,7 @@
                             <span class="ss-muted ss-small">{{ $head->created_at?->diffForHumans() }} · {{ $head->trigger }}</span>
                             @if($sha)
                                 <button type="button" class="ss-btn ss-btn-sm" wire:click="redeploy({{ $head->id }})"
-                                        wire:confirm="Redeploy {{ substr($sha, 0, 7) }} as a fresh release?"
+                                        wire:confirm="Redeploy {{ substr($sha, 0, 7) }} as a fresh release on ALL servers?"
                                         wire:loading.attr="disabled">
                                     Redeploy
                                 </button>
@@ -180,7 +182,7 @@
                                 <div class="ss-row-actions">
                                     @if($d->sha)
                                         <button type="button" class="ss-btn ss-btn-sm" wire:click="redeploy({{ $d->id }})"
-                                                wire:confirm="Redeploy {{ $d->shortSha() }} as a fresh release?">Redeploy</button>
+                                                wire:confirm="Redeploy {{ $d->shortSha() }} as a fresh release on ALL servers?">Redeploy</button>
                                     @endif
                                     <a href="{{ route('slipstream.deployment', $d) }}" class="ss-open" title="Open deployment #{{ $d->id }}">
                                         <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"/></svg>

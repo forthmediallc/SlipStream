@@ -426,6 +426,14 @@
   padding: 0;
   overflow: hidden;
 }
+/* Flush card that must NOT clip an absolutely-positioned child (row-action
+   dropdowns near the last rows). The table rounds its own outer corners
+   instead, so the card still looks clipped. */
+.ss-card-overflow { overflow: visible; }
+.ss-card-overflow > .ss-table thead th:first-child { border-top-left-radius: var(--ss-radius-lg); }
+.ss-card-overflow > .ss-table thead th:last-child { border-top-right-radius: var(--ss-radius-lg); }
+.ss-card-overflow > .ss-table tbody tr:last-child td:first-child { border-bottom-left-radius: var(--ss-radius-lg); }
+.ss-card-overflow > .ss-table tbody tr:last-child td:last-child { border-bottom-right-radius: var(--ss-radius-lg); }
 
 .ss-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.25rem; margin-bottom: 0.15rem; }
 .ss-grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1rem; }
@@ -603,6 +611,7 @@ a code, .ss-commit-link {
 .ss-status-deployed { color: var(--ss-ok); }
 .ss-status-failed { color: var(--ss-err); }
 .ss-status-building { color: var(--ss-warn); }
+.ss-status-queued { color: var(--ss-muted); }
 .ss-status-pending { color: var(--ss-muted); }
 .ss-status-rolled-back { color: var(--ss-violet); }
 .ss-status-superseded { color: var(--ss-faint); }
@@ -625,6 +634,7 @@ a code, .ss-commit-link {
 .ss-pill-deployed { border-left: 3px solid var(--ss-ok); }
 .ss-pill-failed { border-left: 3px solid var(--ss-err); }
 .ss-pill-building { border-left: 3px solid var(--ss-warn); }
+.ss-pill-queued { border-left: 3px solid var(--ss-faint); }
 
 /*
 |------------------------------------------------------------------------------
@@ -723,8 +733,12 @@ textarea.ss-input { min-height: 120px; font-family: var(--ss-mono); resize: vert
 .ss-table tbody tr:last-child td { border-bottom: 0; }
 .ss-table tbody tr:hover td { background: var(--ss-panel-hover); }
 .ss-subrow td { color: var(--ss-muted); font-size: 0.82rem; padding-top: 0; }
-.ss-row-drift td { box-shadow: inset 3px 0 0 var(--ss-warn); }
-.ss-row-offline td { opacity: 0.55; }
+/* One accent bar down the row's left edge — on the first cell only, or every
+   cell paints its own stripe and the row looks striped rather than flagged. */
+.ss-row-drift td:first-child { box-shadow: inset 3px 0 0 var(--ss-warn); }
+/* Fade the data cells but never the actions cell: opacity creates a stacking
+   context, which would drag an open row-action dropdown down with it. */
+.ss-row-offline td:not(:last-child) { opacity: 0.55; }
 
 /*
 |------------------------------------------------------------------------------

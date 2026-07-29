@@ -66,10 +66,10 @@ can never be driven from a stale page without re-passing it:
 3. **Per-component `boot()`** re-checks on every hydration/action (deploy, rollback, hook edits,
    `.env` writes/pushes, secret reveal) as a final backstop.
 
-**The exception — hook endpoints.** `/hooks/deploy`, `/hooks/relay`, and `/hooks/env-sync` are
-intentionally *not* behind the dashboard gate: they are unauthenticated, machine-to-machine
-POSTs verified by HMAC signature/secret (see [Security](#security)). Everything else requires
-passing the gate above.
+**The exception — hook endpoints.** `/hooks/deploy`, `/hooks/relay`, `/hooks/env-sync`, and
+`/hooks/deploy-sync` are intentionally *not* behind the dashboard gate: they are
+unauthenticated, machine-to-machine POSTs verified by HMAC signature/secret (see
+[Security](#security)). Everything else requires passing the gate above.
 
 Optional pre-swap checks (throw on failure):
 
@@ -146,8 +146,8 @@ Dashboard → **Webhook** shows the endpoint and secret for this server.
 2. On the node that receives the git webhook, enable **Relay mode**.
 3. That node fans out a signed request to each peer’s `/hooks/relay`.
 
-Peer traffic (relay + env-sync nudges) is signed with the **fleet key**, not the webhook
-secret — see [Two secrets](#two-secrets).
+Peer traffic (relay, env-sync nudges, deploy-sync nudges) is signed with the **fleet key**,
+not the webhook secret — see [Two secrets](#two-secrets).
 
 Without relay, add the same webhook URL once per server (each must be reachable without a single shared load-balanced VIP stealing the hook).
 
@@ -157,12 +157,22 @@ Default: `/slipstream`
 
 | Section | What it does |
 |---|---|
-| **Deployments** | Fleet timeline, deploy now, rollback, live logs |
+| **Deployments** | Fleet timeline, deploy now, rollback, live logs — deploy/redeploy/rollback act on **every eligible server** |
 | **Servers** | Heartbeats, pause/resume, drift, per-server services |
 | **Pipelines** | Branch patterns, auto-deploy, which servers participate |
 | **Webhook** | Endpoint, secret, delivery log, relay |
 | **Settings** | Repo, keep-N, shared paths, notifications, hooks |
 | **Environment** | Guarded editor for the shared `.env` — view/edit any server’s file and push to this server, selected servers, or the whole fleet |
+
+**Fleet-wide actions.** The Deploy modal (all servers by default, or this server only),
+Redeploy, and Rollback act on every enabled, unpaused server — no matter which node happens
+to serve the dashboard request. The serving node runs its deployment immediately; each peer
+gets a `queued` deployment row in the shared DB, an instant signed nudge if it has a
+**Base URL**, and its minute heartbeat as the reliable backstop (a missed nudge only costs
+latency). Rollback repoints each server at **its own** previous release — identical SHAs
+after a uniform deploy; Redeploy pins one SHA fleet-wide, which also makes it the cleanest
+way to converge a drifted fleet. A queued action no server claims (offline, paused, removed)
+expires after `SLIPSTREAM_QUEUED_MAX_HOURS` (default 24).
 
 Rollback is **code only** — it does not reverse database migrations. Prefer expand→contract migrations.
 
@@ -181,12 +191,20 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 | `slipstream:relay` | Fan a stored relay payload out to peers (spawned detached; not run by hand) |
 | `slipstream:env-apply` | Apply this node’s queued shared `.env` push (spawned detached by a nudge; also the manual escape hatch) |
 | `slipstream:env-nudge` | Nudge peers to apply a queued env push (spawned detached; not run by hand) |
+| `slipstream:deploy-nudge` | Nudge peers to run a queued fleet deploy/rollback (spawned detached; not run by hand — the heartbeat claims queued rows anyway) |
 
 Manual escape hatch if the app is hard-down: run `php artisan slipstream:deploy` over SSH/console.
 
 ## Multi-server notes
 
 - All nodes share the **same application database** (`slipstream_*` tables).
+- **Dashboard deploy/redeploy/rollback are fleet-wide.** Whichever node serves the request
+  runs its own deployment immediately and writes a `queued` deployment row per peer; peers
+  claim their row via an instant signed nudge (Base URL set) or their minute heartbeat.
+  There is no cross-server barrier: nodes swap at slightly different moments, so keep
+  changes compatible across that window (you already need this for webhook deploys).
+  Branch deploys resolve the branch tip per node at build time; use Redeploy (pinned SHA)
+  when you need guaranteed convergence.
 - Only one migration-eligible server runs `migrate --force` per commit (cache lock). In a
   multi-server fleet this lock **must** live on a shared cache store (Redis, database,
   memcached) — with the `file`/`array` driver each node gets its own lock and all of them
@@ -217,11 +235,12 @@ Manual escape hatch if the app is hard-down: run `php artisan slipstream:deploy`
 
 ## Security notes
 
-- The hook endpoints (`/hooks/deploy`, `/hooks/relay`, `/hooks/env-sync`) are the only
-  unauthenticated routes: HMAC/token verified, CSRF-exempt (so provider POSTs work out of the
-  box), rate limited, and body-capped. No host-app CSRF configuration is required. The
-  env-sync nudge carries no `.env` content — it is a signed, replay-window-bounded, domain-
-  separated "check your queue"; the actual content travels only through the shared database.
+- The hook endpoints (`/hooks/deploy`, `/hooks/relay`, `/hooks/env-sync`, `/hooks/deploy-sync`)
+  are the only unauthenticated routes: HMAC/token verified, CSRF-exempt (so provider POSTs work
+  out of the box), rate limited, and body-capped. No host-app CSRF configuration is required.
+  The env-sync and deploy-sync nudges carry no content — each is a signed, replay-window-
+  bounded, domain-separated "check your queue"; what actually runs travels only through the
+  shared database.
 - The dashboard gate is enforced on the initial page load **and** on every Livewire action
   (persistent middleware + an in-component check), so actions can't be driven from a stale
   page snapshot.
@@ -230,7 +249,7 @@ Manual escape hatch if the app is hard-down: run `php artisan slipstream:deploy`
 
 ## Security
 
-- Dashboard is gated; the only unauthenticated package routes are the webhook + env-sync endpoints, verified by secret/HMAC.
+- Dashboard is gated; the only unauthenticated package routes are the webhook + env-sync + deploy-sync endpoints, verified by secret/HMAC.
 - Sensitive settings, secrets, and per-node `.env` snapshots/pushes use Laravel encryption (`APP_KEY`).
 - Prefer a non-root deploy user with scoped sudo for FPM/supervisor reloads — see `stubs/sudoers-slipstream`.
 - Deploy logs (`{app_root}/deploy/logs/*.log`) are created `0600`: hook output is stored
@@ -255,7 +274,7 @@ trust each other with:
 | Key | Used for | Who sees it |
 |---|---|---|
 | **Webhook secret** | GitHub HMAC, GitLab token, Bitbucket HMAC | pasted into your git host — GitLab transmits it verbatim in every `X-Gitlab-Token` header |
-| **Fleet key** | relay fan-out + env-sync nudges between your own nodes | never leaves the fleet; each node reads it from the shared DB |
+| **Fleet key** | relay fan-out + env-sync/deploy-sync nudges between your own nodes | never leaves the fleet; each node reads it from the shared DB |
 
 They are separate because a relay push carries an arbitrary commit SHA and pipeline id — if
 one secret did both jobs, anyone who obtained the webhook secret at the provider (a git-host

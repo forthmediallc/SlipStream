@@ -3,6 +3,7 @@
         'deployed' => 'Finished',
         'failed' => 'Failed',
         'building' => 'Building',
+        'queued' => 'Queued',
         'pending' => 'Pending',
         'rolled-back' => 'Rolled back',
         'superseded' => 'Superseded',

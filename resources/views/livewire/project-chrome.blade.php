@@ -89,6 +89,27 @@
                             </div>
                         </div>
 
+                        @if(count($fleetTargets) > 1)
+                            <div class="ss-field">
+                                <label class="ss-fieldset-label">Deploy To</label>
+                                <div class="ss-radio-list">
+                                    <label class="ss-radio">
+                                        <input type="radio" wire:model.live="deployScope" value="fleet">
+                                        <span>All servers ({{ count($fleetTargets) }})</span>
+                                    </label>
+                                    <label class="ss-radio">
+                                        <input type="radio" wire:model.live="deployScope" value="this">
+                                        <span>This server only ({{ $serverName }})</span>
+                                    </label>
+                                </div>
+                                @if($deployScope === 'fleet')
+                                    <p class="ss-muted ss-small" style="margin-top:0.55rem">
+                                        This server deploys immediately; {{ implode(', ', array_values(array_diff($fleetTargets, [$serverName]))) }} pick the deploy up within seconds (nudge) or at worst on their next minute heartbeat.
+                                    </p>
+                                @endif
+                            </div>
+                        @endif
+
                         @if($hooks->isNotEmpty())
                             <div class="ss-field" style="margin-bottom:0">
                                 <label class="ss-fieldset-label">Deploy Hooks</label>

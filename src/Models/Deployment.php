@@ -8,6 +8,11 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Deployment extends Model
 {
+    // Created for a REMOTE server by a fleet-wide dashboard action; that
+    // server claims it (queued → pending) via its heartbeat or a signed nudge
+    // and runs it locally. Only ever seen on rows for other nodes.
+    public const STATUS_QUEUED = 'queued';
+
     public const STATUS_PENDING = 'pending';
 
     public const STATUS_BUILDING = 'building';
@@ -105,5 +110,15 @@ class Deployment extends Model
     public function shortSha(): ?string
     {
         return $this->sha ? substr($this->sha, 0, 7) : null;
+    }
+
+    /**
+     * Batch id shared by every row a single fleet-wide action created.
+     */
+    public function fleetBatch(): ?string
+    {
+        $batch = $this->meta['fleet_batch'] ?? null;
+
+        return is_string($batch) && $batch !== '' ? $batch : null;
     }
 }

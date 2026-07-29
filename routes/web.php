@@ -8,9 +8,9 @@ use Slipstream\Http\Middleware\AuthorizeSlipstream;
 
 // Unauthenticated — signature/token verified inside the controller. These are
 // machine-to-machine POSTs (GitHub/GitLab/Bitbucket providers, peer relay, and
-// peer env-sync nudges) that never carry a CSRF token, so the web group's CSRF
-// filter must be excluded or every delivery 419s. Rate limited to blunt abuse
-// of the open endpoints.
+// peer env-sync / deploy-sync nudges) that never carry a CSRF token, so the web
+// group's CSRF filter must be excluded or every delivery 419s. Rate limited to
+// blunt abuse of the open endpoints.
 $hookThrottle = 'throttle:'.config('slipstream.webhook.throttle', '60,1');
 
 Route::post('/hooks/deploy', [WebhookController::class, 'deploy'])
@@ -25,6 +25,10 @@ Route::post('/hooks/env-sync', [WebhookController::class, 'envSync'])
     ->withoutMiddleware([ValidateCsrfToken::class])
     ->middleware($hookThrottle)
     ->name('slipstream.hooks.env-sync');
+Route::post('/hooks/deploy-sync', [WebhookController::class, 'deploySync'])
+    ->withoutMiddleware([ValidateCsrfToken::class])
+    ->middleware($hookThrottle)
+    ->name('slipstream.hooks.deploy-sync');
 
 // Dashboard — gated by the Slipstream::auth() callback / viewSlipstream gate.
 Route::middleware([AuthorizeSlipstream::class])->group(function () {

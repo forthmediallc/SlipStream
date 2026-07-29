@@ -6,6 +6,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Routing\Controller;
 use Slipstream\Webhooks\DeployIngress;
+use Slipstream\Webhooks\DeploySyncIngress;
 use Slipstream\Webhooks\EnvSyncIngress;
 
 class WebhookController extends Controller
@@ -30,6 +31,14 @@ class WebhookController extends Controller
      * Signed env-sync nudge from a peer (HMAC via X-Slipstream-Signature).
      */
     public function envSync(Request $request, EnvSyncIngress $ingress): Response
+    {
+        return $ingress->handle($request);
+    }
+
+    /**
+     * Signed deploy-queue nudge from a peer (HMAC via X-Slipstream-Signature).
+     */
+    public function deploySync(Request $request, DeploySyncIngress $ingress): Response
     {
         return $ingress->handle($request);
     }
