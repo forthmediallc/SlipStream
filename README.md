@@ -93,6 +93,7 @@ Published as `config/slipstream.php`:
 | `server_name` | This node’s fleet identity (`SLIPSTREAM_SERVER`) |
 | `views.*` | Enable/disable dashboard sections |
 | `deploy.keep_releases` | How many releases to retain (default 5) |
+| `deploy.keep_failed_releases` | How many failed releases to keep as `<release>.failed` for inspection (default 1, `0` deletes them) |
 
 Re-publish after package upgrades:
 
@@ -123,7 +124,34 @@ php artisan slipstream:provision --repo=git@github.com:org/app.git
 php artisan slipstream:deploy
 ```
 
-Point your web server document root at `{app_root}/current/public`.
+Point your web server document root at `{app_root}/current/public`, and add the
+`$realpath_root` fastcgi params — see `stubs/nginx-slipstream.conf`. They are required with
+symlinked releases: without them FPM keys opcache on the unchanging `current/...` path and
+keeps serving the previous release after a swap.
+
+Run `php artisan slipstream:doctor` before the first deploy. It checks ownership, the layout,
+sudo, git access, and webhook reachability in one pass, and names the fix for anything it finds.
+
+### Adopting a site that is already live
+
+If the app is already serving from a plain checkout at `{app_root}/public`, there is nothing to
+point a document root at yet: `current` only exists after a successful deploy. Rather than take
+the site down while you restructure, let provision adopt the checkout:
+
+```bash
+php artisan slipstream:provision --repo=git@github.com:org/app.git --adopt
+```
+
+That copies the live tree as-is into `releases/<ts>_<sha>`, links the shared `.env` and
+`storage/` the way a deployed release links them, and points `current` at it. No composer, no
+hooks, no health gate — the release is byte-identical to what is serving, so both document roots
+serve the same bytes and the nginx flip is zero-downtime and can wait until you are ready.
+
+Afterwards the app files left at the layout root are inert (the root is detected from the layout
+markers), and the adopted release ages out through normal keep-N pruning.
+
+Note: `current` must not already exist as a real directory. The deploy swap replaces it with
+`mv -T`, which fails against one.
 
 Ensure the scheduler runs (heartbeats and future scheduled work):
 
@@ -182,11 +210,12 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 |---|---|
 | `slipstream:install` | Publish assets, migrate, seed defaults |
 | `slipstream:publish` | Re-publish config / assets / migrations |
-| `slipstream:provision` | Deploy key, bare mirror, directory layout |
+| `slipstream:provision` | Deploy key, bare mirror, directory layout; `--adopt` converts a live checkout into the first release |
+| `slipstream:doctor` | Diagnose layout, ownership, sudo, git access and webhook reachability — with the fix for each |
 | `slipstream:deploy` | Run a deploy (or `--deployment=`) |
 | `slipstream:rollback` | Point `current` at the previous release |
 | `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom) |
-| `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, and apply any queued env push (scheduled every minute) |
+| `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, and fail deploys orphaned by a killed process (scheduled every minute) |
 | `slipstream:prune` | Trim old deploy events + webhook deliveries + terminal env pushes; fail stuck deploys/applies (scheduled daily) |
 | `slipstream:relay` | Fan a stored relay payload out to peers (spawned detached; not run by hand) |
 | `slipstream:env-apply` | Apply this node’s queued shared `.env` push (spawned detached by a nudge; also the manual escape hatch) |
@@ -233,11 +262,55 @@ Manual escape hatch if the app is hard-down: run `php artisan slipstream:deploy`
   queue/nudge/apply path is inert, the `/hooks/env-sync` route `404`s, and the editor
   collapses to a this-server-only tool.
 
+## Troubleshooting
+
+Start with `php artisan slipstream:doctor` — it checks everything below at once and prints the
+fix next to each problem. The entries here explain the symptoms, which rarely resemble the cause.
+
+**GitHub returns `419 Page Expired`.** The host app's CSRF middleware is intercepting the hook.
+Slipstream excludes the hook paths both per-route and through the framework's static exclusion
+list, which covers subclasses of Laravel's middleware — but an app with its own CSRF middleware
+that doesn't extend Laravel's is beyond a package's reach. Add the exclusion yourself in
+`bootstrap/app.php`:
+
+```php
+$middleware->validateCsrfTokens(except: ['slipstream/hooks/*']);
+```
+
+`slipstream:doctor` POSTs to your own hook URL and reports which case you are in: `401` means
+the endpoint is healthy and enforcing signatures, `419` means CSRF is still in the way.
+
+**The browser shows `No input file specified`, or 500s are blank with an empty `laravel.log`.**
+Both are permission problems wearing a disguise. If the web server cannot traverse `releases/`
+(e.g. it is `0750` and owned by root), `$realpath_root` resolves to an empty string and FPM is
+handed a bare `/index.php`. If `storage/` is not writable by the pool user, Monolog cannot write
+the log that would have named the problem. Deploys must run as the FPM pool user; `provision`
+and `doctor` both compare the two and print the `chown` to run.
+
+**A deploy fails with `There are no commands defined in the "slipstream" namespace`.** The
+deployed commit predates the package. Releases are built from git, not from your working
+directory, so `composer require` alone is not enough:
+
+```bash
+git add composer.json composer.lock && git commit -m "Add Slipstream" && git push
+```
+
+**A release fails and you want to look at it.** The failed release is kept as
+`releases/<ts>_<sha>.failed` (`SLIPSTREAM_KEEP_FAILED_RELEASES`, default 1) with its shared
+links intact, so you can `cd` into it and re-run the failing command in the environment it
+failed in. Note that a rollback never selects one of these.
+
+**A deploy is stuck showing `building`.** Interrupted deploys record themselves as failed on
+SIGINT/SIGTERM; a process killed outright (SIGKILL, OOM, reboot) is caught by the watchdog in
+the minute heartbeat, after `SLIPSTREAM_STUCK_MINUTES` (default 120).
+
 ## Security notes
 
 - The hook endpoints (`/hooks/deploy`, `/hooks/relay`, `/hooks/env-sync`, `/hooks/deploy-sync`)
   are the only unauthenticated routes: HMAC/token verified, CSRF-exempt (so provider POSTs work
-  out of the box), rate limited, and body-capped. No host-app CSRF configuration is required.
+  out of the box), rate limited, and body-capped. No host-app CSRF configuration is required in
+  the common case — if your app registers its own CSRF middleware that doesn't extend Laravel's,
+  see [Troubleshooting](#troubleshooting).
   The env-sync and deploy-sync nudges carry no content — each is a signed, replay-window-
   bounded, domain-separated "check your queue"; what actually runs travels only through the
   shared database.
@@ -252,6 +325,9 @@ Manual escape hatch if the app is hard-down: run `php artisan slipstream:deploy`
 - Dashboard is gated; the only unauthenticated package routes are the webhook + env-sync + deploy-sync endpoints, verified by secret/HMAC.
 - Sensitive settings, secrets, and per-node `.env` snapshots/pushes use Laravel encryption (`APP_KEY`).
 - Prefer a non-root deploy user with scoped sudo for FPM/supervisor reloads — see `stubs/sudoers-slipstream`.
+  Service reloads run `sudo -n`, so a missing NOPASSWD rule fails immediately with a warning
+  instead of blocking a detached deploy on a password prompt it can never answer. `provision`
+  and `doctor` both check the rule is in place.
 - Deploy logs (`{app_root}/deploy/logs/*.log`) are created `0600`: hook output is stored
   verbatim, in that file and in `slipstream_deployment_events`, and it routinely echoes
   secrets. Nothing redacts it.
