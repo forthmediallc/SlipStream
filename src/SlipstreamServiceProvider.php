@@ -8,6 +8,7 @@ use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
 use Slipstream\Console\Commands\DeployCommand;
 use Slipstream\Console\Commands\DeployNudgeCommand;
+use Slipstream\Console\Commands\DoctorCommand;
 use Slipstream\Console\Commands\EnvApplyCommand;
 use Slipstream\Console\Commands\EnvNudgeCommand;
 use Slipstream\Console\Commands\HealthcheckCommand;
@@ -88,6 +89,7 @@ class SlipstreamServiceProvider extends ServiceProvider
             RollbackCommand::class,
             HealthcheckCommand::class,
             ProvisionCommand::class,
+            DoctorCommand::class,
             HeartbeatCommand::class,
             PruneCommand::class,
             RelayCommand::class,
