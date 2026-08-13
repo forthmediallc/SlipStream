@@ -3,6 +3,7 @@
 namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
+use Slipstream\Deploy\AdoptInPlace;
 use Slipstream\Diagnostics\FpmPool;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
@@ -16,7 +17,9 @@ class ProvisionCommand extends Command
                             {--key-name=id_ed25519_slipstream : Deploy key filename under ~/.ssh}
                             {--skip-key : Do not generate a deploy key}
                             {--skip-clone : Do not clone the bare mirror}
-                            {--fpm-user= : PHP-FPM pool user (default: detected from the pool config)}';
+                            {--fpm-user= : PHP-FPM pool user (default: detected from the pool config)}
+                            {--adopt : Adopt an existing checkout as the first release without asking}
+                            {--no-adopt : Never adopt the checkout}';
 
     protected $description = 'One-time server bootstrap: deploy key, bare mirror, directory layout';
 
@@ -65,15 +68,95 @@ class ProvisionCommand extends Command
             $this->components->twoColumnDetail('Shared .env', '<fg=green>present</>');
         }
 
+        $adopted = $this->maybeAdopt($root);
+
         $this->newLine();
-        $this->components->info('Provision complete. First deploy:');
-        $this->line('  php artisan slipstream:deploy');
-        $this->newLine();
-        $this->line('  Web server: point the document root at '.$root.'/current/public and add the');
-        $this->line('  $realpath_root fastcgi params — see '.$this->nginxStubPath());
+        if ($adopted) {
+            $this->components->info('Provision complete. One manual step, whenever you are ready:');
+            $this->components->bulletList([
+                'nginx: change  root '.$root.'/public;  →  root '.$root.'/current/public;',
+                'add the $realpath_root fastcgi params — see '.$this->nginxStubPath(),
+                'sudo nginx -t && sudo systemctl reload nginx',
+            ]);
+            $this->line('  Both paths serve identical bytes right now, so the flip is zero-downtime.');
+            $this->line('  The app files left at '.$root.' are inert once it is done.');
+            $this->newLine();
+            $this->line('  Then: php artisan slipstream:deploy   (builds a fresh release from git)');
+        } else {
+            $this->components->info('Provision complete. First deploy:');
+            $this->line('  php artisan slipstream:deploy');
+            $this->newLine();
+            $this->line('  Web server: point the document root at '.$root.'/current/public and add the');
+            $this->line('  $realpath_root fastcgi params — see '.$this->nginxStubPath());
+        }
+
         $this->line('  Verify the whole setup with: php artisan slipstream:doctor');
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Turn a live plain checkout into the release layout, so the operator never
+     * has to choose between a document root that does not exist yet and a
+     * deploy with no signal for when it is safe to flip.
+     */
+    protected function maybeAdopt(string $root): bool
+    {
+        if ($this->option('no-adopt')) {
+            return false;
+        }
+
+        $adopter = new AdoptInPlace($root);
+
+        if ($adopter->currentIsRealDirectory()) {
+            $this->newLine();
+            $this->components->error('current exists as a real directory at '.$adopter->currentPath());
+            $this->line('  The deploy swap replaces it with `mv -T`, which fails against a real directory.');
+            $this->line('  Remove or rename it, then run provision again.');
+
+            return false;
+        }
+
+        if (! $adopter->isPlainCheckout()) {
+            return false;
+        }
+
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->components->warn('Skipping adopt-in-place: it targets the production Linux layout.');
+
+            return false;
+        }
+
+        if (! $this->option('adopt')) {
+            if (! $this->input->isInteractive()) {
+                $this->newLine();
+                $this->components->warn('This looks like a plain checkout with no release layout.');
+                $this->line('  Re-run with --adopt to convert it into the first release without downtime.');
+
+                return false;
+            }
+
+            $this->newLine();
+            $this->line('  This looks like a plain checkout serving from '.$root.'/public.');
+            $this->line('  Adopting copies it as-is into releases/ and links current at it — no build,');
+            $this->line('  no downtime, and the document root can be flipped afterwards at your leisure.');
+
+            if (! $this->confirm('Adopt this checkout as the first release?', true)) {
+                return false;
+            }
+        }
+
+        try {
+            $release = $adopter->adopt();
+        } catch (\Throwable $e) {
+            $this->components->error('Adopt failed: '.$e->getMessage());
+
+            return false;
+        }
+
+        $this->components->info('Adopted this checkout as '.$release);
+
+        return true;
     }
 
     protected function nginxStubPath(): string
