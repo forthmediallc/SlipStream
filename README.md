@@ -148,9 +148,10 @@ hooks, no health gate — the release is byte-identical to what is serving, so b
 serve the same bytes and the nginx flip is zero-downtime and can wait until you are ready.
 
 Configured `shared_paths` are handled properly: the live data is moved into its shared location
-and linked from the release, so uploads written after the flip survive the next deploy. (This is
-also the only thing that seeds a shared path from an existing site — a plain first deploy creates
-it empty, because the directory is usually gitignored.)
+and **both** roots are linked at it — the release and the old document root — so uploads taken
+before the flip and after it land in the same place and survive the next deploy. (This is also
+the only thing that seeds a shared path from an existing site — a plain first deploy creates it
+empty, because the directory is usually gitignored.)
 
 Afterwards the app files left at the layout root are inert (the root is detected from the layout
 markers), and the adopted release ages out through normal keep-N pruning.
@@ -295,12 +296,16 @@ the log that would have named the problem. Deploys must run as the FPM pool user
 and `doctor` both compare the two and print the `chown` to run.
 
 **A deploy fails with `There are no commands defined in the "slipstream" namespace`.** The
-deployed commit predates the package. Releases are built from git, not from your working
-directory, so `composer require` alone is not enough:
+deployed commit predates the package. Releases are built from the mirrored branch, not from your
+working directory, so `composer require` alone is not enough — and neither is committing without
+pushing:
 
 ```bash
 git add composer.json composer.lock && git commit -m "Add Slipstream" && git push
 ```
+
+`slipstream:doctor` answers this against the bare mirror at the configured branch, which is
+exactly what the next deploy installs, so an unpushed commit is reported rather than passed.
 
 **A release fails and you want to look at it.** The failed release is kept as
 `releases/<ts>_<sha>.failed` (`SLIPSTREAM_KEEP_FAILED_RELEASES`, default 1) with its shared

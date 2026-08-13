@@ -48,4 +48,42 @@ abstract class TestCase extends BaseTestCase
     {
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
     }
+
+    /**
+     * Recursively delete a temp tree, symlink- and dotfile-safe.
+     *
+     * One shared implementation on purpose: the per-test copies this replaced
+     * had diverged — one followed symlinks (a teardown walking `current ->`
+     * would delete the target's contents), most missed dotfiles (leaking .env
+     * and .git into the system temp dir every run), and one leaned on
+     * GLOB_BRACE, which PHP only defines where libc's glob has it (not musl).
+     */
+    protected function removeTree(string $path): void
+    {
+        if (is_link($path)) {
+            // A link to a directory needs rmdir on Windows, unlink elsewhere.
+            @unlink($path) || @rmdir($path);
+
+            return;
+        }
+
+        if (is_file($path)) {
+            @chmod($path, 0666);
+            @unlink($path);
+
+            return;
+        }
+
+        if (! is_dir($path)) {
+            return;
+        }
+
+        foreach (scandir($path) ?: [] as $name) {
+            if ($name !== '.' && $name !== '..') {
+                $this->removeTree($path.DIRECTORY_SEPARATOR.$name);
+            }
+        }
+
+        @rmdir($path);
+    }
 }

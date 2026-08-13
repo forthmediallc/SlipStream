@@ -5,6 +5,7 @@ namespace Slipstream\Tests\Unit;
 use RuntimeException;
 use Slipstream\Deploy\AdoptInPlace;
 use Slipstream\Tests\TestCase;
+use Symfony\Component\Process\Process;
 
 class AdoptInPlaceTest extends TestCase
 {
@@ -23,25 +24,6 @@ class AdoptInPlaceTest extends TestCase
         $this->removeTree($this->root);
 
         parent::tearDown();
-    }
-
-    protected function removeTree(string $path): void
-    {
-        if (is_link($path)) {
-            // On Windows a link to a directory needs rmdir, not unlink.
-            @unlink($path) || @rmdir($path);
-
-            return;
-        }
-        if (is_file($path)) {
-            @unlink($path);
-
-            return;
-        }
-        foreach (glob($path.DIRECTORY_SEPARATOR.'*') ?: [] as $child) {
-            $this->removeTree($child);
-        }
-        @rmdir($path);
     }
 
     protected function file(string $relative, string $contents = 'x'): void
@@ -245,6 +227,47 @@ class AdoptInPlaceTest extends TestCase
         $this->assertFileExists($shared.DIRECTORY_SEPARATOR.'scan-2.jpg');
     }
 
+    /**
+     * The OLD document root keeps serving until the operator flips nginx —
+     * provision explicitly invites postponing that. If its shared paths stay
+     * real directories, every upload taken in that window lands where nothing
+     * links and disappears from the site at the flip. Both roots must write
+     * through to the same shared directory from the moment of adoption.
+     */
+    public function test_the_old_document_root_writes_through_to_shared_after_adoption(): void
+    {
+        $this->requireSymlinks();
+        $this->checkout();
+        $this->file('public/images/patient/scan-1.jpg', 'jpeg bytes');
+
+        (new AdoptInPlace($this->root, ['public/images/patient' => 'shared/images/patient']))->adopt();
+
+        $old = $this->root.DIRECTORY_SEPARATOR.'public'.DIRECTORY_SEPARATOR.'images'.DIRECTORY_SEPARATOR.'patient';
+        $shared = $this->root.DIRECTORY_SEPARATOR.'shared'.DIRECTORY_SEPARATOR.'images'.DIRECTORY_SEPARATOR.'patient';
+
+        $this->assertTrue(is_link($old), 'the live path must become a link into shared');
+        $this->assertSame(realpath($shared), realpath($old));
+
+        // An upload through the still-serving old root...
+        file_put_contents($old.DIRECTORY_SEPARATOR.'uploaded-before-flip.jpg', 'between adopt and flip');
+
+        // ...is already where the new root serves from.
+        $this->assertFileExists($this->root.'/current/public/images/patient/uploaded-before-flip.jpg');
+        $this->assertFileExists($shared.DIRECTORY_SEPARATOR.'uploaded-before-flip.jpg');
+    }
+
+    public function test_adopting_requires_the_shared_env(): void
+    {
+        $this->checkout();
+        unlink($this->root.DIRECTORY_SEPARATOR.'.env');
+
+        $adopter = new AdoptInPlace($this->root);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessageMatches('/\.env/');
+        $adopter->adopt();
+    }
+
     public function test_shared_paths_that_already_exist_are_filled_in_not_overwritten(): void
     {
         $this->requireSymlinks();
@@ -259,9 +282,123 @@ class AdoptInPlaceTest extends TestCase
         $this->assertFileExists($shared.DIRECTORY_SEPARATOR.'already-shared.jpg');
         $this->assertFileExists($shared.DIRECTORY_SEPARATOR.'from-checkout.jpg');
         $this->assertTrue(is_link($release.'/public/images/patient'));
+        $this->assertTrue(
+            is_link($this->root.'/public/images/patient'),
+            'the old root converges on shared in the merge case too'
+        );
     }
 
-    public function test_it_names_the_release_after_head_when_the_checkout_is_a_git_repo(): void
+    /**
+     * The layout's shared/ tree sits next to releases/, so a naive recursive
+     * copy pulls every upload the site has ever taken into the release — bytes
+     * that are never read (the release links to shared) and are deleted again
+     * when the release ages out of keep-N.
+     */
+    public function test_it_does_not_copy_the_layout_shared_tree_into_the_release(): void
+    {
+        $this->requireSymlinks();
+        $this->checkout();
+        $this->file('public/images/patient/live.jpg', 'live');
+        $this->file('shared/images/patient/already-shared.jpg', str_repeat('S', 2048));
+
+        $release = (new AdoptInPlace($this->root, ['public/images/patient' => 'shared/images/patient']))->adopt();
+
+        $this->assertFileDoesNotExist(
+            $release.'/shared/images/patient/already-shared.jpg',
+            'the adopted release must not hold a second copy of the shared tree'
+        );
+        $this->assertTrue(is_link($release.'/public/images/patient'));
+    }
+
+    /**
+     * A shared destination is allowed to live inside a directory the release
+     * needs; skipping it must not take the whole parent with it.
+     */
+    public function test_excluding_a_shared_destination_does_not_empty_its_parent(): void
+    {
+        $this->requireSymlinks();
+        $this->checkout();
+        $this->file('public/uploads/photo.jpg', 'photo');
+
+        $release = (new AdoptInPlace($this->root, ['public/uploads' => 'public/uploads']))->adopt();
+
+        $this->assertFileExists($release.'/public/index.php', 'public/ must survive');
+        $this->assertFileExists($release.'/public/build/app.css');
+        $this->assertTrue(is_link($release.'/public/uploads'));
+    }
+
+    /**
+     * Adopting promises a release byte-identical to what is serving. A subtree
+     * the copy cannot read must abort the adopt, not arrive as a silently empty
+     * directory that only surfaces after the document root is flipped.
+     */
+    public function test_an_unreadable_subtree_aborts_the_adopt_instead_of_being_skipped(): void
+    {
+        $this->requireSymlinks();
+
+        if (DIRECTORY_SEPARATOR === '\\' || (function_exists('posix_geteuid') && posix_geteuid() === 0)) {
+            $this->markTestSkipped('needs POSIX permissions and a non-root user.');
+        }
+
+        $this->checkout();
+        $this->file('app/Secret/Critical.php', '<?php // load-bearing');
+        chmod($this->root.DIRECTORY_SEPARATOR.'app'.DIRECTORY_SEPARATOR.'Secret', 0000);
+
+        $adopter = new AdoptInPlace($this->root);
+        $thrown = null;
+
+        try {
+            $adopter->adopt();
+        } catch (RuntimeException $e) {
+            $thrown = $e;
+        } finally {
+            chmod($this->root.DIRECTORY_SEPARATOR.'app'.DIRECTORY_SEPARATOR.'Secret', 0755);
+        }
+
+        $this->assertNotNull($thrown, 'adopt() must abort rather than produce a partial release');
+        $this->assertStringContainsString('Cannot read', $thrown->getMessage());
+
+        // The half-copied tree must not survive to block the retry.
+        $this->assertSame([], $adopter->existingReleases());
+        $this->assertTrue($adopter->isPlainCheckout(), 'a failed adopt must stay retryable');
+    }
+
+    /**
+     * A shared path that cannot be moved into place must fail loudly: left
+     * unchecked it produces a dangling link that 404s every upload the moment
+     * the document root is flipped.
+     */
+    public function test_a_failed_shared_path_move_throws_rather_than_dangling(): void
+    {
+        $this->requireSymlinks();
+
+        if (DIRECTORY_SEPARATOR === '\\' || (function_exists('posix_geteuid') && posix_geteuid() === 0)) {
+            $this->markTestSkipped('needs POSIX permissions and a non-root user.');
+        }
+
+        $this->checkout();
+        $this->file('public/images/patient/live.jpg', 'live');
+        mkdir($this->root.DIRECTORY_SEPARATOR.'shared', 0555, true);
+
+        $adopter = new AdoptInPlace($this->root, ['public/images/patient' => 'shared/images/patient']);
+        $thrown = null;
+
+        try {
+            $adopter->adopt();
+        } catch (RuntimeException $e) {
+            $thrown = $e;
+        } finally {
+            chmod($this->root.DIRECTORY_SEPARATOR.'shared', 0755);
+        }
+
+        $this->assertNotNull($thrown, 'a shared path that cannot be moved must abort the adopt');
+
+        // The live data is still where the site is serving it from.
+        $this->assertFileExists($this->root.'/public/images/patient/live.jpg');
+        $this->assertSame([], $adopter->existingReleases());
+    }
+
+    public function test_a_checkout_without_git_falls_back_to_an_adopted_release_name(): void
     {
         $this->requireSymlinks();
         $this->checkout();
@@ -271,5 +408,35 @@ class AdoptInPlaceTest extends TestCase
         // No git repo here, so the fallback name is used and no SHA is recorded.
         $this->assertStringEndsWith('_adopted', $release);
         $this->assertFileDoesNotExist($release.'/RELEASE_SHA');
+    }
+
+    public function test_it_names_the_release_after_head_when_the_checkout_is_a_git_repo(): void
+    {
+        $this->requireSymlinks();
+        $this->checkout();
+
+        if (! $this->gitAvailable()) {
+            $this->markTestSkipped('git is not available.');
+        }
+
+        foreach ([['init', '-q'], ['config', 'user.email', 't@example.com'], ['config', 'user.name', 'T'],
+            ['add', '-A'], ['commit', '-qm', 'initial']] as $args) {
+            (new Process(['git', ...$args], $this->root))->mustRun();
+        }
+
+        $head = trim((new Process(['git', 'rev-parse', 'HEAD'], $this->root))->mustRun()->getOutput());
+
+        $release = (new AdoptInPlace($this->root))->adopt();
+
+        $this->assertStringEndsWith('_'.substr($head, 0, 7), $release);
+        $this->assertSame($head, trim((string) file_get_contents($release.'/RELEASE_SHA')));
+    }
+
+    protected function gitAvailable(): bool
+    {
+        $probe = new Process(DIRECTORY_SEPARATOR === '\\' ? ['where', 'git'] : ['which', 'git']);
+        $probe->run();
+
+        return $probe->isSuccessful();
     }
 }
