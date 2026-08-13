@@ -53,10 +53,42 @@ class ShellRunner
         $code = $process->getExitCode() ?? 1;
 
         if ($throw && $code !== 0) {
-            throw new RuntimeException("Command failed (exit {$code}): {$display}");
+            throw new RuntimeException("Command failed (exit {$code}): {$display}".$this->outputTail($buffer));
         }
 
         return [$code, $buffer];
+    }
+
+    /**
+     * The last few non-empty output lines, formatted for an exception message.
+     *
+     * The message becomes the deployment's failure_reason, so without this the
+     * only thing that survives a failed step is its exit code.
+     */
+    protected function outputTail(string $buffer, int $lines = 5, int $maxTotal = 2000): string
+    {
+        $tail = [];
+
+        foreach (array_reverse(preg_split("/\r\n|\n|\r/", $buffer) ?: []) as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+
+            $tail[] = mb_strimwidth($line, 0, 400, '…');
+
+            if (count($tail) >= $lines) {
+                break;
+            }
+        }
+
+        if ($tail === []) {
+            return '';
+        }
+
+        $out = "\n  │ ".implode("\n  │ ", array_reverse($tail));
+
+        return mb_strlen($out) > $maxTotal ? mb_substr($out, 0, $maxTotal).'…' : $out;
     }
 
     /**
