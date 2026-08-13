@@ -12,6 +12,7 @@ use Slipstream\Notifications\DeployNotifier;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\GitRef;
+use Slipstream\Support\Sudo;
 
 /**
  * 1:1 port of deploy/deploy.sh step pipeline.
@@ -662,23 +663,7 @@ class Deployer
 
     protected function sudoPrefix(): string
     {
-        $configured = config('slipstream.deploy.use_sudo');
-        if ($configured === true || $configured === '1' || $configured === 1) {
-            return 'sudo ';
-        }
-        if ($configured === false || $configured === '0' || $configured === 0) {
-            return '';
-        }
-
-        // Auto: sudo only when not root (Unix).
-        if (DIRECTORY_SEPARATOR === '\\') {
-            return '';
-        }
-        if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
-            return '';
-        }
-
-        return 'sudo ';
+        return Sudo::prefix();
     }
 
     protected function warnIfUnsharedLockStore(?string $storeName, string $step): void

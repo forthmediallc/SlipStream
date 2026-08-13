@@ -7,6 +7,7 @@ use Slipstream\Fleet\Heartbeat;
 use Slipstream\Models\Deployment;
 use Slipstream\Notifications\DeployNotifier;
 use Slipstream\Slipstream;
+use Slipstream\Support\Sudo;
 
 /**
  * Port of deploy/rollback.sh — code-only rollback; does not un-migrate.
@@ -194,7 +195,7 @@ class Rollbacker
         }
 
         $shell = new ShellRunner($this->log);
-        $sudo = (function_exists('posix_geteuid') && posix_geteuid() === 0) ? '' : 'sudo ';
+        $sudo = Sudo::prefix();
 
         if (config('slipstream.services.restart_fpm', true) !== false) {
             $fpm = (string) config('slipstream.services.fpm', 'php8.4-fpm');

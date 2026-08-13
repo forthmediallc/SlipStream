@@ -5,6 +5,7 @@ namespace Slipstream\Console\Commands;
 use Illuminate\Console\Command;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
+use Slipstream\Support\Sudo;
 use Symfony\Component\Process\Process;
 
 class ProvisionCommand extends Command
@@ -143,6 +144,37 @@ class ProvisionCommand extends Command
                 'fpm ('.$fpm.')',
                 $process->isSuccessful() ? '<fg=green>enabled</>' : '<fg=yellow>check manually</>'
             );
+
+            $this->checkSudoReload($fpm);
+        }
+    }
+
+    /**
+     * Deploys reload FPM with `sudo -n`, so a missing NOPASSWD rule is worth
+     * finding here rather than at the end of the first deploy.
+     */
+    protected function checkSudoReload(string $fpm): void
+    {
+        if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+            return;
+        }
+
+        $allowed = Sudo::canRunWithoutPassword(['systemctl', 'reload', $fpm]);
+
+        if ($allowed === null) {
+            return;
+        }
+
+        $this->components->twoColumnDetail(
+            'sudo systemctl reload',
+            $allowed ? '<fg=green>permitted</>' : '<fg=yellow>needs a password</>'
+        );
+
+        if (! $allowed) {
+            $this->components->warn('Deploys cannot reload FPM without a password prompt.');
+            $this->line('  Install the sudoers rule as /etc/sudoers.d/slipstream (chmod 440) before the first deploy:');
+            $this->line('    '.Sudo::stubPath());
+            $this->line('  Without it the new release is swapped in but FPM keeps serving cached old code.');
         }
     }
 }
