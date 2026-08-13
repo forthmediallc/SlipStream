@@ -7,6 +7,7 @@ use Slipstream\Deploy\StuckDeploymentsSweeper;
 use Slipstream\Environment\EnvSync;
 use Slipstream\Fleet\DeployQueue;
 use Slipstream\Fleet\Heartbeat;
+use Slipstream\Slipstream;
 
 class HeartbeatCommand extends Command
 {
@@ -47,10 +48,12 @@ class HeartbeatCommand extends Command
         }
 
         // Deploys orphaned by a killed process used to sit in "building" on the
-        // dashboard until the daily prune. Sweeping here costs one indexed
-        // query a minute and makes the dashboard honest within the minute.
+        // dashboard until the daily prune; sweeping here makes the dashboard
+        // honest within the minute. Scoped to THIS node's rows so its
+        // stuck_minutes only ever judges its own deploys — the daily prune
+        // stays fleet-wide as the backstop for nodes that died outright.
         try {
-            $swept = $sweeper->sweep();
+            $swept = $sweeper->sweep(Slipstream::serverName());
             foreach (array_filter($swept) as $bucket => $count) {
                 $this->components->twoColumnDetail('stuck '.$bucket.' deploys failed', (string) $count);
             }

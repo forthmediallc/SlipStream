@@ -25,24 +25,6 @@ class DoctorCommandTest extends TestCase
         parent::tearDown();
     }
 
-    protected function removeTree(string $path): void
-    {
-        if (is_link($path)) {
-            @unlink($path) || @rmdir($path);
-
-            return;
-        }
-        if (is_file($path)) {
-            @unlink($path);
-
-            return;
-        }
-        foreach (glob($path.DIRECTORY_SEPARATOR.'*') ?: [] as $child) {
-            $this->removeTree($child);
-        }
-        @rmdir($path);
-    }
-
     /**
      * A layout with nothing set up: the checks should name the gaps rather than
      * blow up.

@@ -19,27 +19,53 @@ class FpmPool
     ];
 
     /**
-     * The first `user = …` from the FPM pool configs, or null when there is no
-     * pool config to read (non-Linux, unusual layout, unreadable directory).
+     * The FPM pool user, or null when it cannot be answered with confidence.
      *
-     * A box with several PHP versions installed has several pool directories.
-     * The configured service name (php8.4-fpm) says which one is actually
-     * serving this app, so look there first and only then fall back to any.
+     * Null means "no pool config found" OR "several pools with different
+     * users" — callers print chown commands from this answer, and a confident
+     * guess at the wrong pool user is a paste-ready way to take the site down.
+     * detectUsers() lists the candidates so a caller can say WHY it declined
+     * and point at --fpm-user.
      *
      * @param  list<string>|null  $globs  overridable for tests
      */
     public static function detectUser(?array $globs = null): ?string
     {
+        $users = self::detectUsers($globs);
+
+        return count($users) === 1 ? $users[0] : null;
+    }
+
+    /**
+     * Distinct pool users from the first glob tier that has any.
+     *
+     * Tiers matter: a box with several PHP versions has several pool
+     * directories, and the configured service name (php8.4-fpm) says which
+     * one serves this app — its pools must answer before some other
+     * version's, but ambiguity WITHIN a tier (two pools, two users) is real
+     * and must surface rather than be resolved by glob() sort order.
+     *
+     * @param  list<string>|null  $globs
+     * @return list<string>
+     */
+    public static function detectUsers(?array $globs = null): array
+    {
         foreach ($globs ?? self::globsForConfiguredService() as $glob) {
+            $users = [];
+
             foreach (glob($glob) ?: [] as $file) {
                 $user = self::userFromConfig($file);
-                if ($user !== null) {
-                    return $user;
+                if ($user !== null && ! in_array($user, $users, true)) {
+                    $users[] = $user;
                 }
+            }
+
+            if ($users !== []) {
+                return $users;
             }
         }
 
-        return null;
+        return [];
     }
 
     /**

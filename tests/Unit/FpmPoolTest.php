@@ -19,10 +19,7 @@ class FpmPoolTest extends TestCase
 
     protected function tearDown(): void
     {
-        foreach (glob($this->dir.DIRECTORY_SEPARATOR.'*') ?: [] as $file) {
-            @unlink($file);
-        }
-        @rmdir($this->dir);
+        $this->removeTree($this->dir);
 
         parent::tearDown();
     }
@@ -63,6 +60,47 @@ class FpmPoolTest extends TestCase
         $this->pool('www.conf', "[www]\nlisten = /run/php/php8.4-fpm.sock\n");
 
         $this->assertNull(FpmPool::detectUser($this->globs()));
+    }
+
+    /**
+     * Two pools, two users: glob() sort order must not pick the winner —
+     * callers print chown commands from this answer, and a confident guess at
+     * the wrong pool user is a paste-ready outage.
+     */
+    public function test_two_pools_with_different_users_is_ambiguous(): void
+    {
+        $this->pool('app.conf', "[app]\nuser = deploy\n");
+        $this->pool('www.conf', "[www]\nuser = www-data\n");
+
+        $this->assertNull(FpmPool::detectUser($this->globs()));
+        $this->assertSame(['deploy', 'www-data'], FpmPool::detectUsers($this->globs()));
+    }
+
+    public function test_two_pools_with_the_same_user_is_not_ambiguous(): void
+    {
+        $this->pool('app.conf', "[app]\nuser = www-data\n");
+        $this->pool('www.conf', "[www]\nuser = www-data\n");
+
+        $this->assertSame('www-data', FpmPool::detectUser($this->globs()));
+    }
+
+    /**
+     * Tiers resolve independently: pools of the configured PHP version answer
+     * before another version's pools ever get a vote.
+     */
+    public function test_an_earlier_glob_tier_wins_over_a_later_one(): void
+    {
+        $configured = $this->dir.DIRECTORY_SEPARATOR.'v84';
+        $other = $this->dir.DIRECTORY_SEPARATOR.'v81';
+        mkdir($configured, 0777, true);
+        mkdir($other, 0777, true);
+        file_put_contents($configured.DIRECTORY_SEPARATOR.'www.conf', "[www]\nuser = deploy\n");
+        file_put_contents($other.DIRECTORY_SEPARATOR.'www.conf', "[www]\nuser = www-data\n");
+
+        $this->assertSame('deploy', FpmPool::detectUser([
+            $configured.DIRECTORY_SEPARATOR.'*.conf',
+            $other.DIRECTORY_SEPARATOR.'*.conf',
+        ]));
     }
 
     public function test_it_returns_null_when_there_are_no_pool_configs(): void

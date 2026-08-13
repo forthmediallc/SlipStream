@@ -236,6 +236,9 @@ class Deployer
         $ts = gmdate('Ymd_His');
         $this->releasePath = $this->releases.DIRECTORY_SEPARATOR."{$ts}_{$short}";
         mkdir($this->releasePath, 0755, true);
+        // mkdir's mode is masked by the umask; under a hardened 0027 umask the
+        // release would come out 0750 and nginx could not traverse into it.
+        @chmod($this->releasePath, 0755);
 
         // Archive to a temp tar then extract — array-form Process, no shell pipe,
         // so a failing `git archive` surfaces its own non-zero exit instead of
@@ -344,6 +347,8 @@ class Deployer
         $this->runHooks($step, 'before');
         $this->log->stepStart($step, 'composer install…');
 
+        $this->assertSlipstreamInLockfile();
+
         $this->shell($this->releasePath)->run([
             $this->composer, 'install',
             '--no-dev', '--optimize-autoloader', '--no-interaction',
@@ -354,6 +359,26 @@ class Deployer
 
         $this->log->stepEnd($step);
         $this->runHooks($step, 'after');
+    }
+
+    /**
+     * Fail before the install a doomed lockfile would waste: the release tree
+     * is already extracted, so a lockfile that predates the package can be
+     * caught in milliseconds instead of after minutes of composer resolving
+     * exactly the old dependency set this error is about.
+     */
+    protected function assertSlipstreamInLockfile(): void
+    {
+        $lock = @file_get_contents($this->releasePath.DIRECTORY_SEPARATOR.'composer.lock');
+
+        // Unknown (missing/unparseable lockfile) is not a failure here —
+        // composer itself is about to give the authoritative answer.
+        if (ComposerLockCheck::lockLists($lock === false ? null : $lock) === false) {
+            throw new RuntimeException(
+                'The deployed commit\'s composer.lock does not include '.ComposerLockCheck::PACKAGE.'. '
+                .ComposerLockCheck::commitFirstMessage()
+            );
+        }
     }
 
     /**
@@ -472,7 +497,7 @@ class Deployer
 
         // Preserved failures have their own (smaller) retention and must not
         // consume the keep-N budget for deployable releases.
-        [$dirs] = FailedReleases::partition($all);
+        [$dirs, $failed] = FailedReleases::partition($all);
         usort($dirs, fn ($a, $b) => filemtime($b) <=> filemtime($a));
 
         foreach (array_slice($dirs, $this->keep) as $old) {
@@ -484,13 +509,34 @@ class Deployer
             $this->removePath($old);
         }
 
-        $keepFailed = (int) config('slipstream.deploy.keep_failed_releases', 1);
-        foreach (FailedReleases::prune($this->releases, $keepFailed, fn ($old) => $this->removePath($old)) as $old) {
+        foreach ($this->pruneFailedReleases($failed) as $old) {
             $this->log->info("Pruning old failed release: {$old}", $step);
         }
 
         $this->log->stepEnd($step);
         $this->runHooks($step, 'after');
+    }
+
+    /**
+     * Apply keep_failed_releases retention, never touching the live target.
+     *
+     * @param  list<string>|null  $failed  already-listed .failed dirs, or null to glob
+     * @return list<string>  the paths removed
+     */
+    protected function pruneFailedReleases(?array $failed = null): array
+    {
+        $keep = (int) config('slipstream.deploy.keep_failed_releases', 1);
+        $live = realpath($this->current) ?: '';
+
+        return FailedReleases::prune($this->releases, $keep, function (string $old) use ($live) {
+            // current pointing at a preserved failure is not a state the
+            // product produces, but deleting the served tree is the one
+            // mistake this method must never make.
+            if ($live !== '' && (realpath($old) ?: $old) === $live) {
+                return false;
+            }
+            $this->removePath($old);
+        }, $failed);
     }
 
     protected function maybeCatchUp(): void
@@ -540,7 +586,14 @@ class Deployer
             $live = realpath($this->current) ?: '';
             $rel = realpath($this->releasePath) ?: $this->releasePath;
             if ($live === '' || $rel !== $live) {
-                $this->disposeOfFailedRelease();
+                // Never let filesystem cleanup stop the row update below: an
+                // unreadable directory throwing out of here would strand the
+                // deployment in "building" with the real error lost.
+                try {
+                    $this->disposeOfFailedRelease();
+                } catch (\Throwable $cleanup) {
+                    $this->log->warning('Could not clean up the failed release: '.$cleanup->getMessage());
+                }
             }
         }
 
@@ -585,11 +638,16 @@ class Deployer
         }
 
         $this->releasePath = $preserved;
+        // rename() keeps the build-time mtime, but retention sorts by mtime —
+        // an operator poking around inside an OLDER .failed dir (composer
+        // there rewrites files) would otherwise make it sort newer than this
+        // one and get this one pruned seconds after it was preserved.
+        @touch($preserved);
         $this->log->info("Kept the failed release for inspection: {$preserved}");
 
         // Prune here as well as in stepPrune: when every deploy fails, a
         // successful prune step never runs and these would accumulate forever.
-        foreach (FailedReleases::prune($this->releases, $keep, fn ($old) => $this->removePath($old)) as $old) {
+        foreach ($this->pruneFailedReleases() as $old) {
             $this->log->info("Pruning old failed release: {$old}");
         }
     }

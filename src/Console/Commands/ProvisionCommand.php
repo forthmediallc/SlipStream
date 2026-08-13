@@ -165,7 +165,7 @@ class ProvisionCommand extends Command
         $this->components->info('Adopted this checkout as '.$release);
 
         foreach ($sharedPaths as $releaseRelative => $sharedRelative) {
-            $this->line("  shared path {$releaseRelative} → {$sharedRelative} (moved out of the release and linked)");
+            $this->line("  shared path {$releaseRelative} → {$sharedRelative} (moved into shared; both roots now link to it)");
         }
 
         return true;
@@ -193,18 +193,33 @@ class ProvisionCommand extends Command
                 // mkdir's mode is masked by the umask, so set it explicitly.
                 @chmod($path, $mode);
                 $this->line("  created {$path}");
-
-                continue;
             }
+        }
 
-            // An earlier provision created releases/ at 0750; widening it here
-            // saves an operator the "No input file specified" hunt.
-            $current = @fileperms($path);
-            if ($current !== false && ($current & 0777) !== $mode && $mode === 0755) {
-                if (@chmod($path, $mode)) {
-                    $this->line(sprintf('  fixed permissions on %s (%04o → %04o)', $path, $current & 0777, $mode));
-                }
-            }
+        $this->repairReleasesTraversal($root.DIRECTORY_SEPARATOR.'releases');
+    }
+
+    /**
+     * An earlier provision created releases/ at 0750; adding the traverse bit
+     * here saves an operator the "No input file specified" hunt.
+     *
+     * Only the execute bits are ever added — the same rule doctor checks by.
+     * Anything more opinionated would quietly undo deliberate setups: forcing
+     * 0755 strips setgid/group-write off a 2775 layout, and "fixing" a
+     * hardened 0711 (traversable, not listable) would loosen a directory that
+     * already works.
+     */
+    protected function repairReleasesTraversal(string $releases): void
+    {
+        $current = @fileperms($releases);
+
+        if ($current === false || ($current & 0o001) === 0o001) {
+            return;
+        }
+
+        $widened = ($current & 07777) | 0o011;
+        if (@chmod($releases, $widened)) {
+            $this->line(sprintf('  added traverse bits on %s (%04o → %04o)', $releases, $current & 07777, $widened));
         }
     }
 
@@ -223,8 +238,16 @@ class ProvisionCommand extends Command
         $current = FpmPool::currentUser();
 
         if (! $poolUser) {
-            $this->components->twoColumnDetail('FPM pool user', '<fg=yellow>not detected</>');
-            $this->line('  Pass --fpm-user=<user> so provision can check ownership against it.');
+            $candidates = FpmPool::detectUsers();
+
+            if (count($candidates) > 1) {
+                $this->components->twoColumnDetail('FPM pool user', '<fg=yellow>ambiguous</>');
+                $this->line('  Pools run as '.implode(', ', $candidates).' — pass --fpm-user=<user> to say');
+                $this->line('  which one serves this app.');
+            } else {
+                $this->components->twoColumnDetail('FPM pool user', '<fg=yellow>not detected</>');
+                $this->line('  Pass --fpm-user=<user> so provision can check ownership against it.');
+            }
 
             return;
         }
@@ -240,18 +263,19 @@ class ProvisionCommand extends Command
 
         $this->newLine();
         $this->components->warn("PHP-FPM runs as '{$poolUser}' but you are running this as '{$current}'.");
-        $this->line("  Everything created here is owned by '{$current}', so the app cannot write it.");
-        $this->line("  Run deploys as '{$poolUser}', and hand over what already exists:");
-        $this->line(sprintf(
-            '    sudo chown -R %s:%s %s',
-            $poolUser,
-            $poolUser,
-            implode(' ', [
-                $root.'/releases',
-                $root.'/storage',
-                $root.'/deploy',
-            ])
-        ));
+        $this->line("  Storage written now is owned by '{$current}', so the app cannot write it.");
+        $this->line("  Either run deploys as '{$poolUser}', or hand storage to the pool user:");
+
+        // Storage only: releases/ and deploy/ belong to whoever runs deploys —
+        // chowning those to the pool user would stop a separate deploy user
+        // from creating the next release at all.
+        $storage = $root.'/storage';
+        if (is_dir($storage)) {
+            $this->line(sprintf('    sudo chown -R %s:%s %s', $poolUser, $poolUser, $storage));
+        }
+
+        $webGroup = (string) config('slipstream.deploy.web_group', 'www-data');
+        $this->line("  (Deploys themselves keep storage shared via chgrp {$webGroup} + g+rwX.)");
         $this->newLine();
     }
 

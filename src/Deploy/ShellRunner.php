@@ -67,6 +67,12 @@ class ShellRunner
      */
     protected function outputTail(string $buffer, int $lines = 5, int $maxTotal = 2000): string
     {
+        // A deploy buffer is routinely megabytes (composer, npm build). Splitting
+        // all of it and reversing the array to read five lines allocates the
+        // whole thing twice over; the last few lines cannot be further back than
+        // the trailing slice, so only that is worth parsing.
+        $buffer = substr($buffer, -($lines + 1) * 4096);
+
         $tail = [];
 
         foreach (array_reverse(preg_split("/\r\n|\n|\r/", $buffer) ?: []) as $line) {

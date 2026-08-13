@@ -64,7 +64,7 @@ class DeployNotifier
             $lines[] = 'Commit: '.$deployment->commit_message;
         }
         if ($deployment->failure_reason) {
-            $lines[] = 'Reason: '.$deployment->failure_reason;
+            $lines[] = 'Reason: '.$this->summarizeReason($deployment->failure_reason);
         }
 
         $text = implode("\n", $lines);
@@ -80,7 +80,9 @@ class DeployNotifier
                 'branch' => $deployment->branch,
                 'trigger' => $deployment->trigger,
                 'duration_ms' => $deployment->duration_ms,
-                'failure_reason' => $deployment->failure_reason,
+                'failure_reason' => $deployment->failure_reason === null
+                    ? null
+                    : $this->summarizeReason($deployment->failure_reason),
             ],
             'app' => config('app.name'),
             'node' => Slipstream::serverName(),
@@ -154,6 +156,26 @@ class DeployNotifier
         } catch (\Throwable $e) {
             Log::warning('Slipstream webhook notification failed: '.$this->redact($e->getMessage(), $url));
         }
+    }
+
+    /**
+     * Only the first line of a failure reason leaves the host.
+     *
+     * Since ShellRunner started appending the tail of command output to its
+     * exceptions, failure_reason carries raw hook/composer output below the
+     * first line — content the README plainly says routinely echoes secrets,
+     * and which is confined to the 0600 deploy log and the gated dashboard.
+     * Notifications go to third-party channels (Slack, Discord, mail, an
+     * arbitrary webhook), so they get the one-line summary and the dashboard
+     * keeps the detail.
+     */
+    protected function summarizeReason(string $reason): string
+    {
+        $firstLine = strtok($reason, "\n") ?: $reason;
+
+        return trim($firstLine) === trim($reason)
+            ? $reason
+            : trim($firstLine).' (full output in the deploy log)';
     }
 
     /**

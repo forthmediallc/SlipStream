@@ -119,7 +119,7 @@ return [
         'migration_lock_ttl' => (int) env('SLIPSTREAM_MIGRATION_LOCK_TTL', 900),
         'migrate_timeout' => (int) env('SLIPSTREAM_MIGRATE_TIMEOUT', 600),
         // A deploy still "building" past this many minutes is treated as dead by
-        // the watchdog (heartbeat, every minute) and marked failed.
+        // the watchdog (heartbeat, every minute) and marked failed. 0 disables.
         'stuck_minutes' => (int) env('SLIPSTREAM_STUCK_MINUTES', 120),
         // A fleet deploy/rollback queued for a server that never claims it
         // (offline, paused, removed) expires after this many hours (0 = never).

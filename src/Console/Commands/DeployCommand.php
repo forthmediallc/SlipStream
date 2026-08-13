@@ -5,6 +5,7 @@ namespace Slipstream\Console\Commands;
 use Illuminate\Console\Command;
 use Slipstream\Deploy\Deployer;
 use Slipstream\Deploy\EventLogger;
+use Slipstream\Deploy\FailedReleases;
 use Slipstream\Models\Deployment;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
@@ -23,7 +24,7 @@ class DeployCommand extends Command
     {
         $deployment = $this->resolveDeployment($settings);
 
-        $this->trapInterrupts($deployment);
+        $this->trapInterrupts();
 
         $this->info("Deploy #{$deployment->id} starting on ".Slipstream::serverName().'…');
 
@@ -64,20 +65,84 @@ class DeployCommand extends Command
      * ext-pcntl is loaded; trap() evaluates it lazily and skips the whole thing
      * where signals are unsupported (Windows).
      */
-    protected function trapInterrupts(Deployment $deployment): void
+    protected function trapInterrupts(): void
     {
-        $this->trap(fn () => [SIGINT, SIGTERM], function (int $signal) use ($deployment) {
-            Deployment::query()
-                ->whereKey($deployment->id)
-                ->whereIn('status', [Deployment::STATUS_PENDING, Deployment::STATUS_BUILDING])
-                ->update([
-                    'status' => Deployment::STATUS_FAILED,
-                    'failure_reason' => "Interrupted by operator (signal {$signal}) — the deploy process was killed mid-run.",
-                    'finished_at' => now(),
-                ]);
+        $this->trap(fn () => [SIGINT, SIGTERM], function (int $signal) {
+            $this->markInterrupted($signal);
 
             exit(128 + $signal);
         });
+    }
+
+    /**
+     * Fail every in-flight deploy row on this server and preserve its
+     * half-built release, exactly as Deployer::fail() would have.
+     *
+     * By server rather than by the row the command started with: a catch-up
+     * deploy chained by Deployer::maybeCatchUp() runs in this same process
+     * under a NEW row, and the trap was registered before that row existed.
+     * The flock guarantees at most one in-flight deploy per server, so this
+     * targets precisely the run the signal killed.
+     *
+     * Everything is best-effort inside a try: an async signal handler can fire
+     * between any two VM instructions, including with the deploy's own DB
+     * connection mid-conversation — if recording fails, the every-minute
+     * watchdog sweep is the backstop, and exiting promptly matters more.
+     */
+    public function markInterrupted(int $signal): void
+    {
+        try {
+            $inFlight = Deployment::query()
+                ->where('server_name', Slipstream::serverName())
+                ->whereIn('status', [Deployment::STATUS_PENDING, Deployment::STATUS_BUILDING])
+                ->get();
+
+            foreach ($inFlight as $deployment) {
+                Deployment::query()
+                    ->whereKey($deployment->id)
+                    ->whereIn('status', [Deployment::STATUS_PENDING, Deployment::STATUS_BUILDING])
+                    ->update([
+                        'status' => Deployment::STATUS_FAILED,
+                        'failure_reason' => "Interrupted by operator (signal {$signal}) — the deploy process was killed mid-run.",
+                        'finished_at' => now(),
+                    ]);
+
+                $this->markReleaseFailed($deployment->release_path);
+            }
+        } catch (\Throwable) {
+            // A signal handler has nowhere useful to report to; the watchdog
+            // sweep records the failure within the minute.
+        }
+    }
+
+    /**
+     * Rename the half-built release the interrupted deploy left behind.
+     *
+     * Without this the tree stays in releases/ under a name indistinguishable
+     * from a good release: it consumes a keep-N slot, blocks
+     * `provision --adopt` (which reads a populated releases/ as "layout already
+     * in use"), and is selectable as a rollback target whenever `current`
+     * cannot be resolved. Deployer::fail() marks its own failures this way; a
+     * killed process has to do it here or not at all.
+     */
+    protected function markReleaseFailed(?string $release): void
+    {
+        if (! $release || FailedReleases::isFailed($release) || ! is_dir($release)) {
+            return;
+        }
+
+        // Never touch the tree that is being served: an interrupt after the
+        // swap leaves current pointing at this release.
+        $current = Slipstream::appRoot().DIRECTORY_SEPARATOR.'current';
+        if ((realpath($current) ?: '') === (realpath($release) ?: $release)) {
+            return;
+        }
+
+        if ((int) config('slipstream.deploy.keep_failed_releases', 1) < 1) {
+            return;
+        }
+
+        @rename($release, $release.FailedReleases::SUFFIX);
     }
 
     protected function resolveDeployment(SettingsRepository $settings): Deployment

@@ -48,29 +48,13 @@ class ComposerLockCheckTest extends TestCase
         $process->mustRun();
     }
 
-    protected function removeTree(string $path): void
-    {
-        foreach (glob($path.DIRECTORY_SEPARATOR.'{,.}*', GLOB_BRACE) ?: [] as $child) {
-            if (in_array(basename($child), ['.', '..'], true)) {
-                continue;
-            }
-            if (is_dir($child)) {
-                $this->removeTree($child);
-            } else {
-                @chmod($child, 0666);
-                @unlink($child);
-            }
-        }
-        @rmdir($path);
-    }
-
-    protected function writeLock(array $packageNames): void
+    protected function writeLock(array $packageNames, array $devPackageNames = []): void
     {
         file_put_contents(
             $this->repo.DIRECTORY_SEPARATOR.'composer.lock',
             json_encode([
                 'packages' => array_map(fn ($name) => ['name' => $name], $packageNames),
-                'packages-dev' => [],
+                'packages-dev' => array_map(fn ($name) => ['name' => $name], $devPackageNames),
             ], JSON_PRETTY_PRINT)
         );
         file_put_contents($this->repo.DIRECTORY_SEPARATOR.'composer.json', '{"name":"acme/app"}');
@@ -125,5 +109,81 @@ class ComposerLockCheckTest extends TestCase
     public function test_repo_without_commits_answers_unknown(): void
     {
         $this->assertNull($this->check()->committedLockHasPackage());
+    }
+
+    /**
+     * `composer require --dev` puts the package in packages-dev, which
+     * `composer install --no-dev` — what every deploy runs — never installs.
+     * Counting it as present would bless exactly the lockfile the deploy then
+     * fails on.
+     */
+    public function test_a_dev_only_requirement_does_not_count(): void
+    {
+        $this->writeLock(['laravel/framework'], [ComposerLockCheck::PACKAGE]);
+        $this->git(['add', '-A']);
+        $this->git(['commit', '-qm', 'require --dev slipstream']);
+
+        $this->assertFalse($this->check()->committedLockHasPackage());
+    }
+
+    public function test_lock_lists_reads_a_raw_lock_body(): void
+    {
+        $lock = json_encode(['packages' => [['name' => ComposerLockCheck::PACKAGE]], 'packages-dev' => []]);
+
+        $this->assertTrue(ComposerLockCheck::lockLists($lock));
+        $this->assertFalse(ComposerLockCheck::lockLists('{"packages": []}'));
+        $this->assertNull(ComposerLockCheck::lockLists(null));
+        $this->assertNull(ComposerLockCheck::lockLists('not json'));
+    }
+
+    /**
+     * A deploy builds from the bare mirror at the configured branch, so a
+     * commit that was never pushed must not read as "ready to deploy".
+     */
+    public function test_the_mirror_answers_for_what_a_deploy_would_install(): void
+    {
+        $this->writeLock(['laravel/framework']);
+        $this->git(['add', '-A']);
+        $this->git(['commit', '-qm', 'no slipstream yet']);
+        $this->git(['branch', '-M', 'main']);
+
+        $mirror = $this->repo.'-mirror.git';
+        (new Process(['git', 'clone', '--mirror', '-q', $this->repo, $mirror]))->setTimeout(30)->mustRun();
+
+        // Committed locally, never pushed: local HEAD says yes, the mirror — the
+        // only thing a deploy reads — still says no.
+        $this->writeLock(['laravel/framework', ComposerLockCheck::PACKAGE]);
+        $this->git(['add', '-A']);
+        $this->git(['commit', '-qm', 'add slipstream']);
+
+        $check = $this->check();
+        $this->assertTrue($check->committedLockHasPackage(), 'the local commit has it');
+
+        [$inMirror, $ref] = $check->mirrorLockHasPackage($mirror, 'main');
+        $this->assertFalse($inMirror, 'the unpushed commit is not in the mirror');
+        $this->assertSame('refs/heads/main', $ref);
+
+        // After a push the mirror agrees.
+        (new Process(['git', 'push', '-q', $mirror, 'main'], $this->repo))->setTimeout(30)->mustRun();
+        [$afterPush] = $this->check()->mirrorLockHasPackage($mirror, 'main');
+        $this->assertTrue($afterPush);
+
+        $this->removeTree($mirror);
+    }
+
+    public function test_an_unknown_branch_in_the_mirror_answers_unknown(): void
+    {
+        $this->writeLock([ComposerLockCheck::PACKAGE]);
+        $this->git(['add', '-A']);
+        $this->git(['commit', '-qm', 'initial']);
+        $this->git(['branch', '-M', 'main']);
+
+        $mirror = $this->repo.'-mirror2.git';
+        (new Process(['git', 'clone', '--mirror', '-q', $this->repo, $mirror]))->setTimeout(30)->mustRun();
+
+        [$answer] = $this->check()->mirrorLockHasPackage($mirror, 'branch-that-was-never-pushed');
+        $this->assertNull($answer);
+
+        $this->removeTree($mirror);
     }
 }

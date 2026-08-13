@@ -39,22 +39,21 @@ class FailedReleases
     /**
      * Keep the newest $keep failed releases, delete the rest.
      *
-     * @param  callable(string): void  $remove
+     * @param  callable(string): (bool|void)  $remove  return false to veto one path
+     * @param  list<string>|null  $failed  already-listed .failed dirs, or null to glob
      * @return list<string>  the paths removed
      */
-    public static function prune(string $releasesDir, int $keep, callable $remove): array
+    public static function prune(string $releasesDir, int $keep, callable $remove, ?array $failed = null): array
     {
-        $failed = array_values(array_filter(
-            glob($releasesDir.DIRECTORY_SEPARATOR.'*'.self::SUFFIX, GLOB_ONLYDIR) ?: [],
-            'is_dir'
-        ));
+        $failed ??= glob($releasesDir.DIRECTORY_SEPARATOR.'*'.self::SUFFIX, GLOB_ONLYDIR) ?: [];
 
         usort($failed, fn ($a, $b) => filemtime($b) <=> filemtime($a));
 
         $removed = [];
         foreach (array_slice($failed, max(0, $keep)) as $old) {
-            $remove($old);
-            $removed[] = $old;
+            if ($remove($old) !== false) {
+                $removed[] = $old;
+            }
         }
 
         return $removed;

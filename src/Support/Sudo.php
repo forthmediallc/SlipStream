@@ -44,6 +44,12 @@ class Sudo
      * shipped sudoers stub allowlists specific commands rather than a blanket
      * rule. Returns null when the answer is unknown (Windows, no sudo binary).
      *
+     * `-k` matters as much as `-n`: without it, a cached sudo timestamp — from
+     * the `sudo tee` that installed the sudoers file seconds earlier — lets
+     * the probe succeed with no NOPASSWD rule at all. The real reload runs in
+     * a fresh detached session where no timestamp exists, so the probe must
+     * ask the question the way that session will.
+     *
      * @param  list<string>  $command
      */
     public static function canRunWithoutPassword(array $command, int $timeout = 5): ?bool
@@ -52,7 +58,7 @@ class Sudo
             return null;
         }
 
-        $probe = new \Symfony\Component\Process\Process(['sudo', '-n', '-l', ...$command]);
+        $probe = new \Symfony\Component\Process\Process(['sudo', '-k', '-n', '-l', ...$command]);
         $probe->setTimeout($timeout);
 
         try {

@@ -3,7 +3,15 @@
 #
 # Replace `deploy` with your deploy user and adjust service/program names
 # to match config/slipstream.php (services.fpm / horizon / reverb).
+#
+# Both /usr/bin and /bin variants are listed on purpose: sudoers matches the
+# command by the exact resolved path, and on merged-/usr distributions (modern
+# Debian/Ubuntu) `sudo systemctl` resolves to /usr/bin/systemctl — a rule
+# naming only /bin/systemctl silently never matches.
 
-deploy ALL=(root) NOPASSWD: /bin/systemctl reload php8.4-fpm, \
+deploy ALL=(root) NOPASSWD: /usr/bin/systemctl reload php8.4-fpm, \
+                            /bin/systemctl reload php8.4-fpm, \
                             /usr/bin/supervisorctl restart horizon, \
-                            /usr/bin/supervisorctl restart reverb
+                            /bin/supervisorctl restart horizon, \
+                            /usr/bin/supervisorctl restart reverb, \
+                            /bin/supervisorctl restart reverb
