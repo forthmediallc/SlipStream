@@ -3,6 +3,7 @@
 namespace Slipstream\Tests\Feature;
 
 use Slipstream\Fleet\Heartbeat;
+use Slipstream\Models\Deployment;
 use Slipstream\Models\Server;
 use Slipstream\Tests\TestCase;
 
@@ -28,5 +29,28 @@ class HeartbeatTest extends TestCase
         // (null → "—" in the UI), not a misleading "down".
         $this->assertNull($server->horizon_running);
         $this->assertNull($server->reverb_running);
+    }
+
+    public function test_heartbeat_fails_deploys_stuck_in_building(): void
+    {
+        $stuck = Deployment::query()->create([
+            'server_name' => 'test-node',
+            'trigger' => Deployment::TRIGGER_WEBHOOK,
+            'status' => Deployment::STATUS_BUILDING,
+            'started_at' => now()->subHours(5),
+        ]);
+
+        $fresh = Deployment::query()->create([
+            'server_name' => 'test-node',
+            'trigger' => Deployment::TRIGGER_WEBHOOK,
+            'status' => Deployment::STATUS_BUILDING,
+            'started_at' => now()->subMinutes(2),
+        ]);
+
+        $this->artisan('slipstream:heartbeat')->assertExitCode(0);
+
+        $this->assertSame(Deployment::STATUS_FAILED, $stuck->fresh()->status);
+        $this->assertStringContainsString('watchdog', $stuck->fresh()->failure_reason);
+        $this->assertSame(Deployment::STATUS_BUILDING, $fresh->fresh()->status, 'a running deploy must be left alone');
     }
 }

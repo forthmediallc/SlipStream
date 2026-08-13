@@ -4,7 +4,7 @@ namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Schema;
-use Slipstream\Models\Deployment;
+use Slipstream\Deploy\StuckDeploymentsSweeper;
 use Slipstream\Models\DeploymentEvent;
 use Slipstream\Models\EnvPush;
 use Slipstream\Models\WebhookDelivery;
@@ -21,7 +21,7 @@ class PruneCommand extends Command
 
     protected $description = 'Prune old deploy events + webhook deliveries and fail stuck in-progress deploys';
 
-    public function handle(): int
+    public function handle(StuckDeploymentsSweeper $sweeper): int
     {
         $eventDays = (int) ($this->option('events') ?? config('slipstream.logging.keep_event_days', 30));
         if ($eventDays > 0) {
@@ -35,49 +35,19 @@ class PruneCommand extends Command
             $this->components->twoColumnDetail('Webhook deliveries pruned (> '.$deliveryDays.'d)', (string) $n);
         }
 
-        // Watchdog: a deploy killed mid-run (OOM/reboot) leaves a "building" row
-        // forever. Fail anything stuck well past a plausible deploy time.
-        $stuckMinutes = (int) config('slipstream.deploy.stuck_minutes', 120);
-        $stuck = Deployment::query()
-            ->where('status', Deployment::STATUS_BUILDING)
-            ->where('started_at', '<', now()->subMinutes($stuckMinutes))
-            ->get();
+        // Long-horizon backstop for deploys orphaned by a killed process. The
+        // heartbeat runs the same sweep every minute, so by the time prune runs
+        // these counts are usually zero.
+        $swept = $sweeper->sweep();
+        $this->components->twoColumnDetail('Stuck deploys failed', (string) $swept['building']);
+        $this->components->twoColumnDetail('Stuck pending deploys failed', (string) $swept['pending']);
 
-        foreach ($stuck as $deployment) {
-            $deployment->update([
-                'status' => Deployment::STATUS_FAILED,
-                'failure_reason' => "Marked failed by watchdog: stuck in 'building' for over {$stuckMinutes} minutes (deploy process likely died).",
-                'finished_at' => now(),
-            ]);
-        }
-        $this->components->twoColumnDetail('Stuck deploys failed', (string) $stuck->count());
-
-        // Same watchdog for rows claimed but never started: a spawn that died
-        // before the Deployer marked "building" leaves "pending" forever.
-        // updated_at (not created_at) so a freshly claimed queued row isn't hit.
-        $n = Deployment::query()
-            ->where('status', Deployment::STATUS_PENDING)
-            ->where('updated_at', '<', now()->subMinutes($stuckMinutes))
-            ->update([
-                'status' => Deployment::STATUS_FAILED,
-                'failure_reason' => "Marked failed by watchdog: stuck in 'pending' for over {$stuckMinutes} minutes (spawned process never started).",
-                'finished_at' => now(),
-            ]);
-        $this->components->twoColumnDetail('Stuck pending deploys failed', (string) $n);
-
-        // Queued fleet actions to a server that never came back to claim them.
-        // Deploys are time-sensitive, so the window is hours, not days.
         $queuedMaxHours = (int) config('slipstream.deploy.queued_max_hours', 24);
         if ($queuedMaxHours > 0) {
-            $n = Deployment::query()
-                ->where('status', Deployment::STATUS_QUEUED)
-                ->where('created_at', '<', now()->subHours($queuedMaxHours))
-                ->update([
-                    'status' => Deployment::STATUS_FAILED,
-                    'failure_reason' => "Expired after {$queuedMaxHours}h queued (server offline, paused, or removed).",
-                    'finished_at' => now(),
-                ]);
-            $this->components->twoColumnDetail('Queued fleet actions expired (> '.$queuedMaxHours.'h)', (string) $n);
+            $this->components->twoColumnDetail(
+                'Queued fleet actions expired (> '.$queuedMaxHours.'h)',
+                (string) $swept['queued']
+            );
         }
 
         $this->pruneEnvPushes();

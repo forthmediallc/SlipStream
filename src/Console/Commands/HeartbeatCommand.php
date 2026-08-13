@@ -3,6 +3,7 @@
 namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
+use Slipstream\Deploy\StuckDeploymentsSweeper;
 use Slipstream\Environment\EnvSync;
 use Slipstream\Fleet\DeployQueue;
 use Slipstream\Fleet\Heartbeat;
@@ -13,7 +14,7 @@ class HeartbeatCommand extends Command
 
     protected $description = 'Register / refresh this node in the Slipstream fleet registry';
 
-    public function handle(Heartbeat $heartbeat, EnvSync $sync, DeployQueue $queue): int
+    public function handle(Heartbeat $heartbeat, EnvSync $sync, DeployQueue $queue, StuckDeploymentsSweeper $sweeper): int
     {
         $server = $heartbeat->pulse();
 
@@ -43,6 +44,18 @@ class HeartbeatCommand extends Command
             }
         } catch (\Throwable $e) {
             $this->components->twoColumnDetail('fleet action', 'error: '.$e->getMessage());
+        }
+
+        // Deploys orphaned by a killed process used to sit in "building" on the
+        // dashboard until the daily prune. Sweeping here costs one indexed
+        // query a minute and makes the dashboard honest within the minute.
+        try {
+            $swept = $sweeper->sweep();
+            foreach (array_filter($swept) as $bucket => $count) {
+                $this->components->twoColumnDetail('stuck '.$bucket.' deploys failed', (string) $count);
+            }
+        } catch (\Throwable $e) {
+            $this->components->twoColumnDetail('stuck deploy sweep', 'error: '.$e->getMessage());
         }
 
         return self::SUCCESS;

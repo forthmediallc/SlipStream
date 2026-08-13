@@ -23,6 +23,8 @@ class DeployCommand extends Command
     {
         $deployment = $this->resolveDeployment($settings);
 
+        $this->trapInterrupts($deployment);
+
         $this->info("Deploy #{$deployment->id} starting on ".Slipstream::serverName().'…');
 
         $logger = new EventLogger($deployment);
@@ -47,6 +49,35 @@ class DeployCommand extends Command
         $this->warn($deployment->failure_reason ?: $deployment->status);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Record the truth when a deploy is killed at the keyboard or by a
+     * shutting-down supervisor.
+     *
+     * SIGINT kills PHP outright, so neither the catch below nor Deployer::fail()
+     * ever runs and the row stays "building" on the dashboard until a watchdog
+     * sweep notices. The deploy lock needs no explicit release: it is an flock
+     * held on a file descriptor, so it goes when the process does.
+     *
+     * The signal list is a closure because SIGINT/SIGTERM are only defined when
+     * ext-pcntl is loaded; trap() evaluates it lazily and skips the whole thing
+     * where signals are unsupported (Windows).
+     */
+    protected function trapInterrupts(Deployment $deployment): void
+    {
+        $this->trap(fn () => [SIGINT, SIGTERM], function (int $signal) use ($deployment) {
+            Deployment::query()
+                ->whereKey($deployment->id)
+                ->whereIn('status', [Deployment::STATUS_PENDING, Deployment::STATUS_BUILDING])
+                ->update([
+                    'status' => Deployment::STATUS_FAILED,
+                    'failure_reason' => "Interrupted by operator (signal {$signal}) — the deploy process was killed mid-run.",
+                    'finished_at' => now(),
+                ]);
+
+            exit(128 + $signal);
+        });
     }
 
     protected function resolveDeployment(SettingsRepository $settings): Deployment
