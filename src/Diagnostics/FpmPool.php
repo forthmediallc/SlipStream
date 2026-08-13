@@ -22,11 +22,15 @@ class FpmPool
      * The first `user = …` from the FPM pool configs, or null when there is no
      * pool config to read (non-Linux, unusual layout, unreadable directory).
      *
+     * A box with several PHP versions installed has several pool directories.
+     * The configured service name (php8.4-fpm) says which one is actually
+     * serving this app, so look there first and only then fall back to any.
+     *
      * @param  list<string>|null  $globs  overridable for tests
      */
     public static function detectUser(?array $globs = null): ?string
     {
-        foreach ($globs ?? self::DEFAULT_GLOBS as $glob) {
+        foreach ($globs ?? self::globsForConfiguredService() as $glob) {
             foreach (glob($glob) ?: [] as $file) {
                 $user = self::userFromConfig($file);
                 if ($user !== null) {
@@ -36,6 +40,27 @@ class FpmPool
         }
 
         return null;
+    }
+
+    /**
+     * Pool globs ordered so the PHP version named by slipstream.services.fpm
+     * wins over any other version installed on the box.
+     *
+     * @return list<string>
+     */
+    public static function globsForConfiguredService(): array
+    {
+        $service = (string) config('slipstream.services.fpm', 'php8.4-fpm');
+
+        // php8.4-fpm / php8.4-fpm.service / php-fpm8.4 → 8.4
+        if (preg_match('/(\d+\.\d+)/', $service, $m) === 1) {
+            return array_merge([
+                '/etc/php/'.$m[1].'/fpm/pool.d/*.conf',
+                '/etc/opt/remi/php'.str_replace('.', '', $m[1]).'/php-fpm.d/*.conf',
+            ], self::DEFAULT_GLOBS);
+        }
+
+        return self::DEFAULT_GLOBS;
     }
 
     /**

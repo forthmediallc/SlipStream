@@ -68,7 +68,7 @@ class ProvisionCommand extends Command
             $this->components->twoColumnDetail('Shared .env', '<fg=green>present</>');
         }
 
-        $adopted = $this->maybeAdopt($root);
+        $adopted = $this->maybeAdopt($root, $settings);
 
         $this->newLine();
         if ($adopted) {
@@ -100,13 +100,14 @@ class ProvisionCommand extends Command
      * has to choose between a document root that does not exist yet and a
      * deploy with no signal for when it is safe to flip.
      */
-    protected function maybeAdopt(string $root): bool
+    protected function maybeAdopt(string $root, SettingsRepository $settings): bool
     {
         if ($this->option('no-adopt')) {
             return false;
         }
 
-        $adopter = new AdoptInPlace($root);
+        $sharedPaths = $settings->sharedPaths();
+        $adopter = new AdoptInPlace($root, $sharedPaths);
 
         if ($adopter->currentIsRealDirectory()) {
             $this->newLine();
@@ -118,6 +119,13 @@ class ProvisionCommand extends Command
         }
 
         if (! $adopter->isPlainCheckout()) {
+            // Explain a declined --adopt; silence here reads as "adopted".
+            if ($this->option('adopt')) {
+                $this->newLine();
+                $this->components->warn('Nothing to adopt.');
+                $this->line($adopter->whyNotAdoptable());
+            }
+
             return false;
         }
 
@@ -155,6 +163,10 @@ class ProvisionCommand extends Command
         }
 
         $this->components->info('Adopted this checkout as '.$release);
+
+        foreach ($sharedPaths as $releaseRelative => $sharedRelative) {
+            $this->line("  shared path {$releaseRelative} → {$sharedRelative} (moved out of the release and linked)");
+        }
 
         return true;
     }

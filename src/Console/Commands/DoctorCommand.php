@@ -98,6 +98,7 @@ class DoctorCommand extends Command
         }
 
         $mismatched = [];
+        $owners = [];
         foreach (['releases', 'storage', 'deploy'] as $dir) {
             $path = $root.DIRECTORY_SEPARATOR.$dir;
             if (! is_dir($path)) {
@@ -105,15 +106,23 @@ class DoctorCommand extends Command
             }
             $owner = FpmPool::ownerOf($path);
             if ($owner !== null && $owner !== $pool) {
-                $mismatched[] = $dir.' owned by '.$owner;
+                $mismatched[] = $path;
+                $owners[$owner] = true;
             }
         }
 
         if ($mismatched !== []) {
             return CheckResult::fail(
                 'FPM pool user',
-                "PHP-FPM runs as {$pool} but ".implode(', ', $mismatched),
-                sprintf('sudo chown -R %s:%s %s/releases %s/storage %s/deploy', $pool, $pool, $root, $root, $root)
+                sprintf(
+                    'PHP-FPM runs as %s but %s %s owned by %s',
+                    $pool,
+                    implode(', ', array_map('basename', $mismatched)),
+                    count($mismatched) === 1 ? 'is' : 'are',
+                    implode('/', array_keys($owners))
+                ),
+                // Only paths that exist, so the command can be pasted as-is.
+                sprintf('sudo chown -R %s:%s %s', $pool, $pool, implode(' ', $mismatched))
             );
         }
 
@@ -350,9 +359,23 @@ class DoctorCommand extends Command
         return CheckResult::pass('package committed', 'present in HEAD');
     }
 
+    /**
+     * POST to our own hook without a signature.
+     *
+     * Safe by construction: DeployIngress verifies the signature before it
+     * looks up a pipeline or spawns anything, so this can only ever be
+     * rejected. It does leave one rejected row in the delivery log — that row
+     * is the evidence the endpoint is reachable and enforcing signatures.
+     */
     protected function checkWebhookReachable(string $root): CheckResult
     {
-        $url = url('/'.Slipstream::path().'/hooks/deploy');
+        // route() honours slipstream.domain; url() would probe app.url and
+        // report a 404 for a dashboard served from its own subdomain.
+        try {
+            $url = route('slipstream.hooks.deploy');
+        } catch (\Throwable) {
+            $url = url('/'.Slipstream::path().'/hooks/deploy');
+        }
 
         try {
             $status = Http::timeout(5)->withoutRedirecting()->post($url)->status();

@@ -147,6 +147,11 @@ That copies the live tree as-is into `releases/<ts>_<sha>`, links the shared `.e
 hooks, no health gate — the release is byte-identical to what is serving, so both document roots
 serve the same bytes and the nginx flip is zero-downtime and can wait until you are ready.
 
+Configured `shared_paths` are handled properly: the live data is moved into its shared location
+and linked from the release, so uploads written after the flip survive the next deploy. (This is
+also the only thing that seeds a shared path from an existing site — a plain first deploy creates
+it empty, because the directory is usually gitignored.)
+
 Afterwards the app files left at the layout root are inert (the root is detected from the layout
 markers), and the adopted release ages out through normal keep-N pruning.
 
@@ -278,7 +283,9 @@ $middleware->validateCsrfTokens(except: ['slipstream/hooks/*']);
 ```
 
 `slipstream:doctor` POSTs to your own hook URL and reports which case you are in: `401` means
-the endpoint is healthy and enforcing signatures, `419` means CSRF is still in the way.
+the endpoint is healthy and enforcing signatures, `419` means CSRF is still in the way. That
+unsigned POST cannot trigger anything — the signature is verified before a pipeline is even
+looked up — but it does leave one rejected entry in the delivery log each run.
 
 **The browser shows `No input file specified`, or 500s are blank with an empty `laravel.log`.**
 Both are permission problems wearing a disguise. If the web server cannot traverse `releases/`

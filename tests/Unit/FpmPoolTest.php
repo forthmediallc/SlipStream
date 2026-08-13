@@ -70,6 +70,25 @@ class FpmPoolTest extends TestCase
         $this->assertNull(FpmPool::detectUser($this->globs()));
     }
 
+    public function test_the_configured_php_version_is_looked_at_first(): void
+    {
+        config()->set('slipstream.services.fpm', 'php8.4-fpm');
+
+        $globs = FpmPool::globsForConfiguredService();
+
+        // A box with 8.1 and 8.4 installed must not answer with whichever pool
+        // directory sorts first.
+        $this->assertStringContainsString('/etc/php/8.4/fpm/pool.d/*.conf', $globs[0]);
+        $this->assertContains('/etc/php/*/fpm/pool.d/*.conf', $globs, 'the generic glob stays as a fallback');
+    }
+
+    public function test_an_unversioned_service_name_falls_back_to_the_generic_globs(): void
+    {
+        config()->set('slipstream.services.fpm', 'php-fpm');
+
+        $this->assertSame(FpmPool::DEFAULT_GLOBS, FpmPool::globsForConfiguredService());
+    }
+
     public function test_owner_of_a_missing_path_is_null(): void
     {
         $this->assertNull(FpmPool::ownerOf($this->dir.DIRECTORY_SEPARATOR.'nope'));

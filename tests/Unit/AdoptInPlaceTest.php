@@ -111,6 +111,29 @@ class AdoptInPlaceTest extends TestCase
         $this->assertTrue((new AdoptInPlace($this->root))->isPlainCheckout());
     }
 
+    /**
+     * The common first-install path: provision, deploy, deploy fails, come back
+     * to adopt. The kept `<release>.failed` directory must not look like a
+     * layout that is already in use.
+     */
+    public function test_a_release_kept_from_a_failed_deploy_does_not_block_adoption(): void
+    {
+        $this->checkout();
+        mkdir($this->root.DIRECTORY_SEPARATOR.'releases'.DIRECTORY_SEPARATOR.'20260101_000000_abc1234.failed', 0777, true);
+
+        $adopter = new AdoptInPlace($this->root);
+
+        $this->assertTrue($adopter->isPlainCheckout());
+    }
+
+    public function test_it_explains_why_it_declined(): void
+    {
+        $this->checkout();
+        mkdir($this->root.DIRECTORY_SEPARATOR.'releases'.DIRECTORY_SEPARATOR.'20260101_000000_abc1234', 0777, true);
+
+        $this->assertStringContainsString('already in use', (new AdoptInPlace($this->root))->whyNotAdoptable());
+    }
+
     public function test_it_refuses_when_current_is_a_real_directory(): void
     {
         $this->checkout();
@@ -189,6 +212,53 @@ class AdoptInPlaceTest extends TestCase
         $this->assertFalse($adopter->isPlainCheckout());
         $this->assertTrue($adopter->currentExists());
         $this->assertFalse($adopter->currentIsRealDirectory());
+    }
+
+    /**
+     * Configured shared paths must end up as links into the layout root. Left
+     * as the real directories the copy produced, everything written through
+     * them after the document-root flip would stop being served by the next
+     * deploy (which overlays shared/ from git content) and would be deleted
+     * when the adopted release ages out.
+     */
+    public function test_it_moves_configured_shared_paths_out_of_the_release_and_links_them(): void
+    {
+        $this->requireSymlinks();
+        $this->checkout();
+        $this->file('public/images/patient/scan-1.jpg', 'jpeg bytes');
+
+        $adopter = new AdoptInPlace($this->root, ['public/images/patient' => 'shared/images/patient']);
+        $release = $adopter->adopt();
+
+        $shared = $this->root.DIRECTORY_SEPARATOR.'shared'.DIRECTORY_SEPARATOR.'images'.DIRECTORY_SEPARATOR.'patient';
+
+        $this->assertDirectoryExists($shared);
+        $this->assertFileExists($shared.DIRECTORY_SEPARATOR.'scan-1.jpg', 'live uploads seed the shared directory');
+
+        $this->assertTrue(is_link($release.'/public/images/patient'), 'the release must link, not hold, shared data');
+        $this->assertSame(realpath($shared), realpath($release.'/public/images/patient'));
+
+        // Reachable through the new document root, and a write through it lands
+        // in shared where the next deploy will still find it.
+        $this->assertFileExists($this->root.'/current/public/images/patient/scan-1.jpg');
+        file_put_contents($this->root.'/current/public/images/patient/scan-2.jpg', 'more bytes');
+        $this->assertFileExists($shared.DIRECTORY_SEPARATOR.'scan-2.jpg');
+    }
+
+    public function test_shared_paths_that_already_exist_are_filled_in_not_overwritten(): void
+    {
+        $this->requireSymlinks();
+        $this->checkout();
+        $this->file('public/images/patient/from-checkout.jpg', 'checkout');
+        $this->file('shared/images/patient/already-shared.jpg', 'shared');
+
+        $release = (new AdoptInPlace($this->root, ['public/images/patient' => 'shared/images/patient']))->adopt();
+
+        $shared = $this->root.DIRECTORY_SEPARATOR.'shared'.DIRECTORY_SEPARATOR.'images'.DIRECTORY_SEPARATOR.'patient';
+
+        $this->assertFileExists($shared.DIRECTORY_SEPARATOR.'already-shared.jpg');
+        $this->assertFileExists($shared.DIRECTORY_SEPARATOR.'from-checkout.jpg');
+        $this->assertTrue(is_link($release.'/public/images/patient'));
     }
 
     public function test_it_names_the_release_after_head_when_the_checkout_is_a_git_repo(): void

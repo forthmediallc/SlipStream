@@ -43,8 +43,13 @@ class AdoptInPlace
         'node_modules',
     ];
 
+    /**
+     * @param  array<string, string>  $sharedPaths  release-relative => layout-relative,
+     *                                              as configured in slipstream.deploy.shared_paths
+     */
     public function __construct(
-        protected string $appRoot
+        protected string $appRoot,
+        protected array $sharedPaths = []
     ) {}
 
     /**
@@ -61,8 +66,33 @@ class AdoptInPlace
         }
 
         // provision creates an empty releases/ moments before this runs, so
-        // only a populated one means the layout is already in use.
+        // only a populated one means the layout is already in use. Releases
+        // kept from a failed deploy do not count: they are exactly the state a
+        // first-timer is in when the first deploy fails and they come back to
+        // adopt, and nothing was ever served from one.
         return $this->existingReleases() === [];
+    }
+
+    /**
+     * Why isPlainCheckout() said no, in a sentence an operator can act on.
+     */
+    public function whyNotAdoptable(): string
+    {
+        if (! is_file($this->appRoot.DIRECTORY_SEPARATOR.'artisan')) {
+            return '  No artisan file at '.$this->appRoot.' — this does not look like a Laravel checkout.';
+        }
+
+        if ($this->currentExists()) {
+            return '  current already exists at '.$this->currentPath().' — the layout is already in use.';
+        }
+
+        $releases = $this->existingReleases();
+        if ($releases !== []) {
+            return '  releases/ already holds '.count($releases).' release(s), starting with '
+                .basename($releases[0]).' — the layout is already in use.';
+        }
+
+        return '  This directory is already using the release layout.';
     }
 
     public function currentExists(): bool
@@ -112,6 +142,7 @@ class AdoptInPlace
 
         $this->copyExcluding($this->appRoot, $release, self::EXCLUDED);
         $this->linkShared($release);
+        $this->linkSharedPaths($release);
 
         if ($sha) {
             file_put_contents($release.DIRECTORY_SEPARATOR.'RELEASE_SHA', $sha."\n");
@@ -128,11 +159,17 @@ class AdoptInPlace
     }
 
     /**
+     * Deployable releases, ignoring any kept from a failed deploy.
+     *
      * @return list<string>
      */
     public function existingReleases(): array
     {
-        return glob($this->appRoot.DIRECTORY_SEPARATOR.'releases'.DIRECTORY_SEPARATOR.'*', GLOB_ONLYDIR) ?: [];
+        $all = glob($this->appRoot.DIRECTORY_SEPARATOR.'releases'.DIRECTORY_SEPARATOR.'*', GLOB_ONLYDIR) ?: [];
+
+        [$releases] = FailedReleases::partition($all);
+
+        return $releases;
     }
 
     /**
@@ -210,12 +247,118 @@ class AdoptInPlace
     }
 
     /**
+     * Seed and link the configured shared paths (uploads and the like).
+     *
+     * These must be links in the adopted release, not the real directories the
+     * copy produced. Once the document root is flipped, writes go through the
+     * release — and a later deploy builds its own release from git, overlays
+     * shared/ from *that* content, and links it. Anything written into the
+     * adopted release's real directory would simply stop being served, and
+     * would go for good when the release ages out of keep-N.
+     *
+     * Seeding shared/ from the live data also fixes the plain first-deploy
+     * case, where shared/ is created empty and the git-built release has
+     * nothing to overlay because the directory is gitignored.
+     */
+    protected function linkSharedPaths(string $release): void
+    {
+        foreach ($this->sharedPaths as $releaseRelative => $sharedRelative) {
+            $sharedAbs = $this->appRoot.DIRECTORY_SEPARATOR.$this->normalise($sharedRelative);
+            $releaseAbs = $release.DIRECTORY_SEPARATOR.$this->normalise($releaseRelative);
+
+            $parent = dirname($sharedAbs);
+            if (! is_dir($parent)) {
+                mkdir($parent, 0755, true);
+            }
+
+            if (! is_dir($sharedAbs)) {
+                // The copy already put the live data in the release; move it
+                // into shared rather than copying the same bytes twice.
+                if (is_dir($releaseAbs) && ! is_link($releaseAbs)) {
+                    rename($releaseAbs, $sharedAbs);
+                } else {
+                    mkdir($sharedAbs, 0755, true);
+                }
+            } elseif (is_dir($releaseAbs) && ! is_link($releaseAbs)) {
+                // Shared already exists (a re-run, or a hand-made layout):
+                // fill in anything it does not have, then drop the copy.
+                $this->copyMissing($releaseAbs, $sharedAbs);
+            }
+
+            $releaseParent = dirname($releaseAbs);
+            if (! is_dir($releaseParent)) {
+                mkdir($releaseParent, 0755, true);
+            }
+
+            $this->remove($releaseAbs);
+
+            if (! @symlink($sharedAbs, $releaseAbs)) {
+                throw new RuntimeException("Failed to link {$releaseAbs} -> {$sharedAbs}");
+            }
+        }
+    }
+
+    protected function normalise(string $relative): string
+    {
+        return str_replace(['/', '\\'], DIRECTORY_SEPARATOR, trim($relative, '/\\'));
+    }
+
+    /**
+     * Copy anything the destination does not already have (existing files win,
+     * the same rule Deployer::copyTree uses for shared data).
+     */
+    protected function copyMissing(string $from, string $to): void
+    {
+        foreach (scandir($from) ?: [] as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+
+            $src = $from.DIRECTORY_SEPARATOR.$name;
+            $dst = $to.DIRECTORY_SEPARATOR.$name;
+
+            if (is_dir($src) && ! is_link($src)) {
+                if (! is_dir($dst)) {
+                    mkdir($dst, 0755, true);
+                }
+                $this->copyMissing($src, $dst);
+            } elseif (! file_exists($dst)) {
+                copy($src, $dst);
+            }
+        }
+    }
+
+    /**
+     * Delete a file, link, or directory tree. Links are unlinked, never
+     * followed — removing a link into shared storage must not touch what it
+     * points at.
+     */
+    protected function remove(string $path): void
+    {
+        if (is_link($path) || is_file($path)) {
+            @unlink($path);
+
+            return;
+        }
+
+        if (! is_dir($path)) {
+            return;
+        }
+
+        foreach (scandir($path) ?: [] as $name) {
+            if ($name !== '.' && $name !== '..') {
+                $this->remove($path.DIRECTORY_SEPARATOR.$name);
+            }
+        }
+
+        @rmdir($path);
+    }
+
+    /**
      * Give the adopted release the same shared links a deployed release gets.
      *
      * Storage is already live at the layout root, so there is no skeleton to
-     * seed and no ownership to fix. Custom shared_paths are left alone too: the
-     * copied tree still holds that data at its real path, and the next deploy
-     * overlays and links it as usual.
+     * seed and no ownership to fix.
      */
     protected function linkShared(string $release): void
     {
