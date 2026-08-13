@@ -4,6 +4,7 @@ namespace Slipstream\Deploy;
 
 use Illuminate\Support\Facades\Cache;
 use RuntimeException;
+use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Fleet\Heartbeat;
 use Slipstream\Models\Deployment;
 use Slipstream\Models\DeploymentHook;
@@ -349,8 +350,31 @@ class Deployer
             '--prefer-dist', '--no-progress',
         ], $this->releasePath, $step, timeout: 1800);
 
+        $this->assertSlipstreamInstalled();
+
         $this->log->stepEnd($step);
         $this->runHooks($step, 'after');
+    }
+
+    /**
+     * Fail here rather than three steps later with a misleading error.
+     *
+     * A release built from a commit that predates `composer require slipstream`
+     * installs the old lockfile, and the first symptom is the health step
+     * reporting that the slipstream artisan namespace does not exist.
+     */
+    protected function assertSlipstreamInstalled(): void
+    {
+        $vendorPath = $this->releasePath.DIRECTORY_SEPARATOR.'vendor'
+            .DIRECTORY_SEPARATOR.'slipstream'.DIRECTORY_SEPARATOR.'slipstream';
+
+        if (! is_dir($vendorPath)) {
+            throw new RuntimeException(
+                'Slipstream is missing from this release after composer install — the deployed commit\'s '
+                .'composer.lock does not include '.ComposerLockCheck::PACKAGE.'. '
+                .ComposerLockCheck::commitFirstMessage()
+            );
+        }
     }
 
     protected function stepHealth(): void

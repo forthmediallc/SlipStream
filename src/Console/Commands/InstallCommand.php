@@ -4,6 +4,7 @@ namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
 use Slipstream\Deploy\DefaultHooks;
+use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Models\Pipeline;
 use Slipstream\Models\Server;
 use Slipstream\Settings\SettingsRepository;
@@ -95,6 +96,26 @@ class InstallCommand extends Command
             'Next:      php artisan slipstream:provision  (server bootstrap)',
         ]);
 
+        $this->warnIfNotCommitted();
+
         return self::SUCCESS;
+    }
+
+    /**
+     * Deploys build from git, so a package that only exists in this working
+     * directory is not in the release. Silent outside a git repo.
+     */
+    protected function warnIfNotCommitted(): void
+    {
+        $check = new ComposerLockCheck(base_path());
+
+        if (! $check->isGitRepo()) {
+            return;
+        }
+
+        if ($check->composerFilesDirty() || $check->committedLockHasPackage() === false) {
+            $this->newLine();
+            $this->components->warn(ComposerLockCheck::commitFirstMessage());
+        }
     }
 }
