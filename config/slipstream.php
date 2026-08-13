@@ -89,6 +89,9 @@ return [
     'deploy' => [
         'branch' => env('SLIPSTREAM_BRANCH', 'main'),
         'keep_releases' => (int) env('SLIPSTREAM_KEEP_RELEASES', 5),
+        // A failed deploy keeps its half-built release as `<release>.failed` so
+        // the failing command can be re-run where it failed. 0 = delete it.
+        'keep_failed_releases' => (int) env('SLIPSTREAM_KEEP_FAILED_RELEASES', 1),
         'shared_paths' => [
             // Extra shared paths beyond .env and storage, e.g.:
             // 'public/images/patient' => 'shared/images/patient',
@@ -116,7 +119,7 @@ return [
         'migration_lock_ttl' => (int) env('SLIPSTREAM_MIGRATION_LOCK_TTL', 900),
         'migrate_timeout' => (int) env('SLIPSTREAM_MIGRATE_TIMEOUT', 600),
         // A deploy still "building" past this many minutes is treated as dead by
-        // the prune watchdog and marked failed.
+        // the watchdog (heartbeat, every minute) and marked failed.
         'stuck_minutes' => (int) env('SLIPSTREAM_STUCK_MINUTES', 120),
         // A fleet deploy/rollback queued for a server that never claims it
         // (offline, paused, removed) expires after this many hours (0 = never).

@@ -468,7 +468,11 @@ class Deployer
         $this->log->stepStart($step, "Pruning old releases (keep {$this->keep})…");
 
         $live = realpath($this->current) ?: '';
-        $dirs = glob($this->releases.DIRECTORY_SEPARATOR.'*', GLOB_ONLYDIR) ?: [];
+        $all = glob($this->releases.DIRECTORY_SEPARATOR.'*', GLOB_ONLYDIR) ?: [];
+
+        // Preserved failures have their own (smaller) retention and must not
+        // consume the keep-N budget for deployable releases.
+        [$dirs] = FailedReleases::partition($all);
         usort($dirs, fn ($a, $b) => filemtime($b) <=> filemtime($a));
 
         foreach (array_slice($dirs, $this->keep) as $old) {
@@ -478,6 +482,11 @@ class Deployer
             }
             $this->log->info("Pruning old release: {$old}", $step);
             $this->removePath($old);
+        }
+
+        $keepFailed = (int) config('slipstream.deploy.keep_failed_releases', 1);
+        foreach (FailedReleases::prune($this->releases, $keepFailed, fn ($old) => $this->removePath($old)) as $old) {
+            $this->log->info("Pruning old failed release: {$old}", $step);
         }
 
         $this->log->stepEnd($step);
@@ -531,8 +540,7 @@ class Deployer
             $live = realpath($this->current) ?: '';
             $rel = realpath($this->releasePath) ?: $this->releasePath;
             if ($live === '' || $rel !== $live) {
-                $this->log->info("Removing half-built release: {$this->releasePath}");
-                $this->removePath($this->releasePath);
+                $this->disposeOfFailedRelease();
             }
         }
 
@@ -547,6 +555,43 @@ class Deployer
         ]);
 
         $this->notifyFinished();
+    }
+
+    /**
+     * Keep the half-built release for inspection, or delete it when retention
+     * is off. Either way $this->releasePath ends up describing something that
+     * exists, so the failed deployment row never points at a deleted directory.
+     */
+    protected function disposeOfFailedRelease(): void
+    {
+        $keep = (int) config('slipstream.deploy.keep_failed_releases', 1);
+
+        if ($keep < 1) {
+            $this->log->info("Removing half-built release: {$this->releasePath}");
+            $this->removePath($this->releasePath);
+            $this->releasePath = null;
+
+            return;
+        }
+
+        $preserved = $this->releasePath.FailedReleases::SUFFIX;
+
+        if (! @rename($this->releasePath, $preserved)) {
+            $this->log->warning("Could not preserve failed release; removing {$this->releasePath}");
+            $this->removePath($this->releasePath);
+            $this->releasePath = null;
+
+            return;
+        }
+
+        $this->releasePath = $preserved;
+        $this->log->info("Kept the failed release for inspection: {$preserved}");
+
+        // Prune here as well as in stepPrune: when every deploy fails, a
+        // successful prune step never runs and these would accumulate forever.
+        foreach (FailedReleases::prune($this->releases, $keep, fn ($old) => $this->removePath($old)) as $old) {
+            $this->log->info("Pruning old failed release: {$old}");
+        }
     }
 
     protected function touchServerHeartbeat(): void

@@ -137,7 +137,10 @@ class Rollbacker
     protected function releaseOlderThanLive(): ?string
     {
         $live = realpath($this->current) ?: '';
-        $dirs = glob($this->releases.DIRECTORY_SEPARATOR.'*', GLOB_ONLYDIR) ?: [];
+        $all = glob($this->releases.DIRECTORY_SEPARATOR.'*', GLOB_ONLYDIR) ?: [];
+
+        // Never roll back onto a half-built release kept for inspection.
+        [$dirs] = FailedReleases::partition($all);
         usort($dirs, fn ($a, $b) => filemtime($b) <=> filemtime($a)); // newest → oldest
 
         return self::pickOlderThanLive($dirs, $live);
