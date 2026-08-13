@@ -3,6 +3,7 @@
 namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
+use Slipstream\Diagnostics\FpmPool;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\Sudo;
@@ -14,7 +15,8 @@ class ProvisionCommand extends Command
                             {--repo= : Git clone URL (e.g. git@github.com:org/app.git)}
                             {--key-name=id_ed25519_slipstream : Deploy key filename under ~/.ssh}
                             {--skip-key : Do not generate a deploy key}
-                            {--skip-clone : Do not clone the bare mirror}';
+                            {--skip-clone : Do not clone the bare mirror}
+                            {--fpm-user= : PHP-FPM pool user (default: detected from the pool config)}';
 
     protected $description = 'One-time server bootstrap: deploy key, bare mirror, directory layout';
 
@@ -23,13 +25,7 @@ class ProvisionCommand extends Command
         $root = Slipstream::appRoot();
         $this->components->info("Provisioning Slipstream layout at {$root}");
 
-        foreach (['releases', 'deploy/logs'] as $dir) {
-            $path = $root.DIRECTORY_SEPARATOR.str_replace('/', DIRECTORY_SEPARATOR, $dir);
-            if (! is_dir($path)) {
-                mkdir($path, 0750, true);
-                $this->line("  created {$path}");
-            }
-        }
+        $this->createLayout($root);
 
         if (! $this->option('skip-key') && DIRECTORY_SEPARATOR !== '\\') {
             $this->generateDeployKey();
@@ -59,6 +55,7 @@ class ProvisionCommand extends Command
         }
 
         $this->checkToolchain();
+        $this->checkPoolUser($root);
 
         $env = $root.DIRECTORY_SEPARATOR.'.env';
         if (! is_file($env)) {
@@ -71,8 +68,96 @@ class ProvisionCommand extends Command
         $this->newLine();
         $this->components->info('Provision complete. First deploy:');
         $this->line('  php artisan slipstream:deploy');
+        $this->newLine();
+        $this->line('  Web server: point the document root at '.$root.'/current/public and add the');
+        $this->line('  $realpath_root fastcgi params — see '.$this->nginxStubPath());
+        $this->line('  Verify the whole setup with: php artisan slipstream:doctor');
 
         return self::SUCCESS;
+    }
+
+    protected function nginxStubPath(): string
+    {
+        $path = dirname(__DIR__, 3).'/stubs/nginx-slipstream.conf';
+
+        return realpath($path) ?: $path;
+    }
+
+    /**
+     * `releases/` must be traversable by the web server, which is usually a
+     * different user than whoever runs provision: at 0750 nginx cannot resolve
+     * a path inside it. Deploy logs stay 0750 — they hold raw hook output.
+     */
+    protected function createLayout(string $root): void
+    {
+        foreach (['releases' => 0755, 'deploy/logs' => 0750] as $dir => $mode) {
+            $path = $root.DIRECTORY_SEPARATOR.str_replace('/', DIRECTORY_SEPARATOR, $dir);
+
+            if (! is_dir($path)) {
+                mkdir($path, $mode, true);
+                // mkdir's mode is masked by the umask, so set it explicitly.
+                @chmod($path, $mode);
+                $this->line("  created {$path}");
+
+                continue;
+            }
+
+            // An earlier provision created releases/ at 0750; widening it here
+            // saves an operator the "No input file specified" hunt.
+            $current = @fileperms($path);
+            if ($current !== false && ($current & 0777) !== $mode && $mode === 0755) {
+                if (@chmod($path, $mode)) {
+                    $this->line(sprintf('  fixed permissions on %s (%04o → %04o)', $path, $current & 0777, $mode));
+                }
+            }
+        }
+    }
+
+    /**
+     * Warn when PHP-FPM runs as someone else: every file this run creates would
+     * then be unwritable by the app, and the resulting failures (blank 500s,
+     * empty laravel.log, "No input file specified") point nowhere near here.
+     */
+    protected function checkPoolUser(string $root): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            return;
+        }
+
+        $poolUser = $this->option('fpm-user') ?: FpmPool::detectUser();
+        $current = FpmPool::currentUser();
+
+        if (! $poolUser) {
+            $this->components->twoColumnDetail('FPM pool user', '<fg=yellow>not detected</>');
+            $this->line('  Pass --fpm-user=<user> so provision can check ownership against it.');
+
+            return;
+        }
+
+        $this->components->twoColumnDetail(
+            'FPM pool user',
+            $poolUser === $current ? '<fg=green>'.$poolUser.'</>' : '<fg=yellow>'.$poolUser.'</>'
+        );
+
+        if ($current === null || $poolUser === $current) {
+            return;
+        }
+
+        $this->newLine();
+        $this->components->warn("PHP-FPM runs as '{$poolUser}' but you are running this as '{$current}'.");
+        $this->line("  Everything created here is owned by '{$current}', so the app cannot write it.");
+        $this->line("  Run deploys as '{$poolUser}', and hand over what already exists:");
+        $this->line(sprintf(
+            '    sudo chown -R %s:%s %s',
+            $poolUser,
+            $poolUser,
+            implode(' ', [
+                $root.'/releases',
+                $root.'/storage',
+                $root.'/deploy',
+            ])
+        ));
+        $this->newLine();
     }
 
     protected function generateDeployKey(): void
