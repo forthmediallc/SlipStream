@@ -3,6 +3,8 @@
 namespace Slipstream;
 
 use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Foundation\Http\Middleware\PreventRequestForgery;
+use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
@@ -46,6 +48,7 @@ class SlipstreamServiceProvider extends ServiceProvider
         $this->registerPublishing();
         $this->registerMigrations();
         $this->registerCommands();
+        $this->excludeHooksFromCsrf();
         $this->registerRoutes();
         $this->registerViews();
         $this->registerLivewire();
@@ -97,6 +100,33 @@ class SlipstreamServiceProvider extends ServiceProvider
             EnvNudgeCommand::class,
             DeployNudgeCommand::class,
         ]);
+    }
+
+    /**
+     * Exclude the hook endpoints from CSRF at the framework level, in addition
+     * to the per-route exclusion in routes/web.php.
+     *
+     * The route-level `withoutMiddleware([ValidateCsrfToken::class])` only
+     * strips a middleware registered under that exact class name. A host app
+     * that registers its own subclass — the old App\Http\Middleware\
+     * VerifyCsrfToken, or a global/priority registration — keeps CSRF in the
+     * stack, and GitHub deliveries come back 419. The static exclusion list
+     * lives on the shared base class, so it covers those subclasses too.
+     *
+     * A CSRF middleware that does not extend Laravel's is still beyond reach
+     * from a package; the README's troubleshooting entry covers that case.
+     */
+    protected function excludeHooksFromCsrf(): void
+    {
+        $middleware = class_exists(PreventRequestForgery::class)
+            ? PreventRequestForgery::class
+            : ValidateCsrfToken::class;
+
+        // The static except() arrived mid-11.x; older versions fall back to the
+        // per-route exclusion alone.
+        if (method_exists($middleware, 'except')) {
+            $middleware::except([Slipstream::path().'/hooks/*']);
+        }
     }
 
     protected function registerRoutes(): void
