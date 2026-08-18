@@ -8,6 +8,7 @@ use Slipstream\Deploy\FailedReleases;
 use Slipstream\Diagnostics\CheckResult;
 use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Diagnostics\FpmPool;
+use Slipstream\Diagnostics\Ownership;
 use Slipstream\Models\Server;
 use Slipstream\Slipstream;
 use Slipstream\Support\Sudo;
@@ -36,6 +37,7 @@ class DoctorCommand extends Command
 
         $checks = [
             'checkPoolUser',
+            'checkLayoutWritable',
             'checkCurrentSymlink',
             'checkReleasesTraversable',
             'checkSharedEnv',
@@ -87,14 +89,11 @@ class DoctorCommand extends Command
     }
 
     /**
-     * Informational only — no remediation command is printed from here.
-     *
-     * Ownership of releases/deploy by another user is a SUPPORTED layout (a
-     * deploy user owns the tree, the pool user reaches storage through the
-     * web_group), and a recursive chown printed from a glob-order guess at the
-     * pool user is a paste-ready outage. The one place ownership genuinely
-     * bites — the pool user unable to write storage — is checkStorageWritable,
-     * which tests the actual behaviour and scopes its fix to storage.
+     * Identifies the pool user and flags ambiguity. Informational only: the
+     * checks that test what the pool user can actually DO — write the layout
+     * a deploy writes, write storage — follow, and they scope their fixes to
+     * the paths they proved a problem on rather than printing a recursive
+     * chown from a guess.
      */
     protected function checkPoolUser(string $root): CheckResult
     {
@@ -144,6 +143,71 @@ class DoctorCommand extends Command
         }
 
         return FpmPool::detectUser();
+    }
+
+    /**
+     * Can the user that deploys write the layout a deploy writes?
+     *
+     * Dashboard and webhook deploys spawn as the FPM pool user, and a deploy
+     * writes repo.git (fetch), releases/ (the new release) and deploy/ (lock,
+     * logs). The git reachability check says nothing about this — ls-remote is
+     * read-only and passes cleanly on a mirror the deploy user cannot add a
+     * single object to. That failure only shows at the first fetch, as
+     * "insufficient permission for adding an object to repository database".
+     *
+     * Mixed ownership INSIDE repo.git is the sneaky variant: one fetch run as
+     * root (a hand-run deploy under plain sudo) leaves root-owned objects/xx/
+     * directories behind, and every later fetch as the deploy user dies the
+     * moment it needs one of them — long after the top of repo.git was
+     * chowned. So directories are checked all the way down, not just the top.
+     */
+    protected function checkLayoutWritable(string $root): CheckResult
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            return CheckResult::skip('deploy user can write', 'not applicable on Windows');
+        }
+
+        $pool = $this->poolUser();
+        if (! $pool) {
+            return CheckResult::skip('deploy user can write', 'pool user unknown — pass --fpm-user=<user>');
+        }
+
+        $problems = [];
+        foreach (['repo.git', 'releases', 'deploy'] as $dir) {
+            $path = $root.DIRECTORY_SEPARATOR.$dir;
+            if (! is_dir($path)) {
+                continue;
+            }
+            $unwritable = Ownership::unwritableDirectories($path, $pool, 3);
+            if ($unwritable !== []) {
+                $problems[$path] = $unwritable;
+            }
+        }
+
+        if ($problems === []) {
+            return CheckResult::pass('deploy user can write', "{$pool} can write repo.git, releases/, deploy/");
+        }
+
+        $described = [];
+        foreach ($problems as $top => $paths) {
+            $examples = array_map(function (string $path) use ($root) {
+                $relative = ltrim(str_replace($root, '', $path), DIRECTORY_SEPARATOR);
+                $owner = FpmPool::ownerOf($path);
+
+                return $relative.($owner ? " (owned by {$owner})" : '');
+            }, $paths);
+            $described[] = implode(', ', $examples);
+        }
+
+        return CheckResult::fail(
+            'deploy user can write',
+            "{$pool} cannot write: ".implode('; ', $described),
+            sprintf('sudo chown -R %s:%s %s', $pool, $pool, implode(' ', array_keys($problems)))."\n"
+            .'Symptom when wrong: git fetch dies with "insufficient permission for adding an object to '
+            ."repository database\".\n"
+            ."Run every deploy as {$pool} (sudo -u {$pool} …, never plain sudo): a single root-run fetch "
+            .'re-salts repo.git/objects with root-owned directories.'
+        );
     }
 
     protected function checkCurrentSymlink(string $root): CheckResult
@@ -315,45 +379,18 @@ class DoctorCommand extends Command
     }
 
     /**
-     * Whether the FPM pool user can write here.
-     *
-     * is_writable() answers for the *current* process, and root bypasses the
-     * permission bits entirely — so a doctor run under sudo (exactly what an
-     * operator reaches for when chasing a permission problem) would report
-     * every directory writable while the pool user still cannot write one of
-     * them. Compare owner/group/mode directly whenever the answer would
-     * otherwise come from root's free pass.
+     * Whether the FPM pool user can write here. Judged from owner/group/mode
+     * when the asker is not that user (or is root, whose is_writable() lies).
      */
     protected function writableByPool(string $path, ?string $pool): bool
     {
-        $runningAsRoot = function_exists('posix_geteuid') && posix_geteuid() === 0;
+        $subject = $pool ?? FpmPool::currentUser();
 
-        if (! $runningAsRoot || $pool === null || ! function_exists('posix_getpwnam')) {
+        if ($subject === null) {
             return is_writable($path);
         }
 
-        $owner = FpmPool::ownerOf($path);
-        $perms = @fileperms($path);
-
-        if ($perms === false) {
-            return is_writable($path);
-        }
-
-        if ($owner === $pool) {
-            return ($perms & 0200) === 0200;
-        }
-
-        // Not the owner: the group bit only helps if the pool user is in the
-        // owning group, which is more than a mode check can settle — fall back
-        // to the "other" write bit, the only one that is unambiguous.
-        $group = @filegroup($path);
-        $poolInfo = @posix_getpwnam($pool);
-
-        if (is_array($poolInfo) && $group !== false && $group === ($poolInfo['gid'] ?? null)) {
-            return ($perms & 0020) === 0020;
-        }
-
-        return ($perms & 0002) === 0002;
+        return Ownership::writableBy($path, $subject) ?? is_writable($path);
     }
 
     protected function checkSudoReload(string $root): CheckResult
@@ -448,6 +485,21 @@ class DoctorCommand extends Command
                 'cannot reach origin',
                 trim($process->getErrorOutput() ?: 'git ls-remote failed')."\n"
                 .'Check the deploy key is installed on the repo and readable by this user.'
+            );
+        }
+
+        // Reachability was just tested with THIS user's key and identity. When
+        // that is not the user deploys run as, the answer is about the wrong
+        // person: root's key in /root/.ssh proves nothing about what the pool
+        // user can fetch.
+        $pool = $this->poolUser();
+        $current = FpmPool::currentUser();
+        if ($pool !== null && $current !== null && $pool !== $current) {
+            return CheckResult::warn(
+                'git mirror',
+                "origin reachable as {$current} — deploys run as {$pool}",
+                "Re-run as the deploy user for an authoritative answer: sudo -u {$pool} php artisan slipstream:doctor\n"
+                ."(A deploy key generated by a root-run provision lives in /root/.ssh, which {$pool} cannot read.)"
             );
         }
 

@@ -78,6 +78,10 @@ abstract class TestCase extends BaseTestCase
             return;
         }
 
+        // Tests deliberately create read-only directories (0555, 0000) to
+        // exercise permission checks; teardown must still be able to empty them.
+        @chmod($path, 0777);
+
         foreach (scandir($path) ?: [] as $name) {
             if ($name !== '.' && $name !== '..') {
                 $this->removeTree($path.DIRECTORY_SEPARATOR.$name);
