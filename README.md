@@ -295,6 +295,23 @@ handed a bare `/index.php`. If `storage/` is not writable by the pool user, Mono
 the log that would have named the problem. Deploys must run as the FPM pool user; `provision`
 and `doctor` both compare the two and print the `chown` to run.
 
+**A deploy fails at git fetch with `insufficient permission for adding an object to repository
+database …/repo.git/objects`.** The user running the deploy cannot write into the mirror. Dashboard
+and webhook deploys run as the FPM pool user, and `repo.git` was usually cloned by whoever ran
+`provision` — root, typically. Hand the whole mirror (and the rest of what a deploy writes) to the
+pool user, then keep every deploy on that user:
+
+```bash
+sudo chown -R deploy:deploy /var/www/app/repo.git /var/www/app/releases /var/www/app/deploy
+sudo -u deploy php artisan slipstream:deploy      # never plain sudo
+```
+
+The sneaky version: `repo.git` *looks* owned correctly, but a single fetch that once ran as root left
+root-owned `objects/xx/` directories inside it, and every later fetch dies the moment it needs one
+of them. `slipstream:doctor` checks every directory in the mirror, not just the top, and its "git
+mirror" check reports whose key it tested — a root-run doctor proves nothing about what the pool
+user can fetch, so run it as the deploy user for the real answer.
+
 **A deploy fails with `There are no commands defined in the "slipstream" namespace`.** The
 deployed commit predates the package. Releases are built from the mirrored branch, not from your
 working directory, so `composer require` alone is not enough — and neither is committing without
