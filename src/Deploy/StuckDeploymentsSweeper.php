@@ -21,6 +21,12 @@ use Slipstream\Models\Deployment;
 class StuckDeploymentsSweeper
 {
     /**
+     * In-code fallback for pending_stuck_minutes: a published config from
+     * before the key existed has no entry for it (config merging is shallow).
+     */
+    public const DEFAULT_PENDING_MINUTES = 5;
+
+    /**
      * @param  string|null  $serverName  sweep only this server's rows; null = fleet-wide
      * @return array{building: int, pending: int, queued: int}
      */
@@ -43,15 +49,24 @@ class StuckDeploymentsSweeper
                     'finished_at' => now(),
                 ]);
 
-            // Rows claimed but never started: a spawn that died before the
-            // Deployer marked "building" leaves "pending" forever. updated_at
-            // (not created_at) so a freshly claimed queued row isn't hit.
+            // Rows claimed but never started. "pending" only covers process
+            // start-up — the Deployer marks "building" right after taking the
+            // lock — so it gets its own, much shorter window: the cause is a
+            // spawn that never ran artisan (the FPM binary as interpreter, a
+            // wrong SLIPSTREAM_PHP, artisan missing), and two hours is a long
+            // time to show "pending" for something that died in its first
+            // second. Never longer than stuck_minutes; 0 falls back to it.
+            // updated_at (not created_at) so a freshly claimed queued row
+            // isn't hit.
+            $pendingMinutes = (int) config('slipstream.deploy.pending_stuck_minutes', self::DEFAULT_PENDING_MINUTES);
+            $pendingMinutes = $pendingMinutes > 0 ? min($pendingMinutes, $stuckMinutes) : $stuckMinutes;
+
             $pending = $this->scoped($serverName)
                 ->where('status', Deployment::STATUS_PENDING)
-                ->where('updated_at', '<', now()->subMinutes($stuckMinutes))
+                ->where('updated_at', '<', now()->subMinutes($pendingMinutes))
                 ->update([
                     'status' => Deployment::STATUS_FAILED,
-                    'failure_reason' => "Marked failed by watchdog: stuck in 'pending' for over {$stuckMinutes} minutes (spawned process never started).",
+                    'failure_reason' => "Marked failed by watchdog: still 'pending' after {$pendingMinutes} minutes — the spawned deploy process never started. Check deploy/logs/detach-*.log and run php artisan slipstream:doctor.",
                     'finished_at' => now(),
                 ]);
         }

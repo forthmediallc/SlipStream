@@ -13,6 +13,7 @@ use Slipstream\Notifications\DeployNotifier;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\GitRef;
+use Slipstream\Support\PhpBinary;
 use Slipstream\Support\Sudo;
 
 /**
@@ -65,7 +66,10 @@ class Deployer
         $this->sharedEnv = Slipstream::sharedEnvPath();
         $this->sharedStorage = $this->appRoot.DIRECTORY_SEPARATOR.'storage';
         $this->sharedAuth = $this->appRoot.DIRECTORY_SEPARATOR.'auth.json';
-        $this->php = (string) config('slipstream.deploy.php_binary', PHP_BINARY);
+        // Resolved the same way the detacher resolves its interpreter, so
+        // {{ php }} in hooks and the health check run under a CLI: from this
+        // CLI child that is PHP_BINARY, or SLIPSTREAM_PHP when set.
+        $this->php = PhpBinary::resolve();
         $this->composer = (string) config('slipstream.deploy.composer_binary', 'composer');
         $this->npm = (string) config('slipstream.deploy.npm_binary', 'npm');
         $this->branch = $deployment->branch ?: $this->settings->branch();

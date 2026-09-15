@@ -113,6 +113,28 @@ class WebhookIngressTest extends TestCase
     }
 
     /**
+     * The detacher throws when it cannot resolve a PHP CLI (or write its log).
+     * That has to become a failed row and a spawn_failed delivery — a 500 the
+     * provider shows in red — never an "accepted" delivery for a deploy that
+     * will sit in "pending".
+     */
+    public function test_a_spawn_failure_is_recorded_on_the_row_and_the_delivery(): void
+    {
+        $this->detacher->throw = true;
+
+        $this->postSigned($this->githubPush('d-spawn'))->assertStatus(500);
+
+        $deployment = Deployment::query()->sole();
+        $this->assertSame(Deployment::STATUS_FAILED, $deployment->status);
+        $this->assertStringContainsString('Spawn failed: spawn failed (fake)', $deployment->failure_reason);
+        $this->assertNotNull($deployment->finished_at);
+
+        $delivery = WebhookDelivery::query()->sole();
+        $this->assertSame('spawn_failed', $delivery->outcome);
+        $this->assertSame($deployment->id, $delivery->deployment_id);
+    }
+
+    /**
      * @param  array{0: string, 1: array<string, string>}  $signed
      */
     protected function postSigned(array $signed)

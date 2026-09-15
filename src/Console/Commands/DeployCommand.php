@@ -29,12 +29,16 @@ class DeployCommand extends Command
         $this->info("Deploy #{$deployment->id} starting on ".Slipstream::serverName().'…');
 
         $logger = new EventLogger($deployment);
-        $deployer = new Deployer($deployment, $settings, $logger);
 
         try {
+            // Constructing the Deployer resolves the PHP binary and can throw;
+            // inside the try so an unusable SLIPSTREAM_PHP is recorded on the
+            // row like any other failure instead of stranding it in "pending".
+            $deployer = new Deployer($deployment, $settings, $logger);
             $deployer->run();
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
+            $this->recordUnrecordedFailure($deployment, $logger, $e);
 
             return self::FAILURE;
         }
@@ -143,6 +147,28 @@ class DeployCommand extends Command
         }
 
         @rename($release, $release.FailedReleases::SUFFIX);
+    }
+
+    /**
+     * Deployer::run() records its own failures before rethrowing; anything that
+     * escaped before run() started (construction, e.g. an unusable
+     * SLIPSTREAM_PHP) has not been, and would otherwise sit in "pending" until
+     * the watchdog guessed at a cause.
+     */
+    protected function recordUnrecordedFailure(Deployment $deployment, EventLogger $logger, \Throwable $e): void
+    {
+        $deployment->refresh();
+
+        if ($deployment->isFinished() || $deployment->status === Deployment::STATUS_SUPERSEDED) {
+            return;
+        }
+
+        $logger->error('DEPLOY FAILED: '.$e->getMessage());
+        $deployment->update([
+            'status' => Deployment::STATUS_FAILED,
+            'failure_reason' => $e->getMessage(),
+            'finished_at' => now(),
+        ]);
     }
 
     protected function resolveDeployment(SettingsRepository $settings): Deployment

@@ -11,6 +11,7 @@ use Slipstream\Diagnostics\FpmPool;
 use Slipstream\Diagnostics\Ownership;
 use Slipstream\Models\Server;
 use Slipstream\Slipstream;
+use Slipstream\Support\PhpBinary;
 use Slipstream\Support\Sudo;
 use Symfony\Component\Process\Process;
 
@@ -27,7 +28,7 @@ class DoctorCommand extends Command
     protected $signature = 'slipstream:doctor
                             {--fpm-user= : PHP-FPM pool user (default: detected from the pool config)}';
 
-    protected $description = 'Diagnose the deploy layout, permissions, git access and webhook reachability';
+    protected $description = 'Diagnose the deploy layout, permissions, PHP binary, git access and webhook reachability';
 
     public function handle(): int
     {
@@ -37,6 +38,7 @@ class DoctorCommand extends Command
 
         $checks = [
             'checkPoolUser',
+            'checkPhpBinary',
             'checkLayoutWritable',
             'checkCurrentSymlink',
             'checkReleasesTraversable',
@@ -208,6 +210,81 @@ class DoctorCommand extends Command
             ."Run every deploy as {$pool} (sudo -u {$pool} …, never plain sudo): a single root-run fetch "
             .'re-salts repo.git/objects with root-owned directories.'
         );
+    }
+
+    /**
+     * The PHP that dashboard and webhook deploys are spawned with.
+     *
+     * They spawn from a PHP-FPM worker, where PHP_BINARY is the FPM daemon —
+     * handed artisan it prints its usage and exits, the row stays "pending",
+     * and the detach log reads like an FPM misconfiguration. Doctor runs from
+     * the CLI, where PHP_BINARY is fine, so the question is asked the way a
+     * worker would: given this config and this build, what resolves when the
+     * SAPI is not a CLI? The version looked for is FPM's, from the service
+     * name, not whichever `php` doctor happens to run under.
+     */
+    protected function checkPhpBinary(string $root): CheckResult
+    {
+        $configured = config('slipstream.deploy.php_binary');
+        $configured = is_string($configured) && trim($configured) !== '' ? trim($configured) : null;
+
+        $resolver = new PhpBinary($configured, sapi: 'fpm-fcgi', binary: '', version: $this->fpmPhpVersion());
+
+        try {
+            $php = $resolver->path();
+        } catch (\RuntimeException $e) {
+            return CheckResult::fail(
+                'deploy PHP binary',
+                'no CLI for dashboard/webhook deploys',
+                $e->getMessage()."\n"
+                .'Symptom when wrong: webhook and dashboard deploys sit in "pending" and '
+                .'deploy/logs/detach-*.log holds only php-fpm usage text.'
+            );
+        }
+
+        if ($configured !== null && PhpBinary::isServerBinary($configured)) {
+            return CheckResult::warn(
+                'deploy PHP binary',
+                "{$php} (ignoring configured {$configured})",
+                'slipstream.deploy.php_binary names a php-fpm/php-cgi binary, which cannot run artisan. '
+                .'Fix SLIPSTREAM_PHP, or unset it to auto-detect the CLI.'
+            );
+        }
+
+        // A config published before auto-detection defaulted php_binary to
+        // env('SLIPSTREAM_PHP', PHP_BINARY). Harmless now — the resolver treats
+        // a daemon as unset, and an explicit SLIPSTREAM_PHP always won anyway —
+        // but the file is stale, which only matters when nothing explicit is set.
+        $published = config_path('slipstream.php');
+        if ($resolver->origin() !== PhpBinary::ORIGIN_CONFIGURED
+            && is_file($published)
+            && preg_match('/env\(\s*.SLIPSTREAM_PHP.\s*,\s*PHP_BINARY\s*\)/', (string) @file_get_contents($published)) === 1
+        ) {
+            return CheckResult::warn(
+                'deploy PHP binary',
+                "{$php} (published config still defaults php_binary to PHP_BINARY)",
+                "From an FPM worker that default is the FPM daemon; it is ignored, but the file is out of date.\n"
+                .'Re-publish it: php artisan slipstream:publish --config'
+            );
+        }
+
+        return CheckResult::pass(
+            'deploy PHP binary',
+            $php.($resolver->origin() === PhpBinary::ORIGIN_CONFIGURED ? ' (SLIPSTREAM_PHP)' : ' (detected)')
+        );
+    }
+
+    /**
+     * The PHP version FPM serves, read from the service name (php8.4-fpm), so
+     * the CLI looked for is FPM's rather than doctor's own.
+     */
+    protected function fpmPhpVersion(): string
+    {
+        if (preg_match('/(\d+\.\d+)/', $this->fpmService(), $m) === 1) {
+            return $m[1];
+        }
+
+        return PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;
     }
 
     protected function checkCurrentSymlink(string $root): CheckResult

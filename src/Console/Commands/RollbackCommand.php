@@ -30,12 +30,15 @@ class RollbackCommand extends Command
         }
 
         $logger = new EventLogger($deployment);
-        $rollbacker = new Rollbacker($deployment, $logger);
 
         try {
+            // Construction resolves the PHP binary and can throw — see
+            // DeployCommand for why that belongs inside the try.
+            $rollbacker = new Rollbacker($deployment, $logger);
             $rollbacker->run();
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
+            $this->recordUnrecordedFailure($deployment, $logger, $e);
 
             return self::FAILURE;
         }
@@ -44,5 +47,25 @@ class RollbackCommand extends Command
         $this->info('Rollback complete: '.$deployment->shortSha());
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Rollbacker::run() records its own failures; one thrown before it started
+     * has not been recorded and would sit in "pending" until the watchdog.
+     */
+    protected function recordUnrecordedFailure(Deployment $deployment, EventLogger $logger, \Throwable $e): void
+    {
+        $deployment->refresh();
+
+        if ($deployment->isFinished() || $deployment->status === Deployment::STATUS_SUPERSEDED) {
+            return;
+        }
+
+        $logger->error('ROLLBACK FAILED: '.$e->getMessage());
+        $deployment->update([
+            'status' => Deployment::STATUS_FAILED,
+            'failure_reason' => $e->getMessage(),
+            'finished_at' => now(),
+        ]);
     }
 }

@@ -96,7 +96,13 @@ return [
             // Extra shared paths beyond .env and storage, e.g.:
             // 'public/images/patient' => 'shared/images/patient',
         ],
-        'php_binary' => env('SLIPSTREAM_PHP', PHP_BINARY),
+        // PHP CLI for deploys, hooks ({{ php }}) and the detached artisan
+        // processes the dashboard and webhook spawn. Leave unset to auto-detect:
+        // the CLI next to the running build (the version FPM serves), then
+        // `php` on PATH. Set it only when PHP lives somewhere unusual — never
+        // PHP_BINARY: from an FPM worker that is the daemon, which cannot run
+        // artisan, and `slipstream:doctor` reports what will actually be used.
+        'php_binary' => env('SLIPSTREAM_PHP'),
         'composer_binary' => env('SLIPSTREAM_COMPOSER', 'composer'),
         'npm_binary' => env('SLIPSTREAM_NPM', 'npm'),
         // Artisan cache command run after migrate. `optimize` caches config/
@@ -121,6 +127,10 @@ return [
         // A deploy still "building" past this many minutes is treated as dead by
         // the watchdog (heartbeat, every minute) and marked failed. 0 disables.
         'stuck_minutes' => (int) env('SLIPSTREAM_STUCK_MINUTES', 120),
+        // A deploy still "pending" past this many minutes never started (its
+        // spawned process died before artisan ran) and is marked failed with
+        // that diagnosis. Never longer than stuck_minutes; 0 = same window.
+        'pending_stuck_minutes' => (int) env('SLIPSTREAM_PENDING_STUCK_MINUTES', 5),
         // A fleet deploy/rollback queued for a server that never claims it
         // (offline, paused, removed) expires after this many hours (0 = never).
         'queued_max_hours' => (int) env('SLIPSTREAM_QUEUED_MAX_HOURS', 24),

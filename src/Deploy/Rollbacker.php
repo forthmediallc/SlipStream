@@ -7,6 +7,7 @@ use Slipstream\Fleet\Heartbeat;
 use Slipstream\Models\Deployment;
 use Slipstream\Notifications\DeployNotifier;
 use Slipstream\Slipstream;
+use Slipstream\Support\PhpBinary;
 use Slipstream\Support\Sudo;
 
 /**
@@ -34,7 +35,7 @@ class Rollbacker
         $this->appRoot = Slipstream::appRoot();
         $this->releases = $this->appRoot.DIRECTORY_SEPARATOR.'releases';
         $this->current = $this->appRoot.DIRECTORY_SEPARATOR.'current';
-        $this->php = (string) config('slipstream.deploy.php_binary', PHP_BINARY);
+        $this->php = PhpBinary::resolve();
         $this->startedAt = microtime(true);
     }
 

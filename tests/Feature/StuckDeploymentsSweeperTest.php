@@ -69,11 +69,59 @@ class StuckDeploymentsSweeperTest extends TestCase
     {
         config()->set('slipstream.deploy.stuck_minutes', 0);
         $building = $this->deployment(Deployment::STATUS_BUILDING, ['started_at' => now()->subDays(3)]);
+        $pending = $this->deployment(Deployment::STATUS_PENDING);
+        $pending->forceFill(['updated_at' => now()->subDays(3)])->saveQuietly();
 
         $counts = app(StuckDeploymentsSweeper::class)->sweep();
 
         $this->assertSame(0, $counts['building']);
+        $this->assertSame(0, $counts['pending'], 'pending shares the master switch');
         $this->assertSame(Deployment::STATUS_BUILDING, $building->fresh()->status);
+        $this->assertSame(Deployment::STATUS_PENDING, $pending->fresh()->status);
+    }
+
+    /**
+     * "pending" only covers process start-up, so a spawn that never ran
+     * artisan (the FPM daemon as interpreter, a wrong SLIPSTREAM_PHP) is
+     * judged on its own short window, not the two hours a real build may
+     * legitimately take — and the reason says where to look.
+     */
+    public function test_a_pending_row_is_failed_on_its_own_short_window(): void
+    {
+        $pending = $this->deployment(Deployment::STATUS_PENDING);
+        $pending->forceFill(['updated_at' => now()->subMinutes(10)])->saveQuietly();
+        $building = $this->deployment(Deployment::STATUS_BUILDING, ['started_at' => now()->subMinutes(10)]);
+
+        $counts = app(StuckDeploymentsSweeper::class)->sweep();
+
+        $this->assertSame(['building' => 0, 'pending' => 1, 'queued' => 0], $counts);
+        $this->assertSame(Deployment::STATUS_FAILED, $pending->fresh()->status);
+        $this->assertStringContainsString('after 5 minutes', $pending->fresh()->failure_reason);
+        $this->assertStringContainsString('never started', $pending->fresh()->failure_reason);
+        $this->assertStringContainsString('slipstream:doctor', $pending->fresh()->failure_reason);
+        $this->assertSame(Deployment::STATUS_BUILDING, $building->fresh()->status);
+    }
+
+    public function test_a_pending_row_still_starting_up_is_left_alone(): void
+    {
+        $pending = $this->deployment(Deployment::STATUS_PENDING);
+        $pending->forceFill(['updated_at' => now()->subMinutes(2)])->saveQuietly();
+
+        $this->assertSame(0, app(StuckDeploymentsSweeper::class)->sweep()['pending']);
+        $this->assertSame(Deployment::STATUS_PENDING, $pending->fresh()->status);
+    }
+
+    public function test_the_pending_window_never_exceeds_stuck_minutes(): void
+    {
+        config()->set('slipstream.deploy.stuck_minutes', 3);
+        config()->set('slipstream.deploy.pending_stuck_minutes', 60);
+        $pending = $this->deployment(Deployment::STATUS_PENDING);
+        $pending->forceFill(['updated_at' => now()->subMinutes(5)])->saveQuietly();
+
+        app(StuckDeploymentsSweeper::class)->sweep();
+
+        $this->assertSame(Deployment::STATUS_FAILED, $pending->fresh()->status);
+        $this->assertStringContainsString('after 3 minutes', $pending->fresh()->failure_reason);
     }
 
     /**

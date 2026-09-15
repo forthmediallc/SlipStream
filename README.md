@@ -94,6 +94,8 @@ Published as `config/slipstream.php`:
 | `views.*` | Enable/disable dashboard sections |
 | `deploy.keep_releases` | How many releases to retain (default 5) |
 | `deploy.keep_failed_releases` | How many failed releases to keep as `<release>.failed` for inspection (default 1, `0` deletes them) |
+| `deploy.php_binary` | PHP CLI for deploys and the processes the dashboard/webhook spawn (`SLIPSTREAM_PHP`); auto-detected when unset, never php-fpm |
+| `deploy.pending_stuck_minutes` | Fail a deploy still `pending` after N minutes — its process never started (default 5) |
 
 Re-publish after package upgrades:
 
@@ -130,7 +132,8 @@ symlinked releases: without them FPM keys opcache on the unchanging `current/...
 keeps serving the previous release after a swap.
 
 Run `php artisan slipstream:doctor` before the first deploy. It checks ownership, the layout,
-sudo, git access, and webhook reachability in one pass, and names the fix for anything it finds.
+the PHP binary deploys are spawned with, sudo, git access, and webhook reachability in one pass,
+and names the fix for anything it finds.
 
 ### Adopting a site that is already live
 
@@ -217,7 +220,7 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 | `slipstream:install` | Publish assets, migrate, seed defaults |
 | `slipstream:publish` | Re-publish config / assets / migrations |
 | `slipstream:provision` | Deploy key, bare mirror, directory layout; `--adopt` converts a live checkout into the first release |
-| `slipstream:doctor` | Diagnose layout, ownership, sudo, git access and webhook reachability — with the fix for each |
+| `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access and webhook reachability — with the fix for each |
 | `slipstream:deploy` | Run a deploy (or `--deployment=`) |
 | `slipstream:rollback` | Point `current` at the previous release |
 | `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom) |
@@ -331,7 +334,22 @@ failed in. Note that a rollback never selects one of these.
 
 **A deploy is stuck showing `building`.** Interrupted deploys record themselves as failed on
 SIGINT/SIGTERM; a process killed outright (SIGKILL, OOM, reboot) is caught by the watchdog in
-the minute heartbeat, after `SLIPSTREAM_STUCK_MINUTES` (default 120).
+the minute heartbeat, after `SLIPSTREAM_STUCK_MINUTES` (default 120). A row stuck in `pending`
+never started at all, so it is failed much sooner, after `SLIPSTREAM_PENDING_STUCK_MINUTES`
+(default 5) — see the next entry for the usual cause.
+
+**A webhook or dashboard deploy sits in `pending`, and `deploy/logs/detach-*.log` holds only
+php-fpm usage text.** The deploy was launched with the wrong interpreter. Dashboard and webhook
+deploys are spawned from a PHP-FPM worker, and there PHP's own `PHP_BINARY` is the FPM daemon,
+which cannot run artisan: it prints its help and exits, while the shell that backgrounded it
+reports success. Slipstream therefore resolves the CLI itself — an explicit `SLIPSTREAM_PHP`,
+else the CLI matching FPM's version next to the running build, else `php` on `PATH` — and refuses
+to launch anything that looks like php-fpm or php-cgi, failing the row immediately instead. If
+PHP lives somewhere it cannot find, set `SLIPSTREAM_PHP=/usr/bin/php8.4` in the shared `.env`.
+`slipstream:doctor` reports the binary those deploys will use and flags a config published before
+auto-detection, which defaulted `php_binary` to `PHP_BINARY` (re-publish it with
+`php artisan slipstream:publish --config`). The first line of every detach log records the exact
+command that was launched.
 
 ## Security notes
 

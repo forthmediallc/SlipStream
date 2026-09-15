@@ -165,6 +165,38 @@ class DoctorCommandTest extends TestCase
             ->assertExitCode(1);
     }
 
+    /**
+     * Doctor runs from the CLI, where PHP_BINARY is a CLI; what matters is
+     * the PHP an FPM worker (dashboard, webhook) would spawn deploys with. An
+     * explicit SLIPSTREAM_PHP is reported as such …
+     */
+    public function test_it_reports_the_php_that_dashboard_and_webhook_deploys_use(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        config()->set('slipstream.deploy.php_binary', PHP_BINARY);
+
+        // One substring: the label and the message share a line, and the
+        // console test harness satisfies at most one expectation per write.
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain(PHP_BINARY.' (SLIPSTREAM_PHP)')
+            ->assertExitCode(1); // the bare layout still fails elsewhere
+    }
+
+    /**
+     * … and one that does not exist is a blocker named with its symptom,
+     * rather than something to work out from a deploy stuck in "pending".
+     */
+    public function test_an_unusable_php_binary_is_a_failure_with_the_pending_symptom(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        config()->set('slipstream.deploy.php_binary', $this->root.DIRECTORY_SEPARATOR.'no-such-php');
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('not an executable file')
+            ->expectsOutputToContain('sit in "pending"')
+            ->assertExitCode(1);
+    }
+
     protected function requirePosixNonRoot(): void
     {
         if (DIRECTORY_SEPARATOR === '\\' || ! function_exists('posix_geteuid')) {
