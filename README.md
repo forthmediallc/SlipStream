@@ -6,9 +6,10 @@ Slipstream installs into your app. On push (or from the dashboard), each server 
 
 ## Requirements
 
-- PHP 8.2+ (8.3+ recommended for Laravel 13)
+- PHP 8.2+ (Laravel 13 requires 8.3+)
 - Laravel 11, 12, or 13
-- Livewire 3.5+ or 4.x
+- Livewire 3.8.3+ or 4.3.4+ — earlier releases carry a DOM-based XSS advisory, which matters here
+  because the dashboard edits deploy hooks (shell on every server)
 - Linux in production (`symlink` swap, `systemctl`, `setsid`)
 - Shared database across servers (multi-server); cache driver that supports locks (Redis or database) for fleet migrations
 
@@ -575,6 +576,12 @@ npm install
 npm run build        # resources/css/app.css -> public/app.css (commit the result)
 npm run dev          # watch mode while iterating
 ```
+
+`package.json` overrides `@parcel/watcher` to 2.6+: the Tailwind CLI pins 2.5.1, whose glob
+dependency (`braces`) has an unfixed denial-of-service advisory, and 2.6 drops it. Only
+`npm run dev` loads the watcher — builds never do. Its install script is denied in
+`allowScripts` because it only builds from source on request; the prebuilt binary comes from
+the platform package. Check both toolchains with `composer audit` and `npm audit`.
 
 ## License
 
