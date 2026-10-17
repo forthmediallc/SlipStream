@@ -6,10 +6,13 @@ use Illuminate\Console\Command;
 use Slipstream\Deploy\Deployer;
 use Slipstream\Deploy\EventLogger;
 use Slipstream\Deploy\FailedReleases;
+use Slipstream\Fleet\DeployQueue;
 use Slipstream\Models\Deployment;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
+use Slipstream\Support\Activity;
 use Slipstream\Support\AuditLog;
+use Slipstream\Support\GitRef;
 
 class DeployCommand extends Command
 {
@@ -17,13 +20,26 @@ class DeployCommand extends Command
                             {--deployment= : Existing deployment id}
                             {--sha= : Commit SHA to deploy (default: branch tip)}
                             {--branch= : Branch name}
+                            {--tag= : Deploy a tag instead of a branch}
+                            {--skip-hooks= : Comma-separated hook ids to skip for this deploy only}
+                            {--fleet : Queue on every enabled, unpaused server — this node runs detached, peers claim their row; follow with slipstream:deployment --follow}
                             {--trigger=manual : Trigger label}';
 
     protected $description = 'Run a Slipstream deploy (detached from webhook/dashboard, or manually)';
 
     public function handle(SettingsRepository $settings): int
     {
-        $deployment = $this->resolveDeployment($settings);
+        try {
+            if ($this->option('fleet')) {
+                return $this->deployFleet($settings, app(DeployQueue::class));
+            }
+
+            $deployment = $this->resolveDeployment($settings);
+        } catch (\InvalidArgumentException $e) {
+            $this->components->error($e->getMessage());
+
+            return self::FAILURE;
+        }
 
         $this->trapInterrupts();
 
@@ -191,12 +207,116 @@ class DeployCommand extends Command
             return $deployment;
         }
 
-        return Deployment::query()->create([
+        return Deployment::query()->create($this->attributes($settings) + [
             'server_name' => Slipstream::serverName(),
-            'sha' => $this->option('sha') ?: null,
-            'branch' => $this->option('branch') ?: $settings->branch(),
-            'trigger' => $this->option('trigger') ?: Deployment::TRIGGER_MANUAL,
             'status' => Deployment::STATUS_PENDING,
         ]);
+    }
+
+    /**
+     * The dashboard's "Deploy now" from the shell: this node runs at once (in
+     * a detached process, like a webhook deploy), every other eligible server
+     * gets a queued row it claims through its nudge or heartbeat. A PCI node
+     * never drives peers, so there it is refused rather than half-done.
+     */
+    protected function deployFleet(SettingsRepository $settings, DeployQueue $queue): int
+    {
+        if (Slipstream::pciMode()) {
+            $this->components->error('PCI mode: this node does not drive peers. Run without --fleet to deploy this server.');
+
+            return self::FAILURE;
+        }
+
+        if ($this->option('deployment')) {
+            throw new \InvalidArgumentException('--fleet creates its own deployment rows; it cannot be combined with --deployment.');
+        }
+
+        $attributes = $this->attributes($settings);
+        $result = $queue->queue($attributes);
+        $local = $result['local'];
+
+        Activity::log('deploy.started', [
+            'via' => 'cli',
+            'deployment' => $local?->id,
+            'batch' => $result['batch'],
+            'queued_for' => $result['queued'],
+            'branch' => $attributes['branch'],
+            'sha' => $attributes['sha'],
+            'deploy_from' => $attributes['meta']['deploy_from'] ?? 'default',
+            'skip_hook_ids' => $attributes['meta']['skip_hook_ids'] ?? [],
+        ]);
+
+        if (! $local && $result['queued'] === []) {
+            $this->components->error('Nothing started: no eligible servers'.($result['skipped'] !== [] ? ' (paused/disabled: '.implode(', ', $result['skipped']).')' : '.'));
+
+            return self::FAILURE;
+        }
+
+        if ($local) {
+            $this->components->twoColumnDetail(
+                Slipstream::serverName(),
+                $local->status === Deployment::STATUS_FAILED
+                    ? '<fg=red>#'.$local->id.' failed to start: '.($local->failure_reason ?: 'spawn failed').'</>'
+                    : "#{$local->id} started (detached)"
+            );
+        }
+        if ($result['queued'] !== []) {
+            $this->components->twoColumnDetail('Queued for', implode(', ', $result['queued']));
+        }
+        if ($result['skipped'] !== []) {
+            $this->components->twoColumnDetail('Skipped (paused/disabled)', implode(', ', $result['skipped']));
+        }
+        if ($local) {
+            $this->line("  Follow it: php artisan slipstream:deployment {$local->id} --follow");
+        }
+
+        return $local && $local->status === Deployment::STATUS_FAILED ? self::FAILURE : self::SUCCESS;
+    }
+
+    /**
+     * What to deploy, from the options: a branch tip (the default branch when
+     * none is named), a pinned SHA, or a tag — plus the hooks to skip this
+     * once, exactly as the dashboard's deploy modal records them.
+     *
+     * @return array{sha: ?string, branch: string, trigger: string, meta?: array<string, mixed>}
+     */
+    protected function attributes(SettingsRepository $settings): array
+    {
+        $sha = $this->option('sha') ?: null;
+        $tag = $this->option('tag') ?: null;
+        $branch = $this->option('branch') ?: null;
+
+        if ($tag && $branch) {
+            throw new \InvalidArgumentException('--tag and --branch are exclusive.');
+        }
+        if ($tag && $sha) {
+            throw new \InvalidArgumentException('--tag and --sha are exclusive: a tag already names a commit.');
+        }
+        if ($sha && ! Deployer::isValidSha($sha)) {
+            throw new \InvalidArgumentException('--sha must be a 7-64 character hex object id.');
+        }
+
+        $ref = trim((string) ($tag ?? $branch ?? $settings->branch()));
+        if (! GitRef::isValidName($ref)) {
+            throw new \InvalidArgumentException("\"{$ref}\" is not a valid git ref name.");
+        }
+
+        $meta = [];
+        if ($tag) {
+            $meta['deploy_from'] = 'tag';
+        }
+        if (($skip = (string) $this->option('skip-hooks')) !== '') {
+            $ids = array_values(array_unique(array_filter(array_map('intval', explode(',', $skip)))));
+            if ($ids === []) {
+                throw new \InvalidArgumentException('--skip-hooks expects hook ids, comma-separated. See `slipstream:hooks list`.');
+            }
+            $meta['skip_hook_ids'] = $ids;
+        }
+
+        return [
+            'sha' => $sha,
+            'branch' => $ref,
+            'trigger' => $this->option('trigger') ?: Deployment::TRIGGER_MANUAL,
+        ] + ($meta !== [] ? ['meta' => $meta] : []);
     }
 }

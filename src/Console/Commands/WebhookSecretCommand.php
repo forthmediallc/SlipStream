@@ -20,14 +20,28 @@ class WebhookSecretCommand extends Command
 {
     protected $signature = 'slipstream:webhook-secret
                             {--reveal : Print the secret}
-                            {--rotate : Replace the secret with a new one (every git host must be updated)}';
+                            {--rotate : Replace the secret with a new one (every git host must be updated)}
+                            {--rotate-fleet-key : Give the fleet its own signing key, or replace the existing one — never printed; peers read it from the shared database}';
 
-    protected $description = 'Show or rotate the webhook secret shared with the git host';
+    protected $description = 'Show or rotate the webhook secret shared with the git host, or rotate the fleet key';
 
     public function handle(SettingsRepository $settings): int
     {
         $rotate = (bool) $this->option('rotate');
         $reveal = (bool) $this->option('reveal');
+
+        if ($this->option('rotate-fleet-key')) {
+            $separated = $settings->hasSeparatePeerSecret();
+            $settings->rotatePeerSecret();
+            Activity::log($separated ? 'webhook.fleet_key_rotated' : 'webhook.fleet_key_separated', ['via' => 'cli', 'os_user' => FpmPool::currentUser()]);
+            $this->components->info($separated
+                ? 'Fleet key rotated. Every node reads it from the shared database — no provider changes needed.'
+                : 'Fleet key separated from the webhook secret. Every node must run a Slipstream version that knows the split, or peers still signing with the webhook secret are rejected.');
+
+            if (! $rotate && ! $reveal) {
+                return self::SUCCESS;
+            }
+        }
 
         if ($rotate) {
             $settings->rotateWebhookSecret();

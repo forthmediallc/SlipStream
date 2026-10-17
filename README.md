@@ -226,11 +226,19 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 |---|---|
 | `slipstream:install` | Publish assets, migrate, seed defaults; `--pci` turns on [PCI mode](#pci-mode) for this server |
 | `slipstream:publish` | Re-publish config / assets / migrations |
-| `slipstream:webhook-secret` | Show (`--reveal`) or replace (`--rotate`) the webhook secret from the shell — the only way in PCI mode |
+| `slipstream:status` | Fleet overview: servers and drift, in-flight and latest deployments, failures in the last 24h, pipelines (`--json`) |
+| `slipstream:deployments` | List deployments, newest first: `--active`, `--failed`, `--status=`, `--server=this`, `--limit=` (`--json`) |
+| `slipstream:deployment` | One deployment with its log; `--follow` tails a running one and exits non-zero if it fails (`--tail=`, `--json`) |
+| `slipstream:deliveries` | Recent webhook deliveries and their outcome — "why didn't my push deploy?" (`--json`) |
+| `slipstream:hooks` | Deploy hooks: `list`, `show <id>`, `add`, `edit <id>`, `enable`/`disable <id>`, `delete <id>`, `move <id> up\|down` |
+| `slipstream:servers` | Fleet servers: `list`, `pause`/`resume`, `enable`/`disable`, `set --base-url=… --run-migrations=…`, `forget <name>` |
+| `slipstream:pipelines` | Pipelines: `list`, `add --name= --branch=`, `edit`, `enable`/`disable`, `delete` |
+| `slipstream:settings` | `show`, or `set --repo= --branch= --keep-releases= --shared-path=in:on --mail= --slack-url= … --relay=on\|off` |
+| `slipstream:webhook-secret` | Show (`--reveal`) or replace (`--rotate`) the webhook secret; `--rotate-fleet-key` separates or rotates the fleet key |
 | `slipstream:provision` | Deploy key, bare mirror, directory layout; `--adopt` converts a live checkout into the first release |
 | `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access, webhook reachability and the PCI-mode checks — with the fix for each |
-| `slipstream:deploy` | Run a deploy (or `--deployment=`) |
-| `slipstream:rollback` | Point `current` at the previous release |
+| `slipstream:deploy` | Run a deploy here (or `--deployment=`); `--sha=` pins a commit, `--tag=` deploys a tag, `--skip-hooks=1,2` skips hooks once, `--fleet` is the dashboard's fleet-wide Deploy |
+| `slipstream:rollback` | Point `current` at the previous release; `--fleet` rolls every eligible server back to its own previous release |
 | `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom) |
 | `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, and fail deploys orphaned by a killed process (scheduled every minute) |
 | `slipstream:prune` | Trim old deploy events + webhook deliveries + terminal env pushes; fail stuck deploys/applies (scheduled daily) |
@@ -455,22 +463,30 @@ minute heartbeat (server registry, stuck-deploy watchdog); notifications; the da
 
 ### Operating a PCI node
 
-Everything happens from the shell:
+Every dashboard page has a command, so nothing needs the UI:
 
 ```bash
-php artisan slipstream:webhook-secret --reveal      # the value to paste into the git host
-php artisan slipstream:webhook-secret --rotate --reveal
-php artisan slipstream:deploy                        # deploy the configured branch now
-php artisan slipstream:deploy --sha=<sha>            # pin a commit (what the dashboard's Redeploy did)
+php artisan slipstream:status                        # the front page: servers, drift, what's running, what failed
+php artisan slipstream:deployments --active          # or --failed, --status=building, --server=this
+php artisan slipstream:deployment --follow           # tail the newest deploy on this node; exits 1 if it fails
+php artisan slipstream:deliveries                    # the webhook delivery log
+php artisan slipstream:hooks                         # list; show/add/edit/enable/disable/delete/move
+php artisan slipstream:hooks add --step=composer --name="Build assets" --script-file=deploy/build.sh
+php artisan slipstream:servers                       # list; pause/resume, set --run-migrations=0, forget
+php artisan slipstream:pipelines                     # list; add --name=main --branch=main
+php artisan slipstream:settings show                 # set --repo=… --branch=… --keep-releases=…
+php artisan slipstream:webhook-secret --reveal       # the value to paste into the git host
+php artisan slipstream:deploy                        # deploy the configured branch on this server now
+php artisan slipstream:deploy --sha=<sha>            # pin a commit (the dashboard's Redeploy)
 php artisan slipstream:rollback
 php artisan slipstream:doctor
 ```
 
-Settings (repo URL, branch, keep-N, shared paths, notifications) and hooks live in the
-`slipstream_*` tables; `install` seeds the defaults, and without a dashboard they change only
-through the database. Each PCI node needs its own provider webhook — there is no relay — and
-a fresh `install` gives a new database its own webhook secret and fleet key, so a vault with
-its own database shares no secret with the rest of your fleet.
+Each PCI node needs its own provider webhook — there is no relay, and `--fleet` is refused —
+and a fresh `install` gives a new database its own webhook secret and fleet key, so a vault
+with its own database shares no secret with the rest of your fleet. Every change made this
+way is recorded in `slipstream_activity_log` with `via: cli` and, in PCI mode, in the audit
+log channel.
 
 ### Restricting the hook's source
 

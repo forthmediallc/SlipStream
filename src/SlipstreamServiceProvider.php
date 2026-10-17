@@ -8,19 +8,27 @@ use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
+use Slipstream\Console\Commands\DeliveriesCommand;
 use Slipstream\Console\Commands\DeployCommand;
+use Slipstream\Console\Commands\DeploymentCommand;
+use Slipstream\Console\Commands\DeploymentsCommand;
 use Slipstream\Console\Commands\DeployNudgeCommand;
 use Slipstream\Console\Commands\DoctorCommand;
 use Slipstream\Console\Commands\EnvApplyCommand;
 use Slipstream\Console\Commands\EnvNudgeCommand;
 use Slipstream\Console\Commands\HealthcheckCommand;
 use Slipstream\Console\Commands\HeartbeatCommand;
+use Slipstream\Console\Commands\HooksCommand;
 use Slipstream\Console\Commands\InstallCommand;
+use Slipstream\Console\Commands\PipelinesCommand;
 use Slipstream\Console\Commands\ProvisionCommand;
 use Slipstream\Console\Commands\PruneCommand;
 use Slipstream\Console\Commands\PublishCommand;
 use Slipstream\Console\Commands\RelayCommand;
 use Slipstream\Console\Commands\RollbackCommand;
+use Slipstream\Console\Commands\ServersCommand;
+use Slipstream\Console\Commands\SettingsCommand;
+use Slipstream\Console\Commands\StatusCommand;
 use Slipstream\Console\Commands\WebhookSecretCommand;
 use Slipstream\Http\Middleware\AuthorizeSlipstream;
 use Slipstream\Livewire\DeployHooksPage;
@@ -101,6 +109,15 @@ class SlipstreamServiceProvider extends ServiceProvider
             EnvNudgeCommand::class,
             DeployNudgeCommand::class,
             WebhookSecretCommand::class,
+            // The dashboard pages as commands, for PCI nodes and for scripts.
+            StatusCommand::class,
+            DeploymentsCommand::class,
+            DeploymentCommand::class,
+            DeliveriesCommand::class,
+            HooksCommand::class,
+            ServersCommand::class,
+            PipelinesCommand::class,
+            SettingsCommand::class,
         ]);
     }
 

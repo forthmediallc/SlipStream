@@ -3,6 +3,7 @@
 namespace Slipstream\Livewire;
 
 use Livewire\Attributes\Locked;
+use Slipstream\Deploy\DeploySteps;
 use Slipstream\Models\DeploymentHook;
 use Slipstream\Slipstream;
 use Slipstream\Support\Activity;
@@ -36,18 +37,10 @@ class DeployHooksPage extends SlipstreamComponent
     public bool $hook_all_servers = true;
 
     /** Structural steps a hook can attach to (the locked skeleton). */
-    public const STEPS = ['fetch', 'link_shared', 'composer', 'health', 'swap', 'fpm', 'prune'];
+    public const STEPS = DeploySteps::STEPS;
 
     /** Ordered built-in steps: key => [label, what it does]. */
-    public const STEP_META = [
-        'fetch' => ['Clone new release', 'git archive of the target commit into a fresh release dir'],
-        'link_shared' => ['Link shared paths', '.env, storage/, and any shared directories'],
-        'composer' => ['Install Composer dependencies', 'composer install --no-dev --optimize-autoloader'],
-        'health' => ['Health check', 'php artisan slipstream:healthcheck — gates the swap'],
-        'swap' => ['Activate new release', 'atomic symlink swap: current → new release'],
-        'fpm' => ['Reload PHP-FPM', 'graceful systemctl reload (connections kept)'],
-        'prune' => ['Purge old releases', 'keep the newest N releases'],
-    ];
+    public const STEP_META = DeploySteps::META;
 
     public function newHook(): void
     {

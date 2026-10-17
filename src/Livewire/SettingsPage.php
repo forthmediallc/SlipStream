@@ -6,6 +6,7 @@ use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\Activity;
 use Slipstream\Support\GitRef;
+use Slipstream\Support\SharedPaths;
 
 class SettingsPage extends SlipstreamComponent
 {
@@ -182,24 +183,11 @@ class SettingsPage extends SlipstreamComponent
 
     protected function normalizePath(string $path): string
     {
-        $path = trim(str_replace('\\', '/', $path));
-        $path = trim($path, '/');
-
-        return $path;
+        return SharedPaths::normalize($path);
     }
 
     protected function isUnsafePath(string $path): bool
     {
-        if ($path === '' || str_starts_with($path, '/')) {
-            return true;
-        }
-
-        foreach (explode('/', $path) as $segment) {
-            if ($segment === '..' || $segment === '.') {
-                return true;
-            }
-        }
-
-        return false;
+        return SharedPaths::isUnsafe($path);
     }
 }
