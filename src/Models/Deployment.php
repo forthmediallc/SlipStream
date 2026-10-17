@@ -5,6 +5,7 @@ namespace Slipstream\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Slipstream\Support\AuditLog;
 
 class Deployment extends Model
 {
@@ -64,6 +65,36 @@ class Deployment extends Model
             'duration_ms' => 'integer',
             'meta' => 'array',
         ];
+    }
+
+    /**
+     * Every row and every status change is an audit event: pending/queued at
+     * creation, then building, deployed, failed, rolled-back, superseded.
+     * Query-builder updates (claims, watchdog sweeps) bypass model events and
+     * record themselves.
+     */
+    protected static function booted(): void
+    {
+        static::created(fn (Deployment $deployment) => $deployment->audit());
+        static::updated(function (Deployment $deployment) {
+            if ($deployment->wasChanged('status')) {
+                $deployment->audit();
+            }
+        });
+    }
+
+    public function audit(): void
+    {
+        AuditLog::record('deployment.'.$this->status, [
+            'deployment' => $this->id,
+            'server' => $this->server_name,
+            'trigger' => $this->trigger,
+            'sha' => $this->sha,
+            'branch' => $this->branch,
+            'pipeline' => $this->pipeline_id,
+            'user' => $this->initiator_user_id,
+            'reason' => $this->failure_reason,
+        ]);
     }
 
     /**

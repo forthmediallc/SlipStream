@@ -4,6 +4,7 @@ namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
 use Slipstream\Models\WebhookDelivery;
+use Slipstream\Slipstream;
 use Slipstream\Webhooks\RelayFanout;
 
 /**
@@ -19,6 +20,12 @@ class RelayCommand extends Command
 
     public function handle(RelayFanout $relay): int
     {
+        if (Slipstream::pciMode()) {
+            $this->warn('PCI mode: this node does not fan out to peers — nothing relayed.');
+
+            return self::SUCCESS;
+        }
+
         $id = $this->option('delivery');
         if (! $id) {
             $this->error('Missing --delivery.');

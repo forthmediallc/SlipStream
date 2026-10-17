@@ -158,6 +158,13 @@ class DeployQueue
      */
     public function processQueued(): ?Deployment
     {
+        // A PCI node takes work from its own provider webhook only. A queued
+        // row for it could only come from a dashboard on another node sharing
+        // the database — exactly the path PCI mode exists to close.
+        if (Slipstream::pciMode()) {
+            return null;
+        }
+
         $self = Slipstream::serverName();
 
         // Re-check eligibility at claim time: a row queued just before the

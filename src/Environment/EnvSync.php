@@ -50,10 +50,16 @@ class EnvSync
     /**
      * Master switch: config toggle plus the tables actually existing (so a
      * new-code node before its migration ran, or an operator who opted out,
-     * cleanly no-ops the whole feature).
+     * cleanly no-ops the whole feature). PCI mode forces it off: no snapshot
+     * of this node's .env leaves the box, no push is applied, and the
+     * env-sync endpoint is not even registered.
      */
     public static function enabled(): bool
     {
+        if (Slipstream::pciMode()) {
+            return false;
+        }
+
         if (! filter_var(config('slipstream.environment.sync_enabled', true), FILTER_VALIDATE_BOOLEAN)) {
             return false;
         }

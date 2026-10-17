@@ -25,6 +25,12 @@ class EnvNudgeCommand extends Command
 
     public function handle(SettingsRepository $settings): int
     {
+        if (Slipstream::pciMode()) {
+            $this->warn('PCI mode: this node does not talk to peers — nothing nudged.');
+
+            return self::SUCCESS;
+        }
+
         // Fleet key, not the provider-shared webhook secret — see
         // SettingsRepository::peerSecret().
         $secret = $settings->peerSecret();

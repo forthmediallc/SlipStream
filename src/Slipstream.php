@@ -39,9 +39,17 @@ class Slipstream
      * Resolution order: an explicit Slipstream::auth() callback, then a
      * host-defined `viewSlipstream` gate, else the local fallback. The package
      * no longer defines the gate itself, so consulting it here cannot recurse.
+     *
+     * In PCI mode nobody passes, whatever the host configured: the dashboard
+     * routes and components are not registered there, and this is the
+     * backstop for anything that reaches a component some other way.
      */
     public static function check(Request $request): bool
     {
+        if (static::pciMode()) {
+            return false;
+        }
+
         if (static::$authUsing !== null) {
             return (bool) (static::$authUsing)($request);
         }
@@ -215,6 +223,36 @@ class Slipstream
     public static function viewEnabled(string $section): bool
     {
         return (bool) config("slipstream.views.{$section}", true);
+    }
+
+    /**
+     * Whether this node runs the locked-down PCI profile: provider webhook
+     * only — no dashboard, no .env editor or sync, no peer traffic, no fleet
+     * queue. See config/slipstream.php ("PCI mode") for the full list.
+     *
+     * Read from config so it is env-driven (SLIPSTREAM_PCI_MODE) and cached
+     * with the rest of the config; nothing inside the package can change it.
+     */
+    public static function pciMode(): bool
+    {
+        return filter_var(config('slipstream.pci.enabled', false), FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
+     * Source addresses the provider hook accepts (IPs / CIDRs); empty = any.
+     * Tolerates a stale published config without the key and a string value.
+     *
+     * @return list<string>
+     */
+    public static function webhookAllowedIps(): array
+    {
+        $configured = config('slipstream.webhook.allowed_ips', []);
+
+        if (is_string($configured)) {
+            $configured = explode(',', $configured);
+        }
+
+        return array_values(array_filter(array_map('trim', (array) $configured)));
     }
 
     /**

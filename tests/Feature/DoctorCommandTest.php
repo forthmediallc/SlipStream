@@ -49,6 +49,35 @@ class DoctorCommandTest extends TestCase
             ->assertExitCode(1);
     }
 
+    /**
+     * The vault's own credentials on a node that still has the dashboard,
+     * the .env editor and env sync: the one configuration the sentinel list
+     * exists to catch, and a blocker rather than a note.
+     */
+    public function test_a_sentinel_key_present_with_pci_mode_off_is_a_failure(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        config()->set('slipstream.pci.sentinel_keys', ['VAULT_DB_HOST', 'GATEWAY_SECRET_ARN']);
+        file_put_contents($this->root.DIRECTORY_SEPARATOR.'.env', "APP_KEY=x\nexport VAULT_DB_HOST=vault.internal\n");
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('VAULT_DB_HOST present but PCI mode is off')
+            ->expectsOutputToContain('slipstream:install --pci')
+            ->assertExitCode(1);
+    }
+
+    public function test_absent_sentinel_keys_pass_and_pci_mode_is_reported_off(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        config()->set('slipstream.pci.sentinel_keys', ['VAULT_DB_HOST']);
+        file_put_contents($this->root.DIRECTORY_SEPARATOR.'.env', "APP_KEY=x\nVAULT_DB_HOST_BACKUP=not-the-key\n");
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('none of VAULT_DB_HOST present')
+            ->expectsOutputToContain('any address (signature verified)')
+            ->assertExitCode(1); // the bare layout still fails elsewhere
+    }
+
     public function test_an_enforced_signature_counts_as_a_healthy_hook(): void
     {
         Http::fake(['*' => Http::response('invalid signature', 401)]);

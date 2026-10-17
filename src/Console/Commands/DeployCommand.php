@@ -9,6 +9,7 @@ use Slipstream\Deploy\FailedReleases;
 use Slipstream\Models\Deployment;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
+use Slipstream\Support\AuditLog;
 
 class DeployCommand extends Command
 {
@@ -102,14 +103,22 @@ class DeployCommand extends Command
                 ->get();
 
             foreach ($inFlight as $deployment) {
-                Deployment::query()
+                $reason = "Interrupted by operator (signal {$signal}) — the deploy process was killed mid-run.";
+
+                $failed = Deployment::query()
                     ->whereKey($deployment->id)
                     ->whereIn('status', [Deployment::STATUS_PENDING, Deployment::STATUS_BUILDING])
                     ->update([
                         'status' => Deployment::STATUS_FAILED,
-                        'failure_reason' => "Interrupted by operator (signal {$signal}) — the deploy process was killed mid-run.",
+                        'failure_reason' => $reason,
                         'finished_at' => now(),
                     ]);
+
+                // A query-builder update fires no model event; a killed deploy
+                // is exactly what an audit trail must show.
+                if ($failed > 0) {
+                    AuditLog::record('deployment.failed', ['deployment' => $deployment->id, 'reason' => $reason, 'via' => 'signal']);
+                }
 
                 $this->markReleaseFailed($deployment->release_path);
             }

@@ -2,7 +2,9 @@
 
 namespace Slipstream\Deploy;
 
+use Illuminate\Database\Eloquent\Builder;
 use Slipstream\Models\Deployment;
+use Slipstream\Support\AuditLog;
 
 /**
  * Fails deploy rows whose process died without ever reaching a terminal status.
@@ -40,14 +42,12 @@ class StuckDeploymentsSweeper
         // threshold matches every in-flight row the moment it starts.
         $stuckMinutes = (int) config('slipstream.deploy.stuck_minutes', 120);
         if ($stuckMinutes > 0) {
-            $building = $this->scoped($serverName)
-                ->where('status', Deployment::STATUS_BUILDING)
-                ->where('started_at', '<', now()->subMinutes($stuckMinutes))
-                ->update([
-                    'status' => Deployment::STATUS_FAILED,
-                    'failure_reason' => "Marked failed by watchdog: stuck in 'building' for over {$stuckMinutes} minutes (deploy process likely died).",
-                    'finished_at' => now(),
-                ]);
+            $building = $this->fail(
+                $this->scoped($serverName)
+                    ->where('status', Deployment::STATUS_BUILDING)
+                    ->where('started_at', '<', now()->subMinutes($stuckMinutes)),
+                "Marked failed by watchdog: stuck in 'building' for over {$stuckMinutes} minutes (deploy process likely died)."
+            );
 
             // Rows claimed but never started. "pending" only covers process
             // start-up — the Deployer marks "building" right after taking the
@@ -61,14 +61,12 @@ class StuckDeploymentsSweeper
             $pendingMinutes = (int) config('slipstream.deploy.pending_stuck_minutes', self::DEFAULT_PENDING_MINUTES);
             $pendingMinutes = $pendingMinutes > 0 ? min($pendingMinutes, $stuckMinutes) : $stuckMinutes;
 
-            $pending = $this->scoped($serverName)
-                ->where('status', Deployment::STATUS_PENDING)
-                ->where('updated_at', '<', now()->subMinutes($pendingMinutes))
-                ->update([
-                    'status' => Deployment::STATUS_FAILED,
-                    'failure_reason' => "Marked failed by watchdog: still 'pending' after {$pendingMinutes} minutes — the spawned deploy process never started. Check deploy/logs/detach-*.log and run php artisan slipstream:doctor.",
-                    'finished_at' => now(),
-                ]);
+            $pending = $this->fail(
+                $this->scoped($serverName)
+                    ->where('status', Deployment::STATUS_PENDING)
+                    ->where('updated_at', '<', now()->subMinutes($pendingMinutes)),
+                "Marked failed by watchdog: still 'pending' after {$pendingMinutes} minutes — the spawned deploy process never started. Check deploy/logs/detach-*.log and run php artisan slipstream:doctor."
+            );
         }
 
         // Queued fleet actions to a server that never came back to claim them.
@@ -76,17 +74,55 @@ class StuckDeploymentsSweeper
         $queued = 0;
         $queuedMaxHours = (int) config('slipstream.deploy.queued_max_hours', 24);
         if ($queuedMaxHours > 0) {
-            $queued = $this->scoped($serverName)
-                ->where('status', Deployment::STATUS_QUEUED)
-                ->where('created_at', '<', now()->subHours($queuedMaxHours))
-                ->update([
-                    'status' => Deployment::STATUS_FAILED,
-                    'failure_reason' => "Expired after {$queuedMaxHours}h queued (server offline, paused, or removed).",
-                    'finished_at' => now(),
-                ]);
+            $queued = $this->fail(
+                $this->scoped($serverName)
+                    ->where('status', Deployment::STATUS_QUEUED)
+                    ->where('created_at', '<', now()->subHours($queuedMaxHours)),
+                "Expired after {$queuedMaxHours}h queued (server offline, paused, or removed)."
+            );
         }
 
-        return ['building' => (int) $building, 'pending' => (int) $pending, 'queued' => (int) $queued];
+        return ['building' => $building, 'pending' => $pending, 'queued' => $queued];
+    }
+
+    /**
+     * Fail every row the query matches, in one UPDATE that keeps the query's
+     * own status condition (a row that finished between a look and the write
+     * must not be overwritten). A query-builder update fires no model events,
+     * so with the audit log on the rows are read back and recorded here.
+     *
+     * @param  Builder<Deployment>  $query
+     */
+    protected function fail(Builder $query, string $reason): int
+    {
+        $update = [
+            'status' => Deployment::STATUS_FAILED,
+            'failure_reason' => $reason,
+            'finished_at' => now(),
+        ];
+
+        if (! AuditLog::enabled()) {
+            return (int) $query->update($update);
+        }
+
+        $ids = (clone $query)->pluck('id')->all();
+        if ($ids === []) {
+            return 0;
+        }
+
+        $count = (int) (clone $query)->whereIn('id', $ids)->update($update);
+
+        $failed = Deployment::query()
+            ->whereIn('id', $ids)
+            ->where('status', Deployment::STATUS_FAILED)
+            ->where('failure_reason', $reason)
+            ->pluck('id');
+
+        foreach ($failed as $id) {
+            AuditLog::record('deployment.failed', ['deployment' => $id, 'reason' => $reason, 'via' => 'watchdog']);
+        }
+
+        return $count;
     }
 
     /**

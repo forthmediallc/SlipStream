@@ -26,8 +26,16 @@ class RelayFanout
         protected SettingsRepository $settings
     ) {}
 
+    /**
+     * Relay mode is a dashboard setting; PCI mode overrides it, so a node in
+     * that profile never fans a push out to peers whatever the table says.
+     */
     public function enabled(): bool
     {
+        if (Slipstream::pciMode()) {
+            return false;
+        }
+
         return filter_var($this->settings->get('relay_enabled', false), FILTER_VALIDATE_BOOLEAN);
     }
 

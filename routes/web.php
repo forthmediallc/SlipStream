@@ -6,6 +6,8 @@ use Illuminate\Support\Facades\Route;
 use Slipstream\Http\Controllers\DashboardController;
 use Slipstream\Http\Controllers\WebhookController;
 use Slipstream\Http\Middleware\AuthorizeSlipstream;
+use Slipstream\Http\Middleware\RestrictWebhookSource;
+use Slipstream\Slipstream;
 
 // Unauthenticated — signature/token verified inside the controller. These are
 // machine-to-machine POSTs (GitHub/GitLab/Bitbucket providers, peer relay, and
@@ -21,10 +23,20 @@ use Slipstream\Http\Middleware\AuthorizeSlipstream;
 $hookCsrf = [ValidateCsrfToken::class, PreventRequestForgery::class];
 $hookThrottle = 'throttle:'.config('slipstream.webhook.throttle', '60,1');
 
+// The provider hook is the one route that exists in every mode. Its optional
+// source allow-list runs after the throttle and before the body is read.
 Route::post('/hooks/deploy', [WebhookController::class, 'deploy'])
     ->withoutMiddleware($hookCsrf)
-    ->middleware($hookThrottle)
+    ->middleware([$hookThrottle, RestrictWebhookSource::class])
     ->name('slipstream.hooks.deploy');
+
+// PCI mode: nothing below is registered. Peer traffic (relay, env-sync and
+// deploy-sync nudges) and the dashboard 404 — there is no "disabled" response
+// to probe, and no gate to get past, because the routes do not exist.
+if (Slipstream::pciMode()) {
+    return;
+}
+
 Route::post('/hooks/relay', [WebhookController::class, 'relay'])
     ->withoutMiddleware($hookCsrf)
     ->middleware($hookThrottle)

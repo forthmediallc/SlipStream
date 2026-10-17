@@ -9,7 +9,9 @@ use Slipstream\Diagnostics\CheckResult;
 use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Diagnostics\FpmPool;
 use Slipstream\Diagnostics\Ownership;
+use Slipstream\Environment\EnvContentMerger;
 use Slipstream\Models\Server;
+use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\PhpBinary;
 use Slipstream\Support\Sudo;
@@ -37,6 +39,7 @@ class DoctorCommand extends Command
         $this->components->info("Checking Slipstream at {$root}");
 
         $checks = [
+            'checkPciMode',
             'checkPoolUser',
             'checkPhpBinary',
             'checkLayoutWritable',
@@ -48,6 +51,8 @@ class DoctorCommand extends Command
             'checkGitAccess',
             'checkPackageCommitted',
             'checkWebhookReachable',
+            'checkWebhookSource',
+            'checkPciSentinels',
         ];
 
         $failures = 0;
@@ -671,7 +676,9 @@ class DoctorCommand extends Command
         }
 
         try {
-            $status = Http::timeout(5)->withoutRedirecting()->post($url)->status();
+            $response = Http::timeout(5)->withoutRedirecting()->post($url);
+            $status = $response->status();
+            $body = (string) $response->body();
         } catch (\Throwable) {
             return CheckResult::warn(
                 'webhook endpoint',
@@ -681,6 +688,9 @@ class DoctorCommand extends Command
         }
 
         return match (true) {
+            // With a source allow-list this probe is refused before the
+            // signature is looked at — which still proves the route is there.
+            $status === 403 && str_contains($body, 'source not allowed') => CheckResult::pass('webhook endpoint', 'reachable, source restricted'),
             $status === 401 || $status === 403 => CheckResult::pass('webhook endpoint', 'reachable, signature enforced'),
             $status === 419 => CheckResult::fail(
                 'webhook endpoint',
@@ -696,5 +706,109 @@ class DoctorCommand extends Command
             ),
             default => CheckResult::warn('webhook endpoint', 'unexpected status '.$status.' from '.$url),
         };
+    }
+
+    /**
+     * PCI mode is a statement about what this node does NOT do. Put it at the
+     * top of the output an assessor is shown, and flag configuration that
+     * reads differently from the behaviour.
+     */
+    protected function checkPciMode(string $root): CheckResult
+    {
+        if (! Slipstream::pciMode()) {
+            return CheckResult::skip('PCI mode', 'off');
+        }
+
+        $relayConfigured = false;
+        try {
+            $relayConfigured = filter_var(app(SettingsRepository::class)->get('relay_enabled', false), FILTER_VALIDATE_BOOLEAN);
+        } catch (\Throwable) {
+            // No settings table yet — nothing to contradict.
+        }
+
+        if ($relayConfigured) {
+            return CheckResult::warn(
+                'PCI mode',
+                'on, but relay_enabled is set in the settings table',
+                'The setting is ignored — a PCI node never fans out — but clear it so the configuration reads like the behaviour.'
+            );
+        }
+
+        return CheckResult::pass('PCI mode', 'on — provider hook only; dashboard, .env editor/sync, relay and fleet queue off');
+    }
+
+    /**
+     * The signature already protects the hook; the allow-list is the second
+     * control an assessor asks for on an unauthenticated route. Reported
+     * outside PCI mode, expected inside it.
+     */
+    protected function checkWebhookSource(string $root): CheckResult
+    {
+        $allowed = Slipstream::webhookAllowedIps();
+
+        if ($allowed !== []) {
+            return CheckResult::pass('webhook source', 'restricted to '.implode(', ', $allowed));
+        }
+
+        if (! Slipstream::pciMode()) {
+            return CheckResult::skip('webhook source', 'any address (signature verified)');
+        }
+
+        return CheckResult::warn(
+            'webhook source',
+            'any address can reach the hook',
+            "Restrict it to your git host's published ranges: SLIPSTREAM_WEBHOOK_ALLOWED_IPS=<ips/cidrs, comma-separated> in the shared .env,\n"
+            .'or an allow/deny block on the hook location in nginx (then this warning is expected). GitHub lists its ranges under '
+            .'"hooks" at https://api.github.com/meta, Bitbucket Cloud at https://ip-ranges.atlassian.com/ — both change over time.'
+        );
+    }
+
+    /**
+     * Sentinel keys (slipstream.pci.sentinel_keys) mark a CDE server by what
+     * its .env holds. One of them present with PCI mode off is the mistake
+     * this exists to catch: the vault's credentials on a node that still has
+     * the dashboard, the .env editor and env sync.
+     */
+    protected function checkPciSentinels(string $root): CheckResult
+    {
+        $keys = config('slipstream.pci.sentinel_keys', []);
+        if (is_string($keys)) {
+            $keys = explode(',', $keys);
+        }
+        $keys = array_values(array_filter(array_map('trim', (array) $keys)));
+
+        if ($keys === []) {
+            return CheckResult::skip('PCI sentinel keys', 'none configured');
+        }
+
+        $env = Slipstream::sharedEnvPath();
+        if (! is_file($env)) {
+            return CheckResult::skip('PCI sentinel keys', 'no shared .env to read');
+        }
+
+        $merger = new EnvContentMerger;
+        $found = [];
+        foreach (preg_split('/\r\n|\r|\n/', (string) @file_get_contents($env)) ?: [] as $line) {
+            $key = $merger->keyOf($line, $keys);
+            if ($key !== null) {
+                $found[$key] = true;
+            }
+        }
+        $found = array_keys($found);
+
+        if ($found === []) {
+            return CheckResult::pass('PCI sentinel keys', 'none of '.implode(', ', $keys).' present');
+        }
+
+        if (Slipstream::pciMode()) {
+            return CheckResult::pass('PCI sentinel keys', implode(', ', $found).' present, PCI mode on');
+        }
+
+        return CheckResult::fail(
+            'PCI sentinel keys',
+            implode(', ', $found).' present but PCI mode is off',
+            "This server holds CDE credentials and still has the dashboard, the .env editor and env sync.\n"
+            .'Enable PCI mode: php artisan slipstream:install --pci (or SLIPSTREAM_PCI_MODE=true in the shared .env).'
+        );
     }
 }

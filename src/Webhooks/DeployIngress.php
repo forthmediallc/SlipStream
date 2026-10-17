@@ -45,6 +45,23 @@ class DeployIngress
 
         $provider = $this->resolver->resolve($request);
 
+        // A PCI node takes deliveries from its git host only. The relay
+        // provider is matched on headers, not on the route, so a fleet-key
+        // signed push aimed at this hook would otherwise be accepted here even
+        // though /hooks/relay is not registered. Refused before any secret is
+        // looked up, and recorded like every other refusal.
+        if ($provider->name() === 'relay' && Slipstream::pciMode()) {
+            WebhookDelivery::query()->create([
+                'provider' => 'relay',
+                'server_name' => Slipstream::serverName(),
+                'signature_valid' => false,
+                'outcome' => 'rejected',
+                'outcome_detail' => 'Relay deliveries are refused in PCI mode',
+            ]);
+
+            return response('relay disabled', 403);
+        }
+
         // Relay is internal fleet traffic and verifies against the fleet key;
         // external providers verify against the secret shared with the git host.
         // Keeping them distinct means a leaked webhook secret cannot forge a

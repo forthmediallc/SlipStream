@@ -55,6 +55,63 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | PCI mode
+    |--------------------------------------------------------------------------
+    |
+    | A locked-down profile for servers inside a PCI DSS cardholder data
+    | environment (or any server where the dashboard must not exist). With it
+    | on, this node registers ONE route — the provider webhook — and nothing
+    | else: no dashboard, no Livewire components, no shared .env editor or
+    | env sync (no snapshots, no pushes, no /hooks/env-sync), no relay fan-out
+    | or /hooks/relay, and no fleet deploy queue (/hooks/deploy-sync, heartbeat
+    | claiming). What remains is "receive a signed push, build a release, swap".
+    |
+    | Enable it with `php artisan slipstream:install --pci` (writes the env
+    | line) or by setting SLIPSTREAM_PCI_MODE=true in the shared .env. It is
+    | deliberately env-driven: with the dashboard, env editor and env sync all
+    | off there is no path inside Slipstream that can flip it back — only
+    | someone with shell access editing the file.
+    |
+    | PCI DSS v4.0.1 req. 2.2.4 (only necessary functions enabled) is the
+    | control this serves. It does not take the server out of scope.
+    |
+    */
+    'pci' => [
+        'enabled' => filter_var(env('SLIPSTREAM_PCI_MODE', false), FILTER_VALIDATE_BOOLEAN),
+
+        // Keys whose presence in the shared .env marks a server as part of the
+        // CDE (vault database host, gateway credential ARNs, …). This file is
+        // committed to the repo, so every server shares the list; doctor warns
+        // when one of them is present and PCI mode is off.
+        'sentinel_keys' => array_values(array_filter(array_map(
+            'trim',
+            explode(',', (string) env('SLIPSTREAM_PCI_SENTINEL_KEYS', ''))
+        ))),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Audit log
+    |--------------------------------------------------------------------------
+    |
+    | Every webhook delivery outcome, deployment status change and dashboard/
+    | CLI action already lands in the slipstream_* tables. This additionally
+    | writes each one as a structured line to a Laravel log channel, so the
+    | host's log shipping (syslog, CloudWatch, a SIEM) carries it off-box —
+    | PCI DSS req. 10.3.3 wants audit logs promptly backed up to a central log
+    | server, and a table the deploy user can UPDATE is not that.
+    |
+    | `enabled` null = on in PCI mode, off otherwise. `channel` null = the
+    | app's default log channel.
+    |
+    */
+    'audit' => [
+        'enabled' => env('SLIPSTREAM_AUDIT_LOG'),
+        'channel' => env('SLIPSTREAM_AUDIT_LOG_CHANNEL'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Server name
     |--------------------------------------------------------------------------
     |
@@ -152,6 +209,22 @@ return [
         'max_body_bytes' => (int) env('SLIPSTREAM_WEBHOOK_MAX_BODY', 2_097_152),
         // Prune webhook delivery rows older than N days (0 = keep forever).
         'keep_delivery_days' => (int) env('SLIPSTREAM_KEEP_DELIVERY_DAYS', 30),
+
+        // Source addresses the provider hook (/hooks/deploy) accepts, as IPs
+        // or CIDR ranges, comma-separated. Empty = any source (the signature
+        // is still verified). A delivery from anywhere else is rejected with
+        // 403 and recorded in the delivery log before its body is read.
+        //
+        // GitHub publishes its hook ranges under "hooks" at
+        // https://api.github.com/meta, Bitbucket Cloud at
+        // https://ip-ranges.atlassian.com/ — both change over time, so refresh
+        // the list when a delivery is rejected. Behind a proxy or load
+        // balancer the app must trust it (TrustProxies) or the address seen
+        // here is the proxy's. Restricting at nginx is equivalent.
+        'allowed_ips' => array_values(array_filter(array_map(
+            'trim',
+            explode(',', (string) env('SLIPSTREAM_WEBHOOK_ALLOWED_IPS', ''))
+        ))),
 
         // Webhook deploys are idempotent per commit: a delivery naming the SHA
         // this node already deployed successfully is ignored. That bounds replay

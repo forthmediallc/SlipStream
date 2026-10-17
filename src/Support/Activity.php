@@ -8,7 +8,8 @@ use Slipstream\Slipstream;
 /**
  * Records who did what in the dashboard. Every state-changing dashboard action
  * writes one row so deploy history + settings/secret/pipeline/server changes
- * form a single audit trail (Envoyer "activity" parity).
+ * form a single audit trail (Envoyer "activity" parity). The same event also
+ * goes to the audit log channel when that is on (AuditLog).
  */
 class Activity
 {
@@ -17,9 +18,13 @@ class Activity
      */
     public static function log(string $action, array $meta = [], ?string $subject = null): void
     {
+        $userId = null;
+
         try {
+            $userId = auth()->id();
+
             ActivityLog::query()->create([
-                'user_id' => auth()->id(),
+                'user_id' => $userId,
                 'action' => $action,
                 'subject' => $subject,
                 'meta' => $meta !== [] ? $meta : null,
@@ -28,5 +33,7 @@ class Activity
         } catch (\Throwable) {
             // Auditing must never break the action it records.
         }
+
+        AuditLog::record('activity.'.$action, ['user' => $userId, 'subject' => $subject] + $meta);
     }
 }

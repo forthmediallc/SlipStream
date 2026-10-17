@@ -21,6 +21,7 @@ use Slipstream\Console\Commands\PruneCommand;
 use Slipstream\Console\Commands\PublishCommand;
 use Slipstream\Console\Commands\RelayCommand;
 use Slipstream\Console\Commands\RollbackCommand;
+use Slipstream\Console\Commands\WebhookSecretCommand;
 use Slipstream\Http\Middleware\AuthorizeSlipstream;
 use Slipstream\Livewire\DeployHooksPage;
 use Slipstream\Livewire\DeploymentShow;
@@ -99,6 +100,7 @@ class SlipstreamServiceProvider extends ServiceProvider
             EnvApplyCommand::class,
             EnvNudgeCommand::class,
             DeployNudgeCommand::class,
+            WebhookSecretCommand::class,
         ]);
     }
 
@@ -158,6 +160,13 @@ class SlipstreamServiceProvider extends ServiceProvider
         Livewire::addPersistentMiddleware([
             AuthorizeSlipstream::class,
         ]);
+
+        // PCI mode has no dashboard, so its components are not registered at
+        // all: an update request naming one has nothing to resolve. The gate
+        // (Slipstream::check() is always false there) covers whatever is left.
+        if (Slipstream::pciMode()) {
+            return;
+        }
 
         Livewire::component('slipstream.project-chrome', ProjectChrome::class);
         Livewire::component('slipstream.deployments-index', DeploymentsIndex::class);

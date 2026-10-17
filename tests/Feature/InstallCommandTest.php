@@ -2,6 +2,8 @@
 
 namespace Slipstream\Tests\Feature;
 
+use Slipstream\Models\ActivityLog;
+use Slipstream\Models\DeploymentHook;
 use Slipstream\Models\Pipeline;
 use Slipstream\Models\Server;
 use Slipstream\Settings\SettingsRepository;
@@ -16,6 +18,63 @@ class InstallCommandTest extends TestCase
         $this->assertTrue(Pipeline::query()->where('name', 'main')->exists());
         $this->assertTrue(Server::query()->where('server_name', 'test-node')->exists());
         $this->assertNotNull(app(SettingsRepository::class)->webhookSecret());
+    }
+
+    public function test_pci_install_turns_the_flag_on_in_the_shared_env(): void
+    {
+        $root = $this->envRoot("APP_KEY=x\nSLIPSTREAM_PCI_MODE=false\nAPP_ENV=production\n");
+
+        $this->artisan('slipstream:install --pci')
+            ->expectsOutputToContain('SLIPSTREAM_PCI_MODE=true written')
+            ->expectsOutputToContain('the only route registered in PCI mode')
+            ->assertExitCode(0);
+
+        // The existing line is replaced in place, nothing else moves, and the
+        // defaults a deploy needs are still seeded.
+        $this->assertSame("APP_KEY=x\nSLIPSTREAM_PCI_MODE=true\nAPP_ENV=production\n", file_get_contents($root.'/.env'));
+        $this->assertTrue(Pipeline::query()->where('name', 'main')->exists());
+        $this->assertTrue(DeploymentHook::query()->exists());
+        $this->assertSame(1, ActivityLog::query()->where('action', 'pci.enabled')->count());
+
+        $this->removeTree($root);
+    }
+
+    public function test_pci_install_appends_the_flag_and_is_idempotent(): void
+    {
+        $root = $this->envRoot("APP_KEY=x\n");
+
+        $this->artisan('slipstream:install --pci')->assertExitCode(0);
+        $this->artisan('slipstream:install --pci')
+            ->expectsOutputToContain('already on')
+            ->assertExitCode(0);
+
+        $this->assertSame("APP_KEY=x\nSLIPSTREAM_PCI_MODE=true\n", file_get_contents($root.'/.env'));
+        $this->assertSame(1, ActivityLog::query()->where('action', 'pci.enabled')->count(), 'a no-op re-run is not an event');
+
+        $this->removeTree($root);
+    }
+
+    public function test_a_plain_install_leaves_the_env_alone(): void
+    {
+        $root = $this->envRoot("APP_KEY=x\n");
+
+        $this->artisan('slipstream:install')
+            ->expectsOutputToContain('Dashboard:')
+            ->assertExitCode(0);
+
+        $this->assertSame("APP_KEY=x\n", file_get_contents($root.'/.env'));
+
+        $this->removeTree($root);
+    }
+
+    protected function envRoot(string $contents): string
+    {
+        $root = sys_get_temp_dir().DIRECTORY_SEPARATOR.'ss-install-'.bin2hex(random_bytes(4));
+        mkdir($root, 0777, true);
+        file_put_contents($root.'/.env', $contents);
+        config()->set('slipstream.app_root', $root);
+
+        return $root;
     }
 
     public function test_fresh_install_gives_the_fleet_its_own_signing_key(): void

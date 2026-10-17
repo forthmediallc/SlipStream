@@ -19,6 +19,9 @@ composer require slipstream/slipstream
 php artisan slipstream:install
 ```
 
+For a server inside a PCI cardholder data environment, or anywhere the dashboard must not
+exist, install with `--pci` instead — see [PCI mode](#pci-mode).
+
 ### Authorize the dashboard
 
 The dashboard is **closed by default in production** and only open automatically in the
@@ -96,6 +99,10 @@ Published as `config/slipstream.php`:
 | `deploy.keep_failed_releases` | How many failed releases to keep as `<release>.failed` for inspection (default 1, `0` deletes them) |
 | `deploy.php_binary` | PHP CLI for deploys and the processes the dashboard/webhook spawn (`SLIPSTREAM_PHP`); auto-detected when unset, never php-fpm |
 | `deploy.pending_stuck_minutes` | Fail a deploy still `pending` after N minutes — its process never started (default 5) |
+| `pci.enabled` | [PCI mode](#pci-mode): provider webhook only, no dashboard / `.env` editor / env sync / peer traffic (`SLIPSTREAM_PCI_MODE`) |
+| `pci.sentinel_keys` | `.env` keys that mark a CDE server; `doctor` fails when one is present and PCI mode is off (`SLIPSTREAM_PCI_SENTINEL_KEYS`) |
+| `webhook.allowed_ips` | IPs/CIDRs the provider hook accepts deliveries from; empty = any (`SLIPSTREAM_WEBHOOK_ALLOWED_IPS`) |
+| `audit.enabled` / `audit.channel` | Structured audit lines to a log channel — on in PCI mode by default (`SLIPSTREAM_AUDIT_LOG`, `SLIPSTREAM_AUDIT_LOG_CHANNEL`) |
 
 Re-publish after package upgrades:
 
@@ -217,10 +224,11 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 
 | Command | Purpose |
 |---|---|
-| `slipstream:install` | Publish assets, migrate, seed defaults |
+| `slipstream:install` | Publish assets, migrate, seed defaults; `--pci` turns on [PCI mode](#pci-mode) for this server |
 | `slipstream:publish` | Re-publish config / assets / migrations |
+| `slipstream:webhook-secret` | Show (`--reveal`) or replace (`--rotate`) the webhook secret from the shell — the only way in PCI mode |
 | `slipstream:provision` | Deploy key, bare mirror, directory layout; `--adopt` converts a live checkout into the first release |
-| `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access and webhook reachability — with the fix for each |
+| `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access, webhook reachability and the PCI-mode checks — with the fix for each |
 | `slipstream:deploy` | Run a deploy (or `--deployment=`) |
 | `slipstream:rollback` | Point `current` at the previous release |
 | `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom) |
@@ -409,6 +417,114 @@ using the webhook secret for peer traffic** so a fleet mid-upgrade doesn't break
 them from Dashboard → **Webhook → Fleet key → Generate separate fleet key** once every node
 runs this version. Rotating the fleet key needs no provider changes — peers pick it up from
 the shared database immediately.
+
+## PCI mode
+
+For servers inside a PCI DSS cardholder data environment — a payment vault, a gateway
+integration host — or any server where the dashboard must not exist. PCI mode reduces
+Slipstream on that node to one thing: **receive a signed push from the git host, build a
+release, swap.**
+
+```bash
+php artisan slipstream:install --pci     # writes SLIPSTREAM_PCI_MODE=true to the shared .env
+```
+
+Or put `SLIPSTREAM_PCI_MODE=true` in the shared `.env` yourself. It is env-driven on purpose:
+with the dashboard, the `.env` editor and env sync all off, nothing inside Slipstream can flip
+it back — only someone with shell access editing the file. (`install --pci` clears a cached
+config and route table so the running app picks it up at once; a deploy's `optimize` rebuilds
+both from the shared `.env` anyway.)
+
+| | Normal | PCI mode |
+|---|---|---|
+| Dashboard (`/slipstream/*`) | Gated UI | Not registered: `404`. The Livewire components are not registered either, and `Slipstream::check()` is always false as a backstop |
+| Dashboard assets | Published to `public/vendor/slipstream` | Not published by `install` |
+| Shared `.env` editor | View / edit / push from the UI | Gone with the dashboard; Slipstream never writes the file again |
+| Env sync | Encrypted snapshot of each node's `.env` in the shared DB, pushes applied by the heartbeat | Off: no snapshot is published, no push is applied, `/hooks/env-sync` does not exist |
+| Relay fan-out, `/hooks/relay` | This node can fan a push out to peers and accept a relayed one | Off and not registered, whatever the `relay_enabled` setting says; a relay-signed delivery aimed at the deploy hook is refused and recorded |
+| Fleet deploy queue, `/hooks/deploy-sync` | A dashboard deploy/rollback on another node queues a row this node's heartbeat claims | This node never claims a queued row; the endpoint does not exist |
+| Deploy hooks | Editable in the dashboard | Still run — they are the build (composer, migrate, optimize); changeable only with database access |
+| Webhook secret | Reveal / rotate in the dashboard | `slipstream:webhook-secret --reveal` / `--rotate`, from the shell |
+| Audit log channel | Off unless `SLIPSTREAM_AUDIT_LOG=true` | On: every delivery outcome, deployment status change and action is also written to a log channel |
+
+What keeps working: the provider webhook (`POST /slipstream/hooks/deploy`) with its HMAC/token
+verification, per-commit idempotency, body cap and rate limit; the whole deploy (fetch, link
+shared paths, composer, hooks, health check, swap, FPM reload, prune) and rollback;
+`slipstream:deploy`, `slipstream:rollback`, `slipstream:healthcheck`, `slipstream:doctor`; the
+minute heartbeat (server registry, stuck-deploy watchdog); notifications; the daily prune.
+
+### Operating a PCI node
+
+Everything happens from the shell:
+
+```bash
+php artisan slipstream:webhook-secret --reveal      # the value to paste into the git host
+php artisan slipstream:webhook-secret --rotate --reveal
+php artisan slipstream:deploy                        # deploy the configured branch now
+php artisan slipstream:deploy --sha=<sha>            # pin a commit (what the dashboard's Redeploy did)
+php artisan slipstream:rollback
+php artisan slipstream:doctor
+```
+
+Settings (repo URL, branch, keep-N, shared paths, notifications) and hooks live in the
+`slipstream_*` tables; `install` seeds the defaults, and without a dashboard they change only
+through the database. Each PCI node needs its own provider webhook — there is no relay — and
+a fresh `install` gives a new database its own webhook secret and fleet key, so a vault with
+its own database shares no secret with the rest of your fleet.
+
+### Restricting the hook's source
+
+The signature is the control that matters; an allow-list is the second one an assessor asks
+for on an unauthenticated route:
+
+```dotenv
+SLIPSTREAM_WEBHOOK_ALLOWED_IPS=<ips or CIDRs, comma-separated>
+```
+
+A delivery from any other address is refused with `403` before its body is read and recorded
+in the delivery log naming the address seen. GitHub publishes its hook ranges under `hooks` at
+`https://api.github.com/meta` and says they change over time; Bitbucket Cloud's are at
+`https://ip-ranges.atlassian.com/`; GitLab.com's are in its documentation. Refresh the list
+when a delivery is rejected. Behind a proxy or load balancer the app must trust it (Laravel's
+`TrustProxies`), or the address Slipstream sees is the proxy's and every delivery is refused —
+the rejected row tells you which address it saw. An `allow`/`deny` block on the hook
+`location` in nginx does the same job (`stubs/nginx-slipstream.conf` has one); in PCI mode
+`slipstream:doctor` warns when the in-app list is empty, which is expected if nginx does it.
+
+### Audit log
+
+In PCI mode every webhook delivery outcome, every deployment status change and every action
+(what `slipstream_activity_log` records) is also written as a structured `slipstream.<event>`
+line to a Laravel log channel — `SLIPSTREAM_AUDIT_LOG_CHANNEL`, or the app's default channel.
+Point it at whatever ships logs off the box (syslog, CloudWatch, your SIEM): PCI DSS
+requirements 10.3.2 and 10.3.3 want audit records protected from modification and promptly
+copied to a central log server, and a table the deploy user can `UPDATE` is not that.
+`SLIPSTREAM_AUDIT_LOG=true` turns the same lines on outside PCI mode. Lines never carry hook
+output, `.env` contents or settings values.
+
+### Doctor checks
+
+`slipstream:doctor` reports the mode first and adds two checks around it:
+
+- **PCI mode** — on/off; warns when `relay_enabled` is set in the settings table (ignored,
+  but the configuration should read like the behaviour).
+- **webhook source** — warns in PCI mode when `SLIPSTREAM_WEBHOOK_ALLOWED_IPS` is empty.
+- **PCI sentinel keys** — `pci.sentinel_keys` (config, so committed and shared by every
+  server) names `.env` keys only a CDE server holds, e.g. the vault database host or a gateway
+  credential ARN. A server that has one of them with PCI mode off **fails** the check: that is
+  the vault's credentials on a node that still has the dashboard, the `.env` editor and env sync.
+
+### What PCI mode is not
+
+It does not take the server out of scope. A deploy tool that can change the code running in
+the CDE is a connected-to / security-impacting system under the PCI SSC's scoping guidance
+whether or not the dashboard exists; what PCI mode does is reduce it to the functions the
+server needs (requirement 2.2.4) and make the rest easy to show. Network segmentation
+(requirement 1), MFA for everyone who can reach the host (8.4.2), change control over what
+gets pushed to the deployed branch (6.5.1), and where the vault's own secrets live (a secrets
+manager rather than the `.env`) are the host's and the infrastructure's job. Deploy logs still
+hold raw hook output (`deploy/logs/*.log` at `0600`, and `slipstream_deployment_events`):
+nothing redacts it.
 
 ## Preview the dashboard locally (no host app)
 
