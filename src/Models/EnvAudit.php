@@ -2,9 +2,7 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
-
-class EnvAudit extends Model
+class EnvAudit extends SlipstreamModel
 {
     protected $table = 'slipstream_env_audits';
 

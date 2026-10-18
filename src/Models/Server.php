@@ -2,9 +2,7 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
-
-class Server extends Model
+class Server extends SlipstreamModel
 {
     protected $table = 'slipstream_servers';
 

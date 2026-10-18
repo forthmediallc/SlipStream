@@ -8,6 +8,7 @@ use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
+use Slipstream\Console\Commands\DatabaseCommand;
 use Slipstream\Console\Commands\DeliveriesCommand;
 use Slipstream\Console\Commands\DeployCommand;
 use Slipstream\Console\Commands\DeploymentCommand;
@@ -118,6 +119,7 @@ class SlipstreamServiceProvider extends ServiceProvider
             ServersCommand::class,
             PipelinesCommand::class,
             SettingsCommand::class,
+            DatabaseCommand::class,
         ]);
     }
 

@@ -2,9 +2,7 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
-
-class DeploymentHook extends Model
+class DeploymentHook extends SlipstreamModel
 {
     protected $table = 'slipstream_deployment_hooks';
 

@@ -3,8 +3,10 @@
 namespace Slipstream;
 
 use Closure;
+use Illuminate\Database\Schema\Builder;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Schema;
 use RuntimeException;
 
 class Slipstream
@@ -236,6 +238,26 @@ class Slipstream
     public static function pciMode(): bool
     {
         return filter_var(config('slipstream.pci.enabled', false), FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
+     * The connection Slipstream's tables live on (SLIPSTREAM_DB_CONNECTION);
+     * null means the app's default connection.
+     */
+    public static function databaseConnection(): ?string
+    {
+        $name = config('slipstream.database.connection');
+
+        return is_string($name) && trim($name) !== '' ? trim($name) : null;
+    }
+
+    /**
+     * Schema builder for Slipstream's connection — what every "does this
+     * table exist yet" check must ask, or it asks the app's database.
+     */
+    public static function schema(): Builder
+    {
+        return Schema::connection(static::databaseConnection());
     }
 
     /**

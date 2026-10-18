@@ -2,10 +2,9 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
-class Pipeline extends Model
+class Pipeline extends SlipstreamModel
 {
     protected $table = 'slipstream_pipelines';
 

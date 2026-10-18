@@ -3,11 +3,11 @@
 namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Schema;
 use Slipstream\Deploy\StuckDeploymentsSweeper;
 use Slipstream\Models\DeploymentEvent;
 use Slipstream\Models\EnvPush;
 use Slipstream\Models\WebhookDelivery;
+use Slipstream\Slipstream;
 
 /**
  * Keeps the DB-backed log tables bounded and clears deploys orphaned in
@@ -101,7 +101,7 @@ class PruneCommand extends Command
     protected function envPushTableReady(): bool
     {
         try {
-            return Schema::hasTable('slipstream_env_pushes');
+            return Slipstream::schema()->hasTable('slipstream_env_pushes');
         } catch (\Throwable) {
             return false;
         }

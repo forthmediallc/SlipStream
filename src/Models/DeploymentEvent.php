@@ -2,10 +2,9 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
-class DeploymentEvent extends Model
+class DeploymentEvent extends SlipstreamModel
 {
     public $timestamps = false;
 

@@ -55,6 +55,27 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Database connection
+    |--------------------------------------------------------------------------
+    |
+    | The connection Slipstream keeps its own tables on: deployments and their
+    | logs, webhook deliveries, the server registry the heartbeat refreshes,
+    | hooks, pipelines, settings (the webhook secret, encrypted) and the
+    | activity log. Null = the app's default connection.
+    |
+    | Give Slipstream a database of its own when the app's database should
+    | hold nothing else — the CDE database on a PCI node, for instance. A
+    | SQLite file in the shared storage/ directory is enough for one server.
+    | The migrations follow this setting; on an existing install, move the
+    | tables first with `php artisan slipstream:database copy --to=<name>`.
+    |
+    */
+    'database' => [
+        'connection' => env('SLIPSTREAM_DB_CONNECTION'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | PCI mode
     |--------------------------------------------------------------------------
     |

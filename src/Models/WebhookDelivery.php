@@ -2,11 +2,10 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Slipstream\Support\AuditLog;
 
-class WebhookDelivery extends Model
+class WebhookDelivery extends SlipstreamModel
 {
     protected $table = 'slipstream_webhook_deliveries';
 

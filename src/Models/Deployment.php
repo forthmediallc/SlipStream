@@ -2,12 +2,11 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Slipstream\Support\AuditLog;
 
-class Deployment extends Model
+class Deployment extends SlipstreamModel
 {
     // Created for a REMOTE server by a fleet-wide dashboard action; that
     // server claims it (queued → pending) via its heartbeat or a signed nudge

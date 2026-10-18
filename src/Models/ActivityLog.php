@@ -2,9 +2,7 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
-
-class ActivityLog extends Model
+class ActivityLog extends SlipstreamModel
 {
     protected $table = 'slipstream_activity_log';
 

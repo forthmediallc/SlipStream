@@ -3,6 +3,7 @@
 namespace Slipstream\Preview;
 
 use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\DB;
 use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Models\ActivityLog;
 use Slipstream\Models\Deployment;
@@ -11,6 +12,7 @@ use Slipstream\Models\DeploymentHook;
 use Slipstream\Models\Pipeline;
 use Slipstream\Models\Server;
 use Slipstream\Models\WebhookDelivery;
+use Slipstream\Slipstream;
 
 /**
  * Sample data for the local preview harness (see testbench.yaml). Dev-only —
@@ -25,7 +27,7 @@ class PreviewSeeder extends Seeder
             'slipstream_servers', 'slipstream_webhook_deliveries',
             'slipstream_deployment_hooks', 'slipstream_activity_log',
         ] as $table) {
-            \DB::table($table)->delete();
+            DB::connection(Slipstream::databaseConnection())->table($table)->delete();
         }
 
         Server::query()->create([

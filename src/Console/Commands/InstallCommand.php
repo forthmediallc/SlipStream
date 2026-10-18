@@ -3,7 +3,9 @@
 namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 use RuntimeException;
+use Slipstream\Database\Tables;
 use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Environment\EnvContentMerger;
@@ -21,7 +23,7 @@ class InstallCommand extends Command
 
     protected $description = 'Install Slipstream: publish config/assets, migrate, seed defaults';
 
-    public function handle(SettingsRepository $settings): int
+    public function handle(SettingsRepository $settings, Tables $tables): int
     {
         // --pci turns the mode on; a re-run on a node that already has it on
         // (SLIPSTREAM_PCI_MODE in the shared .env) keeps behaving as PCI.
@@ -42,14 +44,33 @@ class InstallCommand extends Command
             ]);
         }
 
+        $configured = Slipstream::databaseConnection();
+        if ($configured !== null && ! $tables->defined($configured)) {
+            $this->components->error("SLIPSTREAM_DB_CONNECTION names \"{$configured}\", which config/database.php does not define. Add the connection (the README has a SQLite example), or unset the variable.");
+
+            return self::FAILURE;
+        }
+
+        // A SQLite file named by SLIPSTREAM_DB_CONNECTION may not exist yet,
+        // and `migrate` only offers to create one for its own connection.
+        $connection = $tables->activeConnection();
+        $tables->ensureSqliteFile($connection);
+
         // Run ONLY Slipstream's migrations, not the host app's whole pending
         // migration set — install shouldn't surprise-migrate the application.
+        // They create their tables on Slipstream's connection.
         $migrations = realpath(__DIR__.'/../../../database/migrations');
         $this->call('migrate', [
             '--path' => $migrations,
             '--realpath' => true,
             '--force' => true,
         ]);
+
+        // Migrations recorded as run while the tables are missing here means
+        // SLIPSTREAM_DB_CONNECTION was pointed somewhere new after install.
+        if (! Slipstream::schema()->hasTable('slipstream_settings') && ! $this->createTablesOn($tables, $connection)) {
+            return self::FAILURE;
+        }
 
         Pipeline::query()->firstOrCreate(
             ['name' => 'main'],
@@ -109,20 +130,60 @@ class InstallCommand extends Command
         }
 
         $path = Slipstream::path();
+        $database = "Database:  {$connection} ({$tables->describe($connection)})";
         $this->components->info('Slipstream installed.');
         $this->components->bulletList($pci ? [
             "Webhook:   /{$path}/hooks/deploy (the only route registered in PCI mode)",
             'PCI mode:  on — no dashboard, .env editor, env sync, relay or fleet queue on this server',
+            $database,
             'Next:      php artisan slipstream:provision, then php artisan slipstream:doctor',
         ] : [
             "Dashboard: /{$path} (local-only until you define Slipstream::auth or viewSlipstream gate)",
             "Webhook:   /{$path}/hooks/deploy",
+            $database,
             'Next:      php artisan slipstream:provision  (server bootstrap)',
         ]);
+
+        if ($pci && $tables->sameDatabase($connection, $tables->defaultConnection())) {
+            $this->components->warn('Deployments, heartbeats and webhook deliveries are being written to the app database. To keep them out of it, give Slipstream its own: SLIPSTREAM_DB_CONNECTION (README → PCI mode).');
+        }
 
         $this->warnIfNotCommitted();
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Create the schema on a connection the migrator already counts as done.
+     * Refused while the default connection still holds a used set: the
+     * history, hooks, pipelines and webhook secret are there, and seeding a
+     * fresh set here would leave the copy nowhere to go. An empty old set has
+     * nothing worth keeping.
+     */
+    protected function createTablesOn(Tables $tables, string $connection): bool
+    {
+        $default = $tables->defaultConnection();
+
+        try {
+            $oldTablesThere = ! $tables->sameDatabase($connection, $default)
+                && in_array('slipstream_settings', $tables->presentOn($default), true)
+                && DB::connection($default)->table('slipstream_settings')->exists();
+        } catch (\Throwable) {
+            $oldTablesThere = false;
+        }
+
+        if ($oldTablesThere) {
+            $this->components->error("Slipstream's tables are on \"{$default}\", but SLIPSTREAM_DB_CONNECTION points at \"{$connection}\", which has none yet.");
+            $this->line('  Copy them across first — history, hooks, pipelines and the webhook secret come along:');
+            $this->line("  php artisan slipstream:database copy --from={$default} --to={$connection}");
+
+            return false;
+        }
+
+        $tables->createOn($connection);
+        $this->components->info("Created Slipstream's tables on \"{$connection}\".");
+
+        return true;
     }
 
     /**

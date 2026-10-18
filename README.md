@@ -93,6 +93,7 @@ Published as `config/slipstream.php`:
 | `domain` | Optional subdomain for the dashboard |
 | `middleware` | Route middleware (default `['web']`) |
 | `local_open` | Allow any origin in `local` when no gate is set (`SLIPSTREAM_LOCAL_OPEN`, default off) |
+| `database.connection` | Connection for Slipstream's own tables; null = the app default (`SLIPSTREAM_DB_CONNECTION`). See [Slipstream's own database](#slipstreams-own-database) |
 | `webhook.allow_redeploy_same_sha` | Let a webhook redeploy the commit already live here (default off) |
 | `server_name` | This node’s fleet identity (`SLIPSTREAM_SERVER`) |
 | `views.*` | Enable/disable dashboard sections |
@@ -236,6 +237,7 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 | `slipstream:pipelines` | Pipelines: `list`, `add --name= --branch=`, `edit`, `enable`/`disable`, `delete` |
 | `slipstream:settings` | `show`, or `set --repo= --branch= --keep-releases= --shared-path=in:on --mail= --slack-url= … --relay=on\|off` |
 | `slipstream:webhook-secret` | Show (`--reveal`) or replace (`--rotate`) the webhook secret; `--rotate-fleet-key` separates or rotates the fleet key |
+| `slipstream:database` | Where Slipstream's records live: `status`, `copy --to=<connection>`, `drop-source` — moves them off the app database |
 | `slipstream:provision` | Deploy key, bare mirror, directory layout; `--adopt` converts a live checkout into the first release |
 | `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access, webhook reachability and the PCI-mode checks — with the fix for each |
 | `slipstream:deploy` | Run a deploy here (or `--deployment=`); `--sha=` pins a commit, `--tag=` deploys a tag, `--skip-hooks=1,2` skips hooks once, `--fleet` is the dashboard's fleet-wide Deploy |
@@ -427,6 +429,66 @@ them from Dashboard → **Webhook → Fleet key → Generate separate fleet key*
 runs this version. Rotating the fleet key needs no provider changes — peers pick it up from
 the shared database immediately.
 
+## Slipstream's own database
+
+Slipstream keeps its records in its own `slipstream_*` tables: deployments and their logs,
+webhook deliveries, the server registry the minute heartbeat refreshes, hooks, pipelines, the
+activity log, and settings — the webhook secret among them, encrypted. By default they live on
+the app's default database connection. Set `SLIPSTREAM_DB_CONNECTION` to give them one of
+their own, so an app database that should hold nothing else — the CDE database on a
+[PCI](#pci-mode) node — doesn't.
+
+Define the connection in `config/database.php`. For one server, a SQLite file in the shared
+`storage/` directory is enough. Every release links that directory, so the file survives
+deploys:
+
+```php
+'slipstream' => [
+    'driver' => 'sqlite',
+    'database' => env('SLIPSTREAM_DB_DATABASE', storage_path('slipstream.sqlite')),
+    'foreign_key_constraints' => true,
+    'busy_timeout' => 5000,    // the webhook, a deploy and the heartbeat write concurrently
+    'journal_mode' => 'wal',
+],
+```
+
+A fleet that shares its records needs a shared database instead, a small MySQL or Postgres
+database of its own. A PCI node shares nothing with the fleet, so a per-node SQLite file suits
+it. Either way the migration lock still needs a shared cache store.
+
+**On a fresh install**, set `SLIPSTREAM_DB_CONNECTION` before running `slipstream:install`.
+The migrations create the tables on that connection, and the app's `migrations` table only
+records that they ran, the same arrangement Telescope and Pulse use.
+
+**On an existing install**, the tables are already on the default connection and the
+migrations already count as run. Changing the setting alone would point Slipstream at an empty
+database, so move the tables instead, between pushes:
+
+```bash
+php artisan slipstream:database copy --to=slipstream    # create the tables there, copy every row
+# set SLIPSTREAM_DB_CONNECTION=slipstream in the shared .env, then deploy
+#   (or run config:cache from current/ and reload PHP-FPM)
+php artisan slipstream:database status                  # check the counts
+php artisan slipstream:database drop-source             # remove the old set from the app database
+```
+
+The copy runs while the app still uses the old connection. Ids are kept, and the webhook
+secret, hooks, pipelines and history all come along (the secret is encrypted with `APP_KEY`,
+which the app still has). The copy refuses a target that already holds rows, and waits while
+deployments are in flight. `drop-source` refuses the set Slipstream is still reading. It also
+refuses until the new connection has caught up with the old one: in every table, the newest
+row on the old set must also be on the new one. Old rows deleted by the nightly prune don't
+trip that check.
+
+Run these as the deploy user, so the SQLite file belongs to the user that writes it.
+`slipstream:doctor` checks the file and its directory, because SQLite writes journal files
+beside the database. Leave the rows in the app's `migrations` table that record Slipstream's
+migrations, since they are how `artisan migrate` knows the schema is current. The creates are
+guarded, so `migrate:fresh` on the app database leaves Slipstream's tables alone. If you
+published Slipstream's migrations into `database/migrations`, publish them again with
+`php artisan slipstream:publish --migrations --force`, because older copies ignore the
+setting.
+
 ## PCI mode
 
 For servers inside a PCI DSS cardholder data environment — a payment vault, a gateway
@@ -489,6 +551,11 @@ with its own database shares no secret with the rest of your fleet. Every change
 way is recorded in `slipstream_activity_log` with `via: cli` and, in PCI mode, in the audit
 log channel.
 
+Slipstream's own records — deployments and their logs, heartbeats, webhook deliveries — go to
+the app's default database unless `SLIPSTREAM_DB_CONNECTION` says otherwise, and on a vault
+that is usually the CDE database. They are deployment metadata, but there is no need for them
+to sit there: see [Slipstream's own database](#slipstreams-own-database).
+
 ### Restricting the hook's source
 
 The signature is the control that matters; an allow-list is the second one an assessor asks
@@ -521,10 +588,13 @@ output, `.env` contents or settings values.
 
 ### Doctor checks
 
-`slipstream:doctor` reports the mode first and adds two checks around it:
+`slipstream:doctor` reports the mode first and adds three checks around it:
 
 - **PCI mode** — on/off; warns when `relay_enabled` is set in the settings table (ignored,
   but the configuration should read like the behaviour).
+- **slipstream database** — warns in PCI mode while Slipstream's records are on the app's
+  database (in every mode it fails a connection that is undefined, unreachable or missing the
+  tables, and a SQLite file the pool user cannot write).
 - **webhook source** — warns in PCI mode when `SLIPSTREAM_WEBHOOK_ALLOWED_IPS` is empty.
 - **PCI sentinel keys** — `pci.sentinel_keys` (config, so committed and shared by every
   server) names `.env` keys only a CDE server holds, e.g. the vault database host or a gateway

@@ -4,6 +4,7 @@ namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Http;
+use Slipstream\Database\Tables;
 use Slipstream\Deploy\FailedReleases;
 use Slipstream\Diagnostics\CheckResult;
 use Slipstream\Diagnostics\ComposerLockCheck;
@@ -40,6 +41,7 @@ class DoctorCommand extends Command
 
         $checks = [
             'checkPciMode',
+            'checkDatabase',
             'checkPoolUser',
             'checkPhpBinary',
             'checkLayoutWritable',
@@ -735,6 +737,127 @@ class DoctorCommand extends Command
         }
 
         return CheckResult::pass('PCI mode', 'on — provider hook only; dashboard, .env editor/sync, relay and fleet queue off');
+    }
+
+    /**
+     * Where Slipstream's records live, and whether that works. Everything a
+     * deploy runs from — the deployment row, hooks, pipelines, the webhook
+     * secret — is a row on this connection, so a misconfigured one stops
+     * every webhook with a 500 or a 401 and nothing else explains why.
+     */
+    protected function checkDatabase(string $root): CheckResult
+    {
+        $label = 'slipstream database';
+        $tables = app(Tables::class);
+        $configured = Slipstream::databaseConnection();
+        $active = $tables->activeConnection();
+        $default = $tables->defaultConnection();
+
+        if ($configured !== null && ! $tables->defined($configured)) {
+            return CheckResult::fail(
+                $label,
+                "SLIPSTREAM_DB_CONNECTION names \"{$configured}\", which config/database.php does not define",
+                "Add a '{$configured}' connection to config/database.php (the README has a SQLite example), or unset SLIPSTREAM_DB_CONNECTION."
+            );
+        }
+
+        $separate = ! $tables->sameDatabase($active, $default);
+        $sqlitePath = $tables->driver($active) === 'sqlite' ? (string) config("database.connections.{$active}.database", '') : '';
+        $missingFile = $sqlitePath !== '' && $sqlitePath !== ':memory:' && ! is_file($sqlitePath);
+
+        try {
+            // Doctor never creates the file; a missing one reads as "no tables".
+            $present = $missingFile ? [] : $tables->presentOn($active);
+        } catch (\Throwable $e) {
+            return CheckResult::fail($label, "cannot reach {$active}: ".$e->getMessage(), "Check the '{$active}' connection settings in config/database.php and the shared .env.");
+        }
+
+        if (! in_array('slipstream_settings', $present, true)) {
+            try {
+                $oldSet = $separate && in_array('slipstream_settings', $tables->presentOn($default), true);
+            } catch (\Throwable) {
+                $oldSet = false;
+            }
+
+            return CheckResult::fail(
+                $label,
+                "Slipstream's tables are not on {$active}".($missingFile ? " (no database file at {$sqlitePath})" : ''),
+                $oldSet
+                    ? "They are still on {$default}. Copy them across: php artisan slipstream:database copy --from={$default} --to={$active}"
+                    : 'Run php artisan slipstream:install'
+            );
+        }
+
+        if (($sqlite = $this->sqliteProblem($tables, $active)) !== null) {
+            return $sqlite;
+        }
+
+        $where = "{$active} ({$tables->describe($active)})";
+
+        if ($separate) {
+            try {
+                $left = $tables->presentOn($default);
+            } catch (\Throwable) {
+                $left = [];
+            }
+
+            if ($left !== []) {
+                return CheckResult::warn(
+                    $label,
+                    "{$where}; ".count($left)." Slipstream tables are still on {$default}",
+                    "Once you have checked the copy: php artisan slipstream:database drop-source --from={$default}"
+                );
+            }
+
+            return CheckResult::pass($label, "{$where}, separate from the app database");
+        }
+
+        if (Slipstream::pciMode()) {
+            return CheckResult::warn(
+                $label,
+                $active === $default ? "the app's default connection ({$default})" : "{$active}, the same database as {$default}",
+                "Deployments, heartbeats, webhook deliveries and the activity log are written to the app's database — on a PCI node, usually the CDE database.\n"
+                .'Give Slipstream its own: define a connection, run php artisan slipstream:database copy --to=<connection>, '
+                .'then set SLIPSTREAM_DB_CONNECTION=<connection>. The README has a SQLite example.'
+            );
+        }
+
+        return CheckResult::pass($label, "{$active} (the app's default connection)");
+    }
+
+    /**
+     * A SQLite file the pool user cannot write fails every webhook the moment
+     * it records the delivery — and SQLite writes journal files beside the
+     * database, so the directory has to be writable too, not just the file.
+     */
+    protected function sqliteProblem(Tables $tables, string $connection): ?CheckResult
+    {
+        if ($tables->driver($connection) !== 'sqlite' || DIRECTORY_SEPARATOR === '\\') {
+            return null;
+        }
+
+        $path = (string) config("database.connections.{$connection}.database", '');
+        $pool = $this->poolUser();
+
+        if ($pool === null || $path === '' || $path === ':memory:' || ! is_file($path)) {
+            return null;
+        }
+
+        $unwritable = array_values(array_filter(
+            [$path, dirname($path)],
+            fn (string $p) => Ownership::writableBy($p, $pool) === false
+        ));
+
+        if ($unwritable === []) {
+            return null;
+        }
+
+        return CheckResult::fail(
+            'slipstream database',
+            "{$pool} cannot write ".implode(' or ', $unwritable),
+            sprintf('sudo chown %s:%s %s', $pool, $pool, implode(' ', $unwritable))."\n"
+            .'Webhooks and dashboard deploys run as the pool user; SQLite also writes journal files next to the database.'
+        );
     }
 
     /**

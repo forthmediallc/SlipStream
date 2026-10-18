@@ -4,6 +4,7 @@ namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
 use Slipstream\Console\Commands\Concerns\FormatsConsoleOutput;
+use Slipstream\Database\Tables;
 use Slipstream\Environment\EnvSync;
 use Slipstream\Fleet\Drift;
 use Slipstream\Models\Deployment;
@@ -26,10 +27,12 @@ class StatusCommand extends Command
 
     protected $description = 'Fleet overview: servers and drift, in-flight and latest deployments, recent failures, pipelines';
 
-    public function handle(SettingsRepository $settings, Drift $drift): int
+    public function handle(SettingsRepository $settings, Drift $drift, Tables $tables): int
     {
         $self = Slipstream::serverName();
         $pci = Slipstream::pciMode();
+        $database = $tables->activeConnection();
+        $separateDatabase = ! $tables->sameDatabase($database, $tables->defaultConnection());
         $staleAfter = (int) config('slipstream.fleet.heartbeat_stale_seconds', 120);
         $summary = $drift->summary($staleAfter);
 
@@ -61,6 +64,7 @@ class StatusCommand extends Command
             $this->json([
                 'node' => $self,
                 'pci_mode' => $pci,
+                'database' => ['connection' => $database, 'separate' => $separateDatabase, 'target' => $tables->describe($database)],
                 'repository' => $settings->repoUrl(),
                 'branch' => $settings->branch(),
                 'keep_releases' => $settings->keepReleases(),
@@ -93,6 +97,7 @@ class StatusCommand extends Command
         }
 
         $this->components->twoColumnDetail('Node', $self.($pci ? ' · PCI mode' : ''));
+        $this->components->twoColumnDetail('Database', $database.($separateDatabase ? ' (separate from the app database)' : ' (the app database)'));
         $this->components->twoColumnDetail('Repository', ($settings->repoUrl() ?: 'not set').' @ '.$settings->branch().' · keep '.$settings->keepReleases());
         $this->components->twoColumnDetail('Webhook', $hook);
         if (! $pci) {

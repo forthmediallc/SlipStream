@@ -2,7 +2,6 @@
 
 namespace Slipstream\Livewire;
 
-use Illuminate\Support\Facades\Schema;
 use Slipstream\Fleet\DeployQueue;
 use Slipstream\Models\Deployment;
 use Slipstream\Models\DeploymentHook;
@@ -132,7 +131,7 @@ class ProjectChrome extends SlipstreamComponent
             : null;
         $repoLabel = is_string($repoLabel) ? rtrim(preg_replace('#\.git$#', '', $repoLabel) ?? $repoLabel, '/') : null;
 
-        $hooks = Schema::hasTable('slipstream_deployment_hooks')
+        $hooks = Slipstream::schema()->hasTable('slipstream_deployment_hooks')
             ? DeploymentHook::query()
                 ->where('enabled', true)
                 ->orderBy('sort_order')

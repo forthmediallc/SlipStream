@@ -1,17 +1,17 @@
 <?php
 
-use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use Slipstream\Database\SlipstreamMigration;
 
-return new class extends Migration
+return new class extends SlipstreamMigration
 {
     public function up(): void
     {
         // Queued .env pushes: the shared-DB source of truth for scoped env
         // updates. Each target server applies its own pending row on the next
         // heartbeat (or an instant signed nudge). Contents are encrypted at rest.
-        Schema::create('slipstream_env_pushes', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_env_pushes', function (Blueprint $table) {
             $table->id();
             $table->string('batch', 36);          // groups one save across targets
             $table->string('server_name');        // target node
@@ -32,7 +32,7 @@ return new class extends Migration
         // Encrypted per-node .env snapshots so the dashboard can view/edit any
         // server's file and detect drift. One row per server; rewritten only
         // when the content hash changes.
-        Schema::create('slipstream_env_snapshots', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_env_snapshots', function (Blueprint $table) {
             $table->id();
             $table->string('server_name')->unique();
             $table->longText('contents');   // encrypted .env content

@@ -3,8 +3,8 @@
 namespace Slipstream\Settings;
 
 use Illuminate\Support\Facades\Crypt;
-use Illuminate\Support\Facades\Schema;
 use Slipstream\Models\Setting;
+use Slipstream\Slipstream;
 
 class SettingsRepository
 {
@@ -224,7 +224,7 @@ class SettingsRepository
     protected function tableReady(): bool
     {
         try {
-            return Schema::hasTable('slipstream_settings');
+            return Slipstream::schema()->hasTable('slipstream_settings');
         } catch (\Throwable) {
             return false;
         }

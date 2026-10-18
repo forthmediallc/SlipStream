@@ -1,14 +1,14 @@
 <?php
 
-use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use Slipstream\Database\SlipstreamMigration;
 
-return new class extends Migration
+return new class extends SlipstreamMigration
 {
     public function up(): void
     {
-        Schema::create('slipstream_servers', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_servers', function (Blueprint $table) {
             $table->id();
             $table->string('server_name')->unique();
             $table->string('hostname')->nullable();
@@ -27,7 +27,7 @@ return new class extends Migration
             $table->timestamps();
         });
 
-        Schema::create('slipstream_pipelines', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_pipelines', function (Blueprint $table) {
             $table->id();
             $table->string('name');
             $table->string('branch_pattern')->default('main');
@@ -37,7 +37,7 @@ return new class extends Migration
             $table->timestamps();
         });
 
-        Schema::create('slipstream_deployments', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_deployments', function (Blueprint $table) {
             $table->id();
             $table->string('server_name')->index();
             $table->string('sha', 64)->nullable()->index();
@@ -56,7 +56,7 @@ return new class extends Migration
             $table->timestamps();
         });
 
-        Schema::create('slipstream_deployment_events', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_deployment_events', function (Blueprint $table) {
             $table->id();
             $table->foreignId('deployment_id')->constrained('slipstream_deployments')->cascadeOnDelete();
             $table->unsignedInteger('sequence')->default(0);
@@ -69,7 +69,7 @@ return new class extends Migration
             $table->index(['deployment_id', 'sequence']);
         });
 
-        Schema::create('slipstream_deployment_hooks', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_deployment_hooks', function (Blueprint $table) {
             $table->id();
             $table->string('step'); // e.g. composer, migrate, swap
             $table->string('position', 16); // before|after
@@ -81,7 +81,7 @@ return new class extends Migration
             $table->timestamps();
         });
 
-        Schema::create('slipstream_webhook_deliveries', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_webhook_deliveries', function (Blueprint $table) {
             $table->id();
             $table->string('provider', 32)->default('github');
             $table->string('delivery_id')->nullable()->index();
@@ -97,7 +97,7 @@ return new class extends Migration
             $table->timestamps();
         });
 
-        Schema::create('slipstream_settings', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_settings', function (Blueprint $table) {
             $table->id();
             $table->string('key')->unique();
             $table->text('value')->nullable();
@@ -105,7 +105,7 @@ return new class extends Migration
             $table->timestamps();
         });
 
-        Schema::create('slipstream_backups', function (Blueprint $table) {
+        $this->createIfMissing('slipstream_backups', function (Blueprint $table) {
             $table->id();
             $table->string('type', 32); // db|storage|full
             $table->string('disk')->nullable();

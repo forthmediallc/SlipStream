@@ -2,13 +2,11 @@
 
 namespace Slipstream\Models;
 
-use Illuminate\Database\Eloquent\Model;
-
 /**
  * A queued .env update for one target server. Applied by that node's heartbeat
  * (or an instant signed nudge). The shared-DB row is the source of truth.
  */
-class EnvPush extends Model
+class EnvPush extends SlipstreamModel
 {
     public const STATUS_PENDING = 'pending';
 

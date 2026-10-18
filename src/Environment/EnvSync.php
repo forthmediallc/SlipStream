@@ -3,7 +3,6 @@
 namespace Slipstream\Environment;
 
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Slipstream\Deploy\ProcessDetacher;
 use Slipstream\Models\EnvPush;
@@ -65,8 +64,10 @@ class EnvSync
         }
 
         try {
-            return Schema::hasTable('slipstream_env_pushes')
-                && Schema::hasTable('slipstream_env_snapshots');
+            $schema = Slipstream::schema();
+
+            return $schema->hasTable('slipstream_env_pushes')
+                && $schema->hasTable('slipstream_env_snapshots');
         } catch (\Throwable) {
             return false;
         }
