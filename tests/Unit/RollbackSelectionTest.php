@@ -7,6 +7,18 @@ use Slipstream\Tests\TestCase;
 
 class RollbackSelectionTest extends TestCase
 {
+    /** @var list<string> */
+    protected array $bases = [];
+
+    protected function tearDown(): void
+    {
+        foreach ($this->bases as $base) {
+            $this->removeTree($base);
+        }
+
+        parent::tearDown();
+    }
+
     /**
      * releases newest→oldest: r3 (live), r2, r1.
      * A first rollback from r3 must land on r2 — the one just older.
@@ -61,6 +73,7 @@ class RollbackSelectionTest extends TestCase
     {
         $base = sys_get_temp_dir().'/ss-rel-'.bin2hex(random_bytes(4));
         mkdir($base, 0777, true);
+        $this->bases[] = $base;
 
         $out = [];
         foreach ($names as $name) {

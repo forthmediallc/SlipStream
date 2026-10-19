@@ -47,9 +47,17 @@ class AuditLogTest extends TestCase
 
     protected function tearDown(): void
     {
-        $this->removeTree($this->logDir);
+        // Close the log files first. Windows only marks an open file for
+        // deletion, and a directory holding one cannot be removed.
+        if ($this->app) {
+            foreach (['default-test', 'audit-test'] as $channel) {
+                $this->app['log']->channel($channel)->getLogger()->close();
+            }
+        }
 
         parent::tearDown();
+
+        $this->removeTree($this->logDir);
     }
 
     public function test_off_by_default_outside_pci_mode(): void
