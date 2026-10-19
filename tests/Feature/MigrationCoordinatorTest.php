@@ -4,6 +4,7 @@ namespace Slipstream\Tests\Feature;
 
 use Closure;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 use RuntimeException;
 use Slipstream\Deploy\MigrationCoordinator;
 use Slipstream\Models\Server;
@@ -181,6 +182,38 @@ class MigrationCoordinatorTest extends TestCase
         $outcome = $this->coordinator(fn () => $this->fail('nothing to wait for'))->awaitRun(self::SHA, fn () => null);
 
         $this->assertSame('none', $outcome);
+    }
+
+    public function test_the_lock_outlives_the_longest_the_command_may_run(): void
+    {
+        // A timeout above the TTL used to let the lock lapse mid-migration,
+        // and a waiting node then ran the same migration alongside.
+        config()->set('slipstream.deploy.migrate_timeout', 1200);
+        config()->set('slipstream.deploy.migration_lock_ttl', 900);
+        $this->assertSame(1320, MigrationCoordinator::lockTtl());
+        $this->assertSame(1380, $this->coordinator()->waitSeconds());
+
+        $this->coordinator()->run(self::SHA, function () {
+            $this->travel(1000)->seconds(); // past the 900 s the TTL asked for
+            $this->assertFalse(Cache::lock(MigrationCoordinator::lockKey(self::SHA), 10)->get(), 'still held');
+        }, fn () => null);
+
+        config()->set('slipstream.deploy.migrate_timeout', 600);
+        $this->assertSame(900, MigrationCoordinator::lockTtl(), 'a TTL that already covers it is kept');
+    }
+
+    public function test_doctor_says_when_the_lock_ttl_is_below_the_migrate_timeout(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        config()->set('cache.stores.locks', ['driver' => 'database', 'table' => 'cache']);
+        config()->set('slipstream.deploy.migration_lock_store', 'locks');
+        config()->set('slipstream.migrations.command', 'migrate --force');
+        config()->set('slipstream.deploy.migrate_timeout', 1200);
+        config()->set('slipstream.deploy.migration_lock_ttl', 900);
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('lock held 1320s, not the 900s SLIPSTREAM_MIGRATION_LOCK_TTL sets')
+            ->assertExitCode(1); // the bare layout fails elsewhere
     }
 
     public function test_the_command_and_eligibility_come_from_the_environment_first(): void

@@ -2,20 +2,25 @@
 
 namespace Slipstream\Tests\Support;
 
+use Closure;
 use RuntimeException;
 use Slipstream\Deploy\ShellRunner;
 
 /**
  * Records every command a deploy step would run instead of running it.
- * Commands containing one of $failOn fail like a non-zero exit would.
+ * Commands containing one of $failOn fail like a non-zero exit would, and
+ * $during runs while a command "runs" (to move the clock, say).
  */
 class RecordingShellRunner extends ShellRunner
 {
-    /** @var list<array{command: string, cwd: ?string, step: ?string}> */
+    /** @var list<array{command: string, cwd: ?string, step: ?string, timeout: int}> */
     public array $commands = [];
 
     /** @var list<string> */
     public array $failOn = [];
+
+    /** @var (Closure(string): void)|null */
+    public ?Closure $during = null;
 
     public function run(
         array|string $command,
@@ -25,7 +30,11 @@ class RecordingShellRunner extends ShellRunner
         bool $throw = true
     ): array {
         $display = is_string($command) ? $command : implode(' ', $command);
-        $this->commands[] = ['command' => $display, 'cwd' => $cwd, 'step' => $step];
+        $this->commands[] = ['command' => $display, 'cwd' => $cwd, 'step' => $step, 'timeout' => $timeout];
+
+        if ($this->during !== null) {
+            ($this->during)($display);
+        }
 
         foreach ($this->failOn as $needle) {
             if (str_contains($display, $needle)) {

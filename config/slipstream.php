@@ -317,7 +317,9 @@ return [
         */
         'migration_lock_store' => env('SLIPSTREAM_MIGRATION_LOCK_STORE'),
         // Lock is held for the whole migrate step; keep it above your longest
-        // migration so a slow migrate never outlives its own lock.
+        // migration so a slow migrate never outlives its own lock. Slipstream
+        // holds it at least migrate_timeout + 120s (and a fleet-locked hook's
+        // lock at least the hour a hook may run + 120s) whatever this says.
         'migration_lock_ttl' => (int) env('SLIPSTREAM_MIGRATION_LOCK_TTL', 900),
         'migrate_timeout' => (int) env('SLIPSTREAM_MIGRATE_TIMEOUT', 600),
         // A deploy still "building" past this many minutes is treated as dead by

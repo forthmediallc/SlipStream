@@ -29,6 +29,17 @@ class ScheduleTest extends TestCase
         $this->assertTrue($this->event('slipstream:heartbeat')->runInBackground);
     }
 
+    /**
+     * A run killed outright (a reboot, a terminated instance) never releases
+     * its mutex. Laravel's default expiry is a day, during which the node
+     * would neither poll nor sweep stuck deploys.
+     */
+    public function test_a_mutex_a_dead_run_left_behind_expires_in_minutes(): void
+    {
+        $this->assertSame(5, $this->event('slipstream:heartbeat')->expiresAt);
+        $this->assertSame(60, $this->event('slipstream:prune')->expiresAt);
+    }
+
     protected function event(string $command): Event
     {
         foreach (app(Schedule::class)->events() as $event) {

@@ -26,6 +26,11 @@ use Slipstream\Support\Sudo;
  */
 class Deployer
 {
+    /**
+     * Seconds a deploy hook may run.
+     */
+    public const HOOK_TIMEOUT = 3600;
+
     protected string $appRoot;
 
     protected string $repo;
@@ -339,7 +344,7 @@ class Deployer
                         $this->renderHookScript('{{ php }} artisan '.$command),
                         $this->releasePath,
                         $step,
-                        timeout: max(60, (int) config('slipstream.deploy.migrate_timeout', 600)),
+                        timeout: MigrationCoordinator::migrateTimeout(),
                     ),
                     fn (string $line) => $this->log->info($line, $step),
                 );
@@ -879,7 +884,7 @@ class Deployer
             }
 
             $this->log->info("Hook [{$position} {$step}] {$hook->name}", $step);
-            $this->shell($cwd)->run($this->renderHookScript($hook->script), $cwd, $step);
+            $this->shell($cwd)->run($this->renderHookScript($hook->script), $cwd, $step, timeout: self::HOOK_TIMEOUT);
         }
     }
 
@@ -903,16 +908,16 @@ class Deployer
         $cache = $storeName ? Cache::store($storeName) : Cache::store();
         $this->warnIfUnsharedLockStore($storeName, $step);
 
-        // Lock TTL is deliberately longer than any single hook so a slow task
-        // never outlives its own lock and lets a peer double-run.
-        $ttl = (int) config('slipstream.deploy.migration_lock_ttl', 900);
+        // Held at least as long as the hook may run, so a slow one never
+        // outlives its lock and lets a peer run it at the same time.
+        $ttl = max((int) config('slipstream.deploy.migration_lock_ttl', 900), self::HOOK_TIMEOUT + MigrationCoordinator::LOCK_MARGIN);
         $lockKey = self::fleetLockKey($hook, $this->sha);
 
         $lock = $cache->lock($lockKey, $ttl);
         if ($lock->get()) {
             try {
                 $this->log->info("Hook [{$position} {$step}] {$hook->name} (fleet lock — this server runs it)", $step);
-                $this->shell($cwd)->run($this->renderHookScript($hook->script), $cwd, $step);
+                $this->shell($cwd)->run($this->renderHookScript($hook->script), $cwd, $step, timeout: self::HOOK_TIMEOUT);
             } finally {
                 optional($lock)->release();
             }

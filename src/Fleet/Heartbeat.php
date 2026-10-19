@@ -60,6 +60,24 @@ class Heartbeat
         return $this->processLooksAlive($service);
     }
 
+    /**
+     * The commit the layout serves: current/RELEASE_SHA and nothing else.
+     * Unlike readCurrentSha() it never asks the running checkout, which
+     * during bootstrap is a throwaway clone rather than anything live.
+     */
+    public function liveSha(string $appRoot): ?string
+    {
+        $path = $appRoot.DIRECTORY_SEPARATOR.'current'.DIRECTORY_SEPARATOR.'RELEASE_SHA';
+
+        if (! is_file($path)) {
+            return null;
+        }
+
+        $sha = strtolower(trim((string) file_get_contents($path)));
+
+        return $sha !== '' ? $sha : null;
+    }
+
     public function readCurrentSha(string $appRoot): ?string
     {
         $candidates = [

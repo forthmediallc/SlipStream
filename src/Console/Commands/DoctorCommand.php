@@ -1039,6 +1039,20 @@ class DoctorCommand extends Command
             );
         }
 
-        return CheckResult::pass('migrate step', "{$command} · {$where} · lock store ".SharedStore::name());
+        // The lock must outlive the command, or a waiting node takes it over
+        // and runs the same migration alongside. Slipstream stretches it; the
+        // setting should still say what happens.
+        $configured = (int) config('slipstream.deploy.migration_lock_ttl', 900);
+        $ttl = MigrationCoordinator::lockTtl();
+        if ($configured < $ttl) {
+            return CheckResult::warn(
+                'migrate step',
+                "{$command} · lock held {$ttl}s, not the {$configured}s SLIPSTREAM_MIGRATION_LOCK_TTL sets",
+                'SLIPSTREAM_MIGRATE_TIMEOUT='.MigrationCoordinator::migrateTimeout().' lets the command run longer than that lock would last, so it is held for the'."\n"
+                .'timeout plus '.MigrationCoordinator::LOCK_MARGIN."s. Set SLIPSTREAM_MIGRATION_LOCK_TTL to at least {$ttl}, or lower the timeout."
+            );
+        }
+
+        return CheckResult::pass('migrate step', "{$command} · {$where} · lock store ".SharedStore::name()." · held {$ttl}s");
     }
 }

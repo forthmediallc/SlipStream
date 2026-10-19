@@ -8,6 +8,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Schema;
 use RuntimeException;
+use Slipstream\Fleet\NodeIdentity;
 
 class Slipstream
 {
@@ -24,6 +25,11 @@ class Slipstream
      * @var array<string, Closure(): void>
      */
     public static array $healthChecks = [];
+
+    /**
+     * The poll-mode node name (see serverName()), worked out once per process.
+     */
+    public static ?string $nodeName = null;
 
     /**
      * Configure authorization for the Slipstream dashboard.
@@ -123,13 +129,24 @@ class Slipstream
     }
 
     /**
-     * Resolved server name for this node.
+     * This node's name in the fleet: SLIPSTREAM_SERVER when set, else the
+     * hostname. Except in poll mode, where instances come and go and a reused
+     * hostname would inherit another node's registry row and scheduler mutex:
+     * there it is a name unique to the machine, such as the EC2 instance ID.
      */
     public static function serverName(): string
     {
-        return config('slipstream.server_name')
-            ?: gethostname()
-            ?: 'default';
+        if ($configured = config('slipstream.server_name')) {
+            return (string) $configured;
+        }
+
+        $hostname = gethostname() ?: 'default';
+
+        if (! static::pollMode()) {
+            return $hostname;
+        }
+
+        return static::$nodeName ??= app(NodeIdentity::class)->name($hostname);
     }
 
     /**

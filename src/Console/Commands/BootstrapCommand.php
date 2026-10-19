@@ -12,6 +12,7 @@ use Slipstream\Fleet\LastGood;
 use Slipstream\Models\Deployment;
 use Slipstream\Models\Server;
 use Slipstream\Release\DeployRef;
+use Slipstream\Release\ReleaseHistory;
 use Slipstream\Release\ReleaseRef;
 use Slipstream\Release\ReleaseSource;
 use Slipstream\Settings\SettingsRepository;
@@ -29,7 +30,7 @@ use Slipstream\Support\Activity;
  *
  * The artisan that runs this has to come from somewhere before the first
  * release exists — stubs/slipstream-bootstrap.sh makes a throwaway checkout
- * with its dependencies, runs this from it, and removes it.
+ * of the deploy ref with its dependencies, runs this from it, and removes it.
  */
 class BootstrapCommand extends Command
 {
@@ -66,15 +67,7 @@ class BootstrapCommand extends Command
         $tables->ensureCurrent($connection);
         $this->components->twoColumnDetail('Tables', "current on {$connection}");
 
-        Server::query()->updateOrCreate(['server_name' => $self], [
-            'hostname' => gethostname() ?: null,
-            'php_version' => PHP_VERSION,
-            'fpm_service' => config('slipstream.services.fpm'),
-            'horizon_program' => config('slipstream.services.horizon'),
-            'reverb_program' => config('slipstream.services.reverb'),
-            'last_heartbeat_at' => now(),
-        ]);
-        $this->components->twoColumnDetail('Server', $self);
+        $this->register($self);
         $this->components->twoColumnDetail('Hooks', DefaultHooks::seedFor(base_path()));
 
         if (! is_dir($root.DIRECTORY_SEPARATOR.'repo.git') && ($code = $this->mirror($settings)) !== self::SUCCESS) {
@@ -89,18 +82,33 @@ class BootstrapCommand extends Command
         }
         $this->components->twoColumnDetail('Deploy ref', $ref->describe().' → '.$release->name.' at '.$release->short());
 
-        $running = $heartbeat->readCurrentSha($root);
+        // Only what current serves is live. The checkout this runs from is a
+        // throwaway clone of the deploy ref, so its HEAD is usually the very
+        // commit about to be deployed, and says nothing about this node.
+        $running = $heartbeat->liveSha($root);
         $fellBack = null;
 
-        if (is_string($running) && strtolower($running) === $release->sha) {
+        if ($running === $release->sha) {
             $this->components->twoColumnDetail('Release', 'already serving '.$release->short());
         } elseif (! $this->deploy($runner, $release, $ref, true)) {
             $good = $this->option('no-fallback') ? null : $lastGood->get($ref);
+            $refused = null;
+
+            if ($good !== null && $good['sha'] !== $release->sha
+                && ($refused = $this->refuseFallback($source, $ref, $release, $good['sha'])) !== null) {
+                $this->components->warn('Not falling back to the fleet\'s last good commit '.substr($good['sha'], 0, 7).": {$refused}.");
+                Activity::log('bootstrap.fallback_refused', ['sha' => $good['sha'], 'ref' => $release->ref(), 'reason' => $refused]);
+                $good = null;
+            }
 
             if ($good === null || $good['sha'] === $release->sha) {
                 Activity::log('bootstrap.failed', ['sha' => $release->sha, 'ref' => $release->ref()]);
 
-                return $this->failWith('The deploy of '.$release->short().' failed'.($this->option('no-fallback') ? '.' : ', and the fleet has no other good commit to fall back to.'));
+                return $this->failWith('The deploy of '.$release->short().' failed'.match (true) {
+                    (bool) $this->option('no-fallback') => '.',
+                    $refused !== null => ', and the deploy ref no longer contains the fleet\'s last good commit.',
+                    default => ', and the fleet has no other good commit to fall back to.',
+                });
             }
 
             $this->components->warn(sprintf(
@@ -122,7 +130,7 @@ class BootstrapCommand extends Command
         $live = realpath($root.DIRECTORY_SEPARATOR.'current') ?: $root.DIRECTORY_SEPARATOR.'current';
         $check = $health->check($live);
         if (! $check['ok']) {
-            Activity::log('bootstrap.failed', ['reason' => 'health', 'sha' => $heartbeat->readCurrentSha($root)]);
+            Activity::log('bootstrap.failed', ['reason' => 'health', 'sha' => $heartbeat->liveSha($root)]);
             $this->line($check['output']);
 
             return $this->failWith('The health check failed on the live release.');
@@ -139,6 +147,67 @@ class BootstrapCommand extends Command
         $this->components->info('Ready: serving '.$serving->short().'.');
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Register this node, unheld. A pause or pin already on the row belongs
+     * to whatever held the name before (an instance that had the same
+     * hostname, or this node before it was rebuilt). Bootstrap deploys the
+     * ref regardless, so a hold left in place would only stop the node
+     * following it afterwards.
+     */
+    protected function register(string $self): void
+    {
+        $server = Server::query()->firstOrNew(['server_name' => $self]);
+        $held = $server->exists && ($server->paused || $server->pinned_sha !== null);
+        $pinned = $server->pinned_sha;
+
+        $server->fill([
+            'hostname' => gethostname() ?: null,
+            'php_version' => PHP_VERSION,
+            'fpm_service' => config('slipstream.services.fpm'),
+            'horizon_program' => config('slipstream.services.horizon'),
+            'reverb_program' => config('slipstream.services.reverb'),
+            'last_heartbeat_at' => now(),
+            'paused' => false,
+            'pinned_sha' => null,
+            'pinned_reason' => null,
+            'pinned_at' => null,
+        ])->save();
+
+        $this->components->twoColumnDetail('Server', $self.($held ? ' (pause and pin cleared)' : ''));
+
+        if ($held) {
+            Activity::log('bootstrap.hold_cleared', ['server' => $self, 'pinned_sha' => $pinned]);
+        }
+    }
+
+    /**
+     * Why the fleet's last good commit may not be deployed here, or null when
+     * it may. The deploy ref must still contain it: the shared store only
+     * suggests a commit, and the protected ref is what vouches for one. A
+     * rolled-back release, or a commit nobody reviewed, never comes back
+     * through this door.
+     */
+    protected function refuseFallback(ReleaseSource $source, DeployRef $ref, ReleaseRef $head, string $sha): ?string
+    {
+        if (! $source instanceof ReleaseHistory) {
+            return 'the release source cannot confirm the deploy ref contains it';
+        }
+
+        try {
+            if ($source->contains($ref, $head, $sha)) {
+                return null;
+            }
+        } catch (\Throwable $e) {
+            return 'the deploy ref could not be checked: '.$e->getMessage();
+        }
+
+        return match ($ref->kind) {
+            DeployRef::BRANCH => "it is not in the history of branch {$ref->name}",
+            DeployRef::TAG => "tag {$ref->name} points at {$head->short()}, not at it",
+            default => "no tag matching {$ref->name} points at it now",
+        };
     }
 
     /**

@@ -5,10 +5,13 @@ namespace Slipstream\Tests\Unit;
 use RuntimeException;
 use Slipstream\Release\DeployRef;
 use Slipstream\Release\GitRefSource;
+use Slipstream\Release\ReleaseRef;
 use Slipstream\Tests\TestCase;
+use Symfony\Component\Process\Process;
 
 /**
- * Choosing the release from `git ls-remote` output, without git.
+ * Choosing the release from `git ls-remote` output, without git, and what the
+ * ref contains (the branch case with a real mirror).
  */
 class GitRefSourceTest extends TestCase
 {
@@ -74,6 +77,87 @@ class GitRefSourceTest extends TestCase
             } catch (RuntimeException) {
                 $this->addToAssertionCount(1);
             }
+        }
+    }
+
+    public function test_a_pattern_vouches_for_what_its_matching_tags_point_at_under_the_same_rules(): void
+    {
+        $sha = fn (string $c) => str_repeat($c, 40);
+
+        $this->assertEqualsCanonicalizing(
+            [$sha('3'), $sha('5'), $sha('6')],
+            GitRefSource::taggedCommits(DeployRef::parse('v*'), $this->lsRemote()),
+            'versions only, peeled, no pre-release'
+        );
+        $this->assertContains($sha('7'), GitRefSource::taggedCommits(DeployRef::parse('v*'), $this->lsRemote(), prereleases: true));
+    }
+
+    public function test_containment_takes_nothing_but_a_commit_id(): void
+    {
+        // The value comes from the shared store; none of these reach git.
+        $source = new GitRefSource;
+        $head = new ReleaseRef(str_repeat('2', 40), 'production', false);
+
+        foreach (['--upload-pack=touch /tmp/x', 'HEAD', 'production', '', str_repeat('g', 40)] as $value) {
+            $this->assertFalse($source->contains(DeployRef::parse('refs/heads/production'), $head, $value), $value);
+        }
+    }
+
+    public function test_an_exact_tag_contains_its_own_commit_and_nothing_else(): void
+    {
+        $source = new GitRefSource;
+        $ref = DeployRef::parse('refs/tags/v1.10.0');
+        $head = new ReleaseRef(str_repeat('5', 40), 'v1.10.0', true);
+
+        $this->assertTrue($source->contains($ref, $head, str_repeat('5', 40)));
+        $this->assertFalse($source->contains($ref, $head, str_repeat('3', 40)));
+    }
+
+    /**
+     * The real check for a branch: `git merge-base --is-ancestor` in the
+     * mirror. A commit on another branch, or one the mirror lacks, is out.
+     */
+    public function test_a_branch_contains_its_own_history_only(): void
+    {
+        try {
+            $hasGit = (new Process(['git', '--version']))->run() === 0;
+        } catch (\Throwable) {
+            $hasGit = false;
+        }
+        if (! $hasGit) {
+            $this->markTestSkipped('needs git on the PATH.');
+        }
+
+        $root = sys_get_temp_dir().DIRECTORY_SEPARATOR.'ss-gitref-'.bin2hex(random_bytes(4));
+        $work = $root.DIRECTORY_SEPARATOR.'work';
+        mkdir($work, 0777, true);
+        $git = fn (string ...$args) => trim((new Process(
+            ['git', '-C', $work, '-c', 'user.name=Slipstream', '-c', 'user.email=slipstream@example.com', ...$args]
+        ))->mustRun()->getOutput());
+
+        try {
+            $git('init', '-q');
+            $git('checkout', '-q', '-b', 'production');
+            $git('commit', '-q', '--allow-empty', '-m', 'one');
+            $older = $git('rev-parse', 'HEAD');
+            $git('commit', '-q', '--allow-empty', '-m', 'two');
+            $tip = $git('rev-parse', 'HEAD');
+            $git('checkout', '-q', '-b', 'unreviewed', $older);
+            $git('commit', '-q', '--allow-empty', '-m', 'never merged');
+            $elsewhere = $git('rev-parse', 'HEAD');
+            (new Process(['git', 'clone', '-q', '--bare', $work, $root.DIRECTORY_SEPARATOR.'repo.git']))->mustRun();
+            config()->set('slipstream.app_root', $root);
+
+            $source = new GitRefSource;
+            $ref = DeployRef::parse('refs/heads/production');
+            $head = new ReleaseRef($tip, 'production', false);
+
+            $this->assertTrue($source->contains($ref, $head, $older));
+            $this->assertTrue($source->contains($ref, $head, $tip));
+            $this->assertFalse($source->contains($ref, $head, $elsewhere), 'a branch nobody merged');
+            $this->assertFalse($source->contains($ref, $head, str_repeat('a', 40)), 'a commit the mirror lacks');
+        } finally {
+            $this->removeTree($root);
         }
     }
 }

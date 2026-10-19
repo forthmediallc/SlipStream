@@ -7,10 +7,19 @@
 # removes the checkout. The release bootstrap builds is a normal one; the
 # second composer install it does mostly comes from composer's local cache.
 #
+# The checkout is the deploy ref itself, read from the shared .env: the branch
+# or tag SLIPSTREAM_DEPLOY_REF names (SLIPSTREAM_BRANCH when it is unset), or,
+# for a tag pattern, the highest version tag matching it. Composer's scripts
+# and artisan run with the production .env, so nothing but released code runs
+# before the first release. BOOTSTRAP_BRANCH (a branch or tag) overrides it.
+#
 # Run it as the deploy user — the PHP-FPM pool user — never as root, or the
 # releases and the mirror it creates belong to the wrong user:
 #
 #   sudo -u deploy APP_ROOT=/var/www/app REPO=git@github.com:org/app.git sh slipstream-bootstrap.sh
+#
+# Options for slipstream:bootstrap, such as --no-fallback, go after the script
+# name or in BOOTSTRAP_ARGS.
 #
 # Exits non-zero unless the node can serve, so a lifecycle hook can keep the
 # instance out of the load balancer until it succeeds. Safe to run again.
@@ -24,24 +33,78 @@ set -eu
 : "${REPO:?set REPO to the repository, e.g. git@github.com:org/app.git}"
 PHP="${PHP:-php}"
 COMPOSER="${COMPOSER:-composer}"
-# Any recent commit with Slipstream installed works for the throwaway
-# checkout; bootstrap resolves and deploys the real deploy ref itself.
 BOOTSTRAP_BRANCH="${BOOTSTRAP_BRANCH:-}"
+BOOTSTRAP_ARGS="${BOOTSTRAP_ARGS:-}"
 
 if [ ! -f "$APP_ROOT/.env" ]; then
     echo "slipstream-bootstrap: no shared .env at $APP_ROOT/.env" >&2
     exit 1
 fi
 
-mkdir -p "$APP_ROOT"
-work=$(mktemp -d "$APP_ROOT/.bootstrap.XXXXXX")
-trap 'rm -rf "$work"' EXIT INT TERM
+# The last value the shared .env gives a variable, unquoted; empty for none.
+env_value() {
+    tr -d '\r' < "$APP_ROOT/.env" \
+        | sed -e 's/^[[:space:]]*export[[:space:]][[:space:]]*//' \
+        | sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" \
+        | tail -n 1 \
+        | sed -e 's/[[:space:]][[:space:]]*#.*$//' -e 's/[[:space:]]*$//' \
+              -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
 
-if [ -n "$BOOTSTRAP_BRANCH" ]; then
-    git clone --quiet --depth 1 --branch "$BOOTSTRAP_BRANCH" "$REPO" "$work/app"
-else
-    git clone --quiet --depth 1 "$REPO" "$work/app"
+# What to check out: BOOTSTRAP_BRANCH, else what the deploy ref names now.
+checkout="$BOOTSTRAP_BRANCH"
+if [ -z "$checkout" ]; then
+    ref=$(env_value SLIPSTREAM_DEPLOY_REF)
+    if [ -z "$ref" ]; then
+        branch=$(env_value SLIPSTREAM_BRANCH)
+        ref="refs/heads/${branch:-main}"
+    fi
+
+    name=${ref#refs/heads/}
+    name=${name#refs/tags/}
+
+    case "$name" in
+        *\**|*\?*|*\[*)
+            # A tag pattern: the highest version tag matching it, by the rules
+            # slipstream:bootstrap picks with (pre-releases only when allowed).
+            checkout=$(git ls-remote --tags --refs "$REPO" \
+                | PATTERN="$name" PRERELEASES="$(env_value SLIPSTREAM_DEPLOY_PRERELEASES)" "$PHP" -r '
+                    $best = null;
+                    foreach (preg_split("/\R/", stream_get_contents(STDIN)) as $line) {
+                        if (preg_match("#^[0-9a-f]{40}(?:[0-9a-f]{24})?\s+refs/tags/(\S+)$#i", trim($line), $m) !== 1
+                            || ! fnmatch(getenv("PATTERN"), $m[1])) {
+                            continue;
+                        }
+                        $version = ltrim(preg_replace("#^.*/#", "", $m[1]), "vV");
+                        if (preg_match("/^\d+(\.\d+)*([.-].*)?$/", $version) !== 1
+                            || (! filter_var(getenv("PRERELEASES"), FILTER_VALIDATE_BOOLEAN)
+                                && preg_match("/-|alpha|beta|rc|dev|pre/i", $version) === 1)) {
+                            continue;
+                        }
+                        if ($best === null || version_compare($version, $best[1], ">")) {
+                            $best = [$m[1], $version];
+                        }
+                    }
+                    echo $best[0] ?? "";
+                ')
+            if [ -z "$checkout" ]; then
+                echo "slipstream-bootstrap: no tag on $REPO matches $name" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            checkout=$name
+            ;;
+    esac
 fi
+
+work=$(mktemp -d "$APP_ROOT/.bootstrap.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "slipstream-bootstrap: checking out $checkout"
+git clone --quiet --depth 1 --branch "$checkout" "$REPO" "$work/app"
 
 ln -s "$APP_ROOT/.env" "$work/app/.env"
 if [ -f "$APP_ROOT/auth.json" ]; then
@@ -64,4 +127,7 @@ ln -s "$APP_ROOT/storage" "$work/app/storage"
 (cd "$work/app" && "$COMPOSER" install --no-dev --no-interaction --prefer-dist --no-progress --quiet)
 
 cd "$work/app"
-SLIPSTREAM_APP_ROOT="$APP_ROOT" "$PHP" artisan slipstream:bootstrap --repo="$REPO" --no-interaction
+# BOOTSTRAP_ARGS is a list of options: split on purpose, never globbed.
+set -f
+# shellcheck disable=SC2086
+SLIPSTREAM_APP_ROOT="$APP_ROOT" "$PHP" artisan slipstream:bootstrap --repo="$REPO" --no-interaction $BOOTSTRAP_ARGS "$@"

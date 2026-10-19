@@ -29,6 +29,11 @@ class MigrationCoordinator
 
     public const OUTCOME_ALREADY = 'already';
 
+    /**
+     * Seconds a lock outlives the longest its holder may run.
+     */
+    public const LOCK_MARGIN = 120;
+
     /** @var Closure(int): void */
     protected Closure $sleep;
 
@@ -78,7 +83,7 @@ class MigrationCoordinator
 
         return is_numeric($configured)
             ? max(0, (int) $configured)
-            : $this->lockTtl() + 60;
+            : self::lockTtl() + 60;
     }
 
     /**
@@ -99,7 +104,7 @@ class MigrationCoordinator
         $waitedOn = null;
 
         while (true) {
-            $lock = $cache->lock(self::lockKey($sha), $this->lockTtl());
+            $lock = $cache->lock(self::lockKey($sha), self::lockTtl());
 
             if ($lock->get()) {
                 try {
@@ -115,7 +120,7 @@ class MigrationCoordinator
                         throw $this->failedElsewhere($short, $state);
                     }
 
-                    $cache->put($marker, $this->state('running'), $this->lockTtl());
+                    $cache->put($marker, $this->state('running'), self::lockTtl());
                     $say("Running migrations for {$short} — this node holds the lock.");
 
                     try {
@@ -230,9 +235,23 @@ class MigrationCoordinator
         return strtolower($sha).':'.substr(sha1((self::command() ?? '').'|'.SharedStore::scope()), 0, 12);
     }
 
-    protected function lockTtl(): int
+    /**
+     * How long the migrate command may run (SLIPSTREAM_MIGRATE_TIMEOUT).
+     */
+    public static function migrateTimeout(): int
     {
-        return max(60, (int) config('slipstream.deploy.migration_lock_ttl', 900));
+        return max(60, (int) config('slipstream.deploy.migrate_timeout', 600));
+    }
+
+    /**
+     * How long the lock is held: SLIPSTREAM_MIGRATION_LOCK_TTL, but never
+     * less than the migrate timeout plus a margin. A lock that expired while
+     * the command still ran would hand the same migration to a waiting node
+     * to run alongside it.
+     */
+    public static function lockTtl(): int
+    {
+        return max(60, (int) config('slipstream.deploy.migration_lock_ttl', 900), self::migrateTimeout() + self::LOCK_MARGIN);
     }
 
     /**

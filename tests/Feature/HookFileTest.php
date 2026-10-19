@@ -121,6 +121,38 @@ class HookFileTest extends TestCase
         $this->assertSame([], $this->deployer()->migrate()->commands());
     }
 
+    public function test_a_fleet_locked_hook_holds_its_lock_as_long_as_the_hook_may_run(): void
+    {
+        DefaultHooks::seed();
+        $hook = DeploymentHook::query()->where('name', DefaultHooks::MIGRATE_HOOK)->sole();
+        $deployer = $this->deployer();
+
+        // The hook may run an hour; the 900 s TTL used to lapse well before.
+        $deployer->runner->during = function (string $command) use ($hook) {
+            if (str_contains($command, 'artisan migrate --force')) {
+                $this->travel(1000)->seconds();
+                $this->assertFalse(Cache::lock(Deployer::fleetLockKey($hook, self::SHA), 10)->get(), 'still held');
+            }
+        };
+
+        $deployer->hooks('composer', 'after');
+
+        $migrate = array_values(array_filter($deployer->runner->commands, fn ($c) => str_contains($c['command'], 'artisan migrate --force')));
+        $this->assertCount(1, $migrate);
+        $this->assertSame(Deployer::HOOK_TIMEOUT, $migrate[0]['timeout']);
+    }
+
+    public function test_the_migrate_step_runs_its_command_under_the_migrate_timeout(): void
+    {
+        config()->set('slipstream.migrations.command', 'migrate --force');
+        config()->set('slipstream.deploy.migrate_timeout', 1200);
+
+        $deployer = $this->deployer()->migrate();
+
+        $migrate = array_values(array_filter($deployer->runner->commands, fn ($c) => str_contains($c['command'], 'artisan migrate --force')));
+        $this->assertSame(1200, $migrate[0]['timeout']);
+    }
+
     public function test_a_node_set_not_to_migrate_will_not_swap_onto_a_failed_migration(): void
     {
         config()->set('slipstream.migrations.command', 'migrate --force');

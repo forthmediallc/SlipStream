@@ -17,6 +17,12 @@ class HealthGate
      */
     public function check(string $releaseDir): array
     {
+        // Process refuses a working directory that does not exist; say so
+        // as a failed check rather than an exception.
+        if (! is_dir($releaseDir)) {
+            return ['ok' => false, 'output' => "No release at {$releaseDir} to check."];
+        }
+
         $process = new Process([PhpBinary::resolve(), 'artisan', 'slipstream:healthcheck'], $releaseDir);
         $process->setTimeout(300);
         $process->run();

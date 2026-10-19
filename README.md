@@ -281,7 +281,9 @@ Manual escape hatch if the app is hard-down: run `php artisan slipstream:deploy`
   migrate. Pin it with `SLIPSTREAM_MIGRATION_LOCK_STORE` if your default store isn't shared.
   The seeded hook only keeps two servers from migrating *at the same moment*; for "exactly
   once per commit, and the others wait for it", set `SLIPSTREAM_MIGRATE_COMMAND` — see
-  [Migrations once per commit](#migrations-once-per-commit).
+  [Migrations once per commit](#migrations-once-per-commit). A fleet-locked hook's lock is
+  held for at least the hour a hook may run, plus two minutes, so a slow migration never
+  outlives it.
 - Pause a server to accept webhooks but skip builds (in poll mode: checks go on, no deploy
   starts).
 - Notifications (mail, Slack, Discord, generic webhook) are configured under Settings.
@@ -688,9 +690,15 @@ read-only. (Webhook mode keeps preferring stored values, as before.)
 | `SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS` | `0` (never) | The daily prune forgets servers silent this long, so terminated instances don't pile up in a shared registry |
 
 Shared paths have no variable: they come from `deploy.shared_paths` in your published
-`config/slipstream.php`, which the repository carries. Keep `SLIPSTREAM_SERVER` out of a
-shared `.env`, or every instance claims the same identity; unset, a node is named after its
-hostname.
+`config/slipstream.php`, which the repository carries.
+
+Keep `SLIPSTREAM_SERVER` out of a shared `.env`, or every instance claims the same identity.
+Unset, a poll-mode node names itself after its EC2 instance ID, read from `/sys` on Nitro
+instances or from IMDSv2 on Xen ones; off EC2 it uses its hostname plus the first eight
+characters of `/etc/machine-id`. EC2 derives hostnames from private IPs, which the next
+instance may get, but an instance ID is never reused, so a new instance never inherits an old
+one's pause, pin or scheduler lock. (A webhook-mode node keeps its hostname.) If several nodes
+share one machine, give each its own `SLIPSTREAM_SERVER`.
 
 ### How releases are cut
 
@@ -727,7 +735,8 @@ the check when one is due:
 `slipstream.poll.<result>`, and each deploy a check starts as `slipstream.poll.deploy_started`.
 The heartbeat runs in the background under a mutex of the node's own, so the wait never holds
 up the app's own scheduled tasks, and a cache store the fleet shares never makes one node skip
-another's heartbeat.
+another's heartbeat. If a heartbeat dies mid-run (a reboot, a terminated instance), its mutex
+expires after five minutes.
 
 ### Hooks from the repository
 
@@ -784,6 +793,10 @@ lock dies, its lock expires and a waiting node takes the run over. A node with
 `SLIPSTREAM_RUN_MIGRATIONS=false` never runs the command, but it still waits for a run in
 progress and fails its deploy when the last run failed.
 
+The lock is held for at least `SLIPSTREAM_MIGRATE_TIMEOUT` plus two minutes, whatever
+`SLIPSTREAM_MIGRATION_LOCK_TTL` says. A lock that lapsed while the command still ran would hand
+the same migration to a second node. `doctor` warns when the TTL is set lower than that.
+
 With a command set, the seeded "Run migrations" hook stops running (unless you edited it,
 which makes it your own), and `install` and `bootstrap` stop seeding it. Leave the command
 unset and nothing changes: that hook runs as it always has.
@@ -814,11 +827,16 @@ a Slipstream migration as run the first time any node runs it.
 ### Bootstrapping a new instance
 
 A node has no `artisan` until its first release exists. `stubs/slipstream-bootstrap.sh` solves
-that: it makes a throwaway checkout, installs its dependencies, runs
-`php artisan slipstream:bootstrap` from it, and removes it. Bootstrap then:
+that: it makes a throwaway checkout of the deploy ref, installs its dependencies, runs
+`php artisan slipstream:bootstrap` from it, and removes it. The checkout is the commit the ref
+names, read from the shared `.env`: the branch, the tag, or the highest version tag matching
+the pattern, by the same rules as the deploy. So the only code that runs before the first
+release (composer's scripts and artisan, with the production `.env`) is released code.
+Bootstrap then:
 
 1. creates Slipstream's tables if they are missing, and brings them current;
-2. registers the server;
+2. registers the server, unheld: a pause or pin already on its row came with the name, and is
+   cleared;
 3. mirrors `SLIPSTREAM_REPOSITORY` if the node has no mirror yet;
 4. deploys the deploy ref's commit, blocking: a normal deploy, with its hooks, migrate step
    and health check;
@@ -866,16 +884,22 @@ aws autoscaling complete-lifecycle-action --auto-scaling-group-name app \
 
 Give the group a launch lifecycle hook whose default result is `ABANDON`. An instance whose
 bootstrap fails then never completes the action; it is terminated when the hook times out,
-and the group launches another. The stub takes `PHP`, `COMPOSER` and `BOOTSTRAP_BRANCH` (a
-branch or tag for the throwaway checkout; any recent commit with Slipstream installed works,
-because bootstrap deploys the deploy ref itself).
+and the group launches another. Besides `APP_ROOT` and `REPO`, the stub takes `PHP`,
+`COMPOSER`, `BOOTSTRAP_BRANCH` (a branch or tag to check out instead of the deploy ref) and
+`BOOTSTRAP_ARGS`. Options for `slipstream:bootstrap` go in `BOOTSTRAP_ARGS` or after the
+script name: `sh slipstream-bootstrap.sh --no-fallback`.
 
 **When the ref's commit fails.** A broken release would otherwise stop the group from scaling
 out: each new instance would fail its health check and be replaced, over and over. So when the
 deploy ref's own commit fails to deploy, bootstrap deploys the fleet's last good commit
 instead: the last commit any node deployed successfully from the ref, kept in the shared store.
-It says so on its output and in the audit log (`slipstream.activity.bootstrap.fell_back`), and
-the node keeps retrying the ref, with back-off, like any other. Alarm on that line. Pass
+It does so only if the ref still contains that commit. For a branch, the commit must be in its
+history; for a tag pattern, a matching tag must point at it now; an exact tag has nothing else
+to offer. So a release rolled back by deleting its tag never comes back this way, and neither
+does a commit someone wrote into the store. A fallback, or a refused one, is reported on
+bootstrap's output and in the audit log (`slipstream.activity.bootstrap.fell_back`,
+`slipstream.activity.bootstrap.fallback_refused`), and the node keeps retrying the ref, with
+back-off, like any other. Alarm on those lines. Pass
 `--no-fallback` to fail instead.
 
 ### Rollback in poll mode
@@ -915,8 +939,9 @@ database.
 `slipstream:doctor` checks that the deploy user's key can `ls-remote` the ref (and shows what it
 resolves to), warns when `SLIPSTREAM_DEPLOY_REF` is unset or no heartbeat ran in the last three
 minutes, and confirms the webhook route is absent. With a migrate command set, it checks that
-the lock store can be shared at all. A PCI node on the webhook trigger gets a warning that each
-node needs its own webhook, and a pointer to poll mode.
+the lock store can be shared at all, and that `SLIPSTREAM_MIGRATION_LOCK_TTL` outlasts
+`SLIPSTREAM_MIGRATE_TIMEOUT`. A PCI node on the webhook trigger gets a warning that each node
+needs its own webhook, and a pointer to poll mode.
 
 ### Poll mode in a PCI environment
 
@@ -935,10 +960,34 @@ node needs its own webhook, and a pointer to poll mode.
 
 Rollout caps (a limit on how many nodes build or swap at once), signed-release verification,
 and an artifact source (a tarball CI built once, named by an S3 object or an SSM parameter,
-in place of git) are not part of 0.5.0. Releases are found through an interface,
-`Slipstream\Release\ReleaseSource`, so a source other than git can be bound later.
+in place of git) are not part of 0.5. Releases are found through an interface,
+`Slipstream\Release\ReleaseSource`, so a source other than git can be bound later; bootstrap
+falls back only with a source that also implements `Slipstream\Release\ReleaseHistory`.
 
 ## Upgrading
+
+### To 0.5.1
+
+- **Poll-mode nodes rename themselves.** With `SLIPSTREAM_SERVER` unset, a poll-mode node is now
+  named after its EC2 instance ID (or its hostname plus machine ID), not its hostname. After the
+  upgrade each node registers under its new name. Its history stays under the old one, which
+  stops reporting: forget it with `slipstream:servers forget <old-name>`, or let
+  `SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS` do it. A pin set on the old name does not carry over.
+  Set `SLIPSTREAM_SERVER` to keep a name. Upgrade between releases, so no deploy is in flight
+  while the name changes. Webhook-mode nodes keep their hostnames.
+- **Copy the new `slipstream-bootstrap.sh` into your image.** Its checkout is now the deploy
+  ref, not the repository's default branch, and `BOOTSTRAP_BRANCH` only overrides that. Options
+  pass through to `slipstream:bootstrap`.
+- **Bootstrap's fallback is stricter.** It deploys the fleet's last good commit only when the
+  deploy ref still contains it. A release source of your own must also implement
+  `Slipstream\Release\ReleaseHistory` for bootstrap to fall back at all.
+- **Locks last as long as what they guard.** The migrate step's lock is held for at least
+  `SLIPSTREAM_MIGRATE_TIMEOUT` plus two minutes, and a fleet-locked hook's for at least an hour
+  and two minutes, whatever `SLIPSTREAM_MIGRATION_LOCK_TTL` says. If a node dies holding one,
+  the lock outlives it by that much: a waiting node takes the migration over later, and other
+  nodes skip the fleet-locked hook for longer.
+- The heartbeat's scheduler mutex now expires after five minutes rather than a day, and prune's
+  after an hour.
 
 ### To 0.5.0
 

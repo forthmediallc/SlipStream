@@ -215,10 +215,14 @@ class SlipstreamServiceProvider extends ServiceProvider
             // per-node tasks, so the mutex is per node.
             $perNode = fn (string $task) => 'framework'.DIRECTORY_SEPARATOR.'schedule-'.sha1($task.'|'.Slipstream::serverName());
 
+            // A run killed outright (a reboot, a terminated instance) never
+            // releases its mutex, and Laravel's default expiry is a day: a
+            // node would stop polling for that long. A heartbeat finishes
+            // within about a minute and a half, so five minutes is ample.
             $schedule->command('slipstream:heartbeat')
                 ->everyMinute()
                 ->name('slipstream-heartbeat')
-                ->withoutOverlapping()
+                ->withoutOverlapping(5)
                 ->createMutexNameUsing($perNode('slipstream-heartbeat'))
                 // In poll mode the check first waits a random few seconds; in
                 // the background that never holds up the app's own tasks.
@@ -227,7 +231,7 @@ class SlipstreamServiceProvider extends ServiceProvider
             $schedule->command('slipstream:prune')
                 ->daily()
                 ->name('slipstream-prune')
-                ->withoutOverlapping()
+                ->withoutOverlapping(60)
                 ->createMutexNameUsing($perNode('slipstream-prune'));
         });
     }

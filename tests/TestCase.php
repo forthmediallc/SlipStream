@@ -16,6 +16,7 @@ abstract class TestCase extends BaseTestCase
         // Static auth/health registries leak across tests otherwise.
         Slipstream::$authUsing = null;
         Slipstream::$healthChecks = [];
+        Slipstream::$nodeName = null;
     }
 
     protected function getPackageProviders($app): array

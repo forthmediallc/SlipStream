@@ -67,9 +67,10 @@ class Poller
             return $this->record($server, self::ERROR, $e->getMessage());
         }
 
-        $running = $this->heartbeat->readCurrentSha(Slipstream::appRoot());
+        // What current serves, never the checkout this process runs from.
+        $running = $this->heartbeat->liveSha(Slipstream::appRoot());
 
-        if (is_string($running) && strtolower($running) === $release->sha) {
+        if ($running === $release->sha) {
             return $this->record($server, self::UP_TO_DATE, 'running '.$release->short().' — '.$release->name, $release);
         }
 
