@@ -233,6 +233,16 @@ class PciModeTest extends TestCase
             ->assertExitCode(1); // the bare layout fails elsewhere
     }
 
+    public function test_doctor_points_a_pci_node_on_the_webhook_at_poll_mode(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('webhook, in PCI mode')
+            ->expectsOutputToContain('SLIPSTREAM_TRIGGER=poll')
+            ->assertExitCode(1);
+    }
+
     public function test_doctor_warns_when_relay_is_configured_but_ignored(): void
     {
         Http::fake(['*' => Http::response('invalid signature', 401)]);

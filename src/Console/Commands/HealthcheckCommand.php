@@ -17,6 +17,11 @@ class HealthcheckCommand extends Command
     {
         $this->components->info('Running Slipstream health checks…');
 
+        // Which commit this check speaks for, in every deploy log that runs it.
+        $release = base_path('RELEASE_SHA');
+        $sha = is_file($release) ? trim((string) file_get_contents($release)) : '';
+        $this->components->twoColumnDetail('Release', $sha !== '' ? substr($sha, 0, 12) : 'unknown (not a release directory)');
+
         try {
             DB::connection()->getPdo();
             $this->components->twoColumnDetail('Database', '<fg=green>OK</>');

@@ -35,6 +35,12 @@ class Deployment extends SlipstreamModel
 
     public const TRIGGER_CATCH_UP = 'catch-up';
 
+    // Poll mode: the node saw a new commit on the deploy ref and started it.
+    public const TRIGGER_POLL = 'poll';
+
+    // slipstream:bootstrap bringing a fresh instance up.
+    public const TRIGGER_BOOTSTRAP = 'bootstrap';
+
     protected $table = 'slipstream_deployments';
 
     protected $fillable = [

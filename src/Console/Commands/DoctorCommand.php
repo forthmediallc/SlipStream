@@ -4,14 +4,19 @@ namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Route;
 use Slipstream\Database\Tables;
 use Slipstream\Deploy\FailedReleases;
+use Slipstream\Deploy\MigrationCoordinator;
 use Slipstream\Diagnostics\CheckResult;
 use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Diagnostics\FpmPool;
 use Slipstream\Diagnostics\Ownership;
 use Slipstream\Environment\EnvContentMerger;
+use Slipstream\Fleet\SharedStore;
 use Slipstream\Models\Server;
+use Slipstream\Release\DeployRef;
+use Slipstream\Release\ReleaseSource;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\PhpBinary;
@@ -41,6 +46,8 @@ class DoctorCommand extends Command
 
         $checks = [
             'checkPciMode',
+            'checkTrigger',
+            'checkMigrateStep',
             'checkDatabase',
             'checkPoolUser',
             'checkPhpBinary',
@@ -669,6 +676,12 @@ class DoctorCommand extends Command
      */
     protected function checkWebhookReachable(string $root): CheckResult
     {
+        if (Slipstream::pollMode()) {
+            return Route::has('slipstream.hooks.deploy')
+                ? CheckResult::fail('webhook endpoint', 'registered in poll mode', 'Poll mode registers no webhook route. Clear the route cache: php artisan route:clear')
+                : CheckResult::pass('webhook endpoint', 'not registered (poll mode: nothing inbound)');
+        }
+
         // route() honours slipstream.domain; url() would probe app.url and
         // report a 404 for a dashboard served from its own subdomain.
         try {
@@ -867,6 +880,10 @@ class DoctorCommand extends Command
      */
     protected function checkWebhookSource(string $root): CheckResult
     {
+        if (Slipstream::pollMode()) {
+            return CheckResult::skip('webhook source', 'poll mode: no webhook endpoint to restrict');
+        }
+
         $allowed = Slipstream::webhookAllowedIps();
 
         if ($allowed !== []) {
@@ -933,5 +950,95 @@ class DoctorCommand extends Command
             "This server holds CDE credentials and still has the dashboard, the .env editor and env sync.\n"
             .'Enable PCI mode: php artisan slipstream:install --pci (or SLIPSTREAM_PCI_MODE=true in the shared .env).'
         );
+    }
+
+    /**
+     * How deploys start. Poll mode stands or falls on the deploy key reaching
+     * the ref, and on the scheduler running the minute heartbeat that polls.
+     * A PCI node on the webhook trigger works, but behind a load balancer the
+     * webhook reaches one node only.
+     */
+    protected function checkTrigger(string $root): CheckResult
+    {
+        if (! Slipstream::pollMode()) {
+            $raw = strtolower(trim((string) config('slipstream.trigger.mode', 'webhook')));
+            if (! in_array($raw, ['', 'webhook', 'poll'], true)) {
+                return CheckResult::warn('deploy trigger', "unknown SLIPSTREAM_TRIGGER \"{$raw}\" — using webhook", 'Set SLIPSTREAM_TRIGGER to webhook or poll.');
+            }
+
+            if (Slipstream::pciMode()) {
+                return CheckResult::warn(
+                    'deploy trigger',
+                    'webhook, in PCI mode',
+                    "PCI mode has no relay, so every node needs its own provider webhook. Behind a load balancer the webhook\n"
+                    .'reaches one node only; set SLIPSTREAM_TRIGGER=poll so each node deploys by itself, with no inbound endpoint.'
+                );
+            }
+
+            return CheckResult::skip('deploy trigger', 'webhook');
+        }
+
+        try {
+            $ref = DeployRef::fromConfig();
+            $release = app(ReleaseSource::class)->latest($ref);
+        } catch (\Throwable $e) {
+            $pool = $this->poolUser();
+
+            return CheckResult::fail(
+                'deploy trigger',
+                'poll mode cannot read the deploy ref',
+                $e->getMessage()."\n"
+                .'The deploy user\'s key must reach origin: '
+                .($pool ? "sudo -u {$pool} " : '').'git --git-dir='.$root.DIRECTORY_SEPARATOR.'repo.git ls-remote origin'
+            );
+        }
+
+        $summary = 'poll · '.$ref->describe().' → '.$release->name.' at '.$release->short();
+
+        if (trim((string) config('slipstream.trigger.ref', '')) === '') {
+            return CheckResult::warn(
+                'deploy trigger',
+                $summary.'; no SLIPSTREAM_DEPLOY_REF, so it follows the deploy branch',
+                'Name the release ref explicitly, e.g. SLIPSTREAM_DEPLOY_REF=refs/heads/production or v*: releasing then means moving that ref.'
+            );
+        }
+
+        $server = Server::query()->where('server_name', Slipstream::serverName())->first();
+        if ($server?->last_heartbeat_at === null || $server->last_heartbeat_at->lt(now()->subMinutes(3))) {
+            return CheckResult::warn(
+                'deploy trigger',
+                $summary.'; no heartbeat in the last 3 minutes',
+                "Poll mode deploys from the minute heartbeat. Add the scheduler to the pool user's crontab:\n"
+                .'* * * * * cd '.$root.'/current && php artisan schedule:run >> /dev/null 2>&1'
+            );
+        }
+
+        return CheckResult::pass('deploy trigger', $summary);
+    }
+
+    /**
+     * The migrate step runs a command once per commit only among nodes that
+     * share its lock store; a file or array store is one node's own.
+     */
+    protected function checkMigrateStep(string $root): CheckResult
+    {
+        $command = MigrationCoordinator::command();
+
+        if ($command === null) {
+            return CheckResult::skip('migrate step', 'not configured (the seeded hook runs migrations)');
+        }
+
+        $where = MigrationCoordinator::enabledHere() ? 'eligible here' : 'off on this node';
+
+        if (! SharedStore::isShareable()) {
+            return CheckResult::warn(
+                'migrate step',
+                "{$command} · {$where}; lock store \"".SharedStore::name().'" is not shared',
+                "Fine for one node. With several, every node migrates each commit: set SLIPSTREAM_MIGRATION_LOCK_STORE to a\n"
+                .'store all nodes share (redis, database, memcached, dynamodb), ideally one no deploy hook runs cache:clear against.'
+            );
+        }
+
+        return CheckResult::pass('migrate step', "{$command} · {$where} · lock store ".SharedStore::name());
     }
 }

@@ -23,24 +23,32 @@ use Slipstream\Slipstream;
 $hookCsrf = [ValidateCsrfToken::class, PreventRequestForgery::class];
 $hookThrottle = 'throttle:'.config('slipstream.webhook.throttle', '60,1');
 
-// The provider hook is the one route that exists in every mode. Its optional
-// source allow-list runs after the throttle and before the body is read.
-Route::post('/hooks/deploy', [WebhookController::class, 'deploy'])
-    ->withoutMiddleware($hookCsrf)
-    ->middleware([$hookThrottle, RestrictWebhookSource::class])
-    ->name('slipstream.hooks.deploy');
+// The provider hook exists in webhook mode only. Its optional source
+// allow-list runs after the throttle and before the body is read. In poll
+// mode a node learns about pushes by itself, so there is nothing to receive.
+if (! Slipstream::pollMode()) {
+    Route::post('/hooks/deploy', [WebhookController::class, 'deploy'])
+        ->withoutMiddleware($hookCsrf)
+        ->middleware([$hookThrottle, RestrictWebhookSource::class])
+        ->name('slipstream.hooks.deploy');
+}
 
 // PCI mode: nothing below is registered. Peer traffic (relay, env-sync and
 // deploy-sync nudges) and the dashboard 404 — there is no "disabled" response
-// to probe, and no gate to get past, because the routes do not exist.
+// to probe, and no gate to get past, because the routes do not exist. With
+// poll mode on top, Slipstream registers no route at all.
 if (Slipstream::pciMode()) {
     return;
 }
 
-Route::post('/hooks/relay', [WebhookController::class, 'relay'])
-    ->withoutMiddleware($hookCsrf)
-    ->middleware($hookThrottle)
-    ->name('slipstream.hooks.relay');
+// Relay spreads one provider webhook across the fleet; with no webhook there
+// is nothing to spread.
+if (! Slipstream::pollMode()) {
+    Route::post('/hooks/relay', [WebhookController::class, 'relay'])
+        ->withoutMiddleware($hookCsrf)
+        ->middleware($hookThrottle)
+        ->name('slipstream.hooks.relay');
+}
 Route::post('/hooks/env-sync', [WebhookController::class, 'envSync'])
     ->withoutMiddleware($hookCsrf)
     ->middleware($hookThrottle)

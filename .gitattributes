@@ -1,6 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
+# Shell scripts run on Linux; a CRLF checkout breaks them.
+*.sh text eol=lf
+
 # Keep development-only files out of the dist archive Composer downloads.
 # Everything below stays in the git repo — it just doesn't ship inside
 # vendor/slipstream/slipstream on every install.

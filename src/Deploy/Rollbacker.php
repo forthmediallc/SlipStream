@@ -4,6 +4,7 @@ namespace Slipstream\Deploy;
 
 use RuntimeException;
 use Slipstream\Fleet\Heartbeat;
+use Slipstream\Fleet\NodeHold;
 use Slipstream\Models\Deployment;
 use Slipstream\Notifications\DeployNotifier;
 use Slipstream\Slipstream;
@@ -113,6 +114,15 @@ class Rollbacker
             $this->log->info('Rollback complete — now serving '.($sha ? substr($sha, 0, 7) : 'unknown'));
 
             app(Heartbeat::class)->pulse($sha);
+
+            // Poll mode: hold the node here, or the next check redeploys the
+            // commit this rollback just stepped back from.
+            try {
+                app(NodeHold::class)->afterDeploy($this->deployment->refresh());
+            } catch (\Throwable $e) {
+                $this->addWarning('Could not pin the node after the rollback: '.$e->getMessage());
+            }
+
             $this->notifyFinished();
         } catch (\Throwable $e) {
             $this->log->error('ROLLBACK FAILED: '.$e->getMessage());

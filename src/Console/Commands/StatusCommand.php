@@ -5,6 +5,11 @@ namespace Slipstream\Console\Commands;
 use Illuminate\Console\Command;
 use Slipstream\Console\Commands\Concerns\FormatsConsoleOutput;
 use Slipstream\Database\Tables;
+use Slipstream\Deploy\MigrationCoordinator;
+use Slipstream\Fleet\Heartbeat;
+use Slipstream\Fleet\NodeHold;
+use Slipstream\Fleet\Poller;
+use Slipstream\Release\DeployRef;
 use Slipstream\Environment\EnvSync;
 use Slipstream\Fleet\Drift;
 use Slipstream\Models\Deployment;
@@ -65,6 +70,8 @@ class StatusCommand extends Command
                 'node' => $self,
                 'pci_mode' => $pci,
                 'database' => ['connection' => $database, 'separate' => $separateDatabase, 'target' => $tables->describe($database)],
+                'trigger' => $this->triggerState(),
+                'migrations' => $this->migrationsState(),
                 'repository' => $settings->repoUrl(),
                 'branch' => $settings->branch(),
                 'keep_releases' => $settings->keepReleases(),
@@ -99,7 +106,11 @@ class StatusCommand extends Command
         $this->components->twoColumnDetail('Node', $self.($pci ? ' · PCI mode' : ''));
         $this->components->twoColumnDetail('Database', $database.($separateDatabase ? ' (separate from the app database)' : ' (the app database)'));
         $this->components->twoColumnDetail('Repository', ($settings->repoUrl() ?: 'not set').' @ '.$settings->branch().' · keep '.$settings->keepReleases());
-        $this->components->twoColumnDetail('Webhook', $hook);
+        $this->renderTrigger($hook);
+        $migrations = $this->migrationsState();
+        $this->components->twoColumnDetail('Migrations', $migrations['command'] === null
+            ? 'seeded "Run migrations" hook (no migrate step)'
+            : $migrations['command'].' · '.($migrations['enabled_here'] ? 'this node may run it, once per commit' : 'off on this node'));
         if (! $pci) {
             $this->components->twoColumnDetail('Relay', $relay ? 'on' : 'off');
             $this->components->twoColumnDetail('Env sync', $syncOn ? 'on'.($pendingPushes > 0 ? " · {$pendingPushes} pending push(es)" : '') : 'off');
@@ -154,5 +165,95 @@ class StatusCommand extends Command
         }
 
         return self::SUCCESS;
+    }
+    /**
+     * How deploys start here and, in poll mode, what the last check saw and
+     * decided: the inputs to "why is this node running what it runs".
+     *
+     * @return array<string, mixed>
+     */
+    protected function triggerState(): array
+    {
+        $poll = Slipstream::pollMode();
+        $server = Server::query()->where('server_name', Slipstream::serverName())->first();
+        $running = app(Heartbeat::class)->readCurrentSha(Slipstream::appRoot());
+
+        try {
+            $ref = $poll ? DeployRef::fromConfig()->describe() : null;
+            $refError = null;
+        } catch (\Throwable $e) {
+            $ref = null;
+            $refError = $e->getMessage();
+        }
+
+        $backoff = null;
+        if ($poll && $server?->poll_seen_sha && strtolower((string) $running) !== strtolower($server->poll_seen_sha)) {
+            $state = app(Poller::class)->backoff($server->poll_seen_sha);
+            $backoff = $state === null ? null : ['failures' => $state['failures'], 'until' => $state['until']->toIso8601String()];
+        }
+
+        return [
+            'mode' => Slipstream::triggerMode(),
+            'ref' => $ref,
+            'ref_error' => $refError,
+            'running_sha' => $running,
+            'last_poll_at' => $server?->poll_checked_at?->toIso8601String(),
+            'next_poll_at' => $server?->poll_next_at?->toIso8601String(),
+            'result' => $server?->poll_result,
+            'detail' => $server?->poll_detail,
+            'seen_sha' => $server?->poll_seen_sha,
+            'seen_ref' => $server?->poll_seen_ref,
+            'hold' => app(NodeHold::class)->reason($server),
+            'pinned_sha' => $server?->isPinned() ? $server->pinned_sha : null,
+            'backoff' => $backoff,
+        ];
+    }
+
+    /**
+     * @return array{command: ?string, enabled_here: bool, lock_store: string}
+     */
+    protected function migrationsState(): array
+    {
+        return [
+            'command' => MigrationCoordinator::command(),
+            'enabled_here' => MigrationCoordinator::enabledHere(),
+            'lock_store' => \Slipstream\Fleet\SharedStore::name(),
+        ];
+    }
+
+    protected function renderTrigger(string $hook): void
+    {
+        $state = $this->triggerState();
+
+        if ($state['mode'] !== 'poll') {
+            $this->components->twoColumnDetail('Trigger', 'webhook');
+            $this->components->twoColumnDetail('Webhook', $hook);
+
+            return;
+        }
+
+        $this->components->twoColumnDetail('Trigger', 'poll · '.($state['ref'] ?? 'invalid ref: '.$state['ref_error']));
+        $this->components->twoColumnDetail('Running', $this->shortSha($state['running_sha']));
+        $this->components->twoColumnDetail(
+            'Last poll',
+            $state['last_poll_at'] === null
+                ? 'never — the minute heartbeat runs the check'
+                : $this->ago(\Illuminate\Support\Carbon::parse($state['last_poll_at'])).' ago · '.$state['result'].' · '.$state['detail']
+        );
+        if ($state['seen_sha'] !== null) {
+            $this->components->twoColumnDetail('Ref last seen', preg_replace('#^refs/(heads|tags)/#', '', (string) $state['seen_ref']).' at '.$this->shortSha($state['seen_sha']));
+        }
+        if ($state['hold'] !== null) {
+            $this->components->warn('Held: '.$state['hold'].($state['pinned_sha'] ? '. Resume with: php artisan slipstream:servers resume' : ''));
+        }
+        if ($state['backoff'] !== null) {
+            $this->components->warn(sprintf(
+                'Back-off: %s failed %d× here; next try %s, or sooner if the ref moves. Force it: php artisan slipstream:deploy --sha=%s',
+                $this->shortSha($state['seen_sha']),
+                $state['backoff']['failures'],
+                \Illuminate\Support\Carbon::parse($state['backoff']['until'])->toDateTimeString(),
+                $state['seen_sha']
+            ));
+        }
     }
 }

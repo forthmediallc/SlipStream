@@ -4,6 +4,12 @@ namespace Slipstream\Models;
 
 class DeploymentHook extends SlipstreamModel
 {
+    /**
+     * Where the hook came from: a row in the database, or the hooks file the
+     * release carries (an unsaved instance, never written back).
+     */
+    public string $source = 'database';
+
     protected $table = 'slipstream_deployment_hooks';
 
     protected $fillable = [

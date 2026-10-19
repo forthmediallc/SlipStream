@@ -6,8 +6,12 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Validator;
 use InvalidArgumentException;
 use Slipstream\Console\Commands\Concerns\FormatsConsoleOutput;
+use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Deploy\DeploySteps;
+use Slipstream\Deploy\HookFile;
+use Slipstream\Deploy\MigrationCoordinator;
 use Slipstream\Models\DeploymentHook;
+use Slipstream\Slipstream;
 use Slipstream\Support\Activity;
 
 /**
@@ -23,7 +27,7 @@ class HooksCommand extends Command
                             {action=list : list | show | add | edit | enable | disable | delete | move}
                             {id? : Hook id (show, edit, enable, disable, delete, move)}
                             {direction? : up | down (move)}
-                            {--step= : Step the hook attaches to: fetch, link_shared, composer, health, swap, fpm, prune}
+                            {--step= : Step the hook attaches to: fetch, link_shared, composer, migrate, health, swap, fpm, prune}
                             {--position= : before | after that step (default: after)}
                             {--name= : Hook name}
                             {--script= : The script; the php, composer and npm placeholders (in double curly braces) expand to the configured binaries}
@@ -56,19 +60,49 @@ class HooksCommand extends Command
         }
     }
 
+    /**
+     * Every hook a deploy would consider, in run order and with its source:
+     * the live release's hooks file first, then the database. Defaults that
+     * step aside — for the file, or for the migrate step — are listed as such.
+     */
     protected function list(): int
     {
-        $hooks = DeploymentHook::query()->get()->sortBy(fn (DeploymentHook $h) => [
-            array_search($h->step, DeploySteps::STEPS, true),
-            $h->position === 'before' ? 0 : 1,
-            $h->sort_order,
-            $h->id,
-        ])->values();
+        $releaseRoot = $this->liveReleaseRoot();
+        $fileError = null;
+
+        try {
+            $fileHooks = HookFile::load($releaseRoot);
+        } catch (\RuntimeException $e) {
+            $fileHooks = null;
+            $fileError = $e->getMessage();
+        }
+
+        $migrateStep = MigrationCoordinator::command() !== null;
+        $skipped = function (DeploymentHook $hook) use ($fileHooks, $migrateStep): ?string {
+            return match (true) {
+                $fileHooks !== null && DefaultHooks::isUntouchedDefault($hook) => 'skipped: the hooks file replaces the defaults',
+                $migrateStep && DefaultHooks::isUntouchedDefault($hook, DefaultHooks::MIGRATE_HOOK) => 'skipped: the migrate step runs migrations',
+                default => null,
+            };
+        };
+
+        $hooks = collect([...($fileHooks ?? []), ...DeploymentHook::query()->get()->all()])
+            ->sortBy(fn (DeploymentHook $h) => [
+                array_search($h->step, DeploySteps::STEPS, true),
+                $h->position === 'before' ? 0 : 1,
+                $h->source === 'file' ? 0 : 1,
+                $h->sort_order,
+                $h->id ?? 0,
+            ])->values();
 
         if ($this->option('json')) {
-            $this->json($hooks->map(fn (DeploymentHook $h) => $this->hookJson($h))->all());
+            $this->json($hooks->map(fn (DeploymentHook $h) => $this->hookJson($h) + ['skipped' => $skipped($h)])->all());
 
             return self::SUCCESS;
+        }
+
+        if ($fileError !== null) {
+            $this->components->error($fileError);
         }
 
         if ($hooks->isEmpty()) {
@@ -78,21 +112,36 @@ class HooksCommand extends Command
         }
 
         $this->table(
-            ['ID', 'On', 'Step', 'When', 'Name', 'Servers', 'Lock', 'Script'],
+            ['ID', 'Source', 'On', 'Step', 'When', 'Name', 'Servers', 'Lock', 'Script'],
             $hooks->map(fn (DeploymentHook $h) => [
-                '#'.$h->id,
-                $h->enabled ? 'yes' : 'no',
+                $h->id ? '#'.$h->id : '—',
+                $h->source,
+                $h->enabled ? ($skipped($h) ? 'no' : 'yes') : 'no',
                 $h->step,
                 $h->position,
-                $h->name,
+                $h->name.(($why = $skipped($h)) ? " ({$why})" : ''),
                 $h->server_names ? implode(', ', $h->server_names) : 'all',
                 $h->fleet_lock ? 'fleet' : '—',
                 $this->truncate(strtok((string) $h->script, "\n") ?: '', 48).(str_contains((string) $h->script, "\n") ? ' …' : ''),
             ])->all()
         );
+        if ($fileHooks !== null) {
+            $this->line('  File hooks come from '.HookFile::path($releaseRoot).'; each deploy reads the file from the release it builds.');
+        }
         $this->line('  Steps run in this order: '.implode(' → ', DeploySteps::STEPS).'. `slipstream:hooks show <id>` prints a full script.');
 
         return self::SUCCESS;
+    }
+
+    /**
+     * The release that is live, for its hooks file: current/ in a release
+     * layout, else this checkout.
+     */
+    protected function liveReleaseRoot(): string
+    {
+        $current = Slipstream::appRoot().DIRECTORY_SEPARATOR.'current';
+
+        return is_dir($current) ? (realpath($current) ?: $current) : base_path();
     }
 
     protected function show(DeploymentHook $hook): int
@@ -302,6 +351,7 @@ class HooksCommand extends Command
     {
         return [
             'id' => $hook->id,
+            'source' => $hook->source,
             'enabled' => (bool) $hook->enabled,
             'step' => $hook->step,
             'position' => $hook->position,

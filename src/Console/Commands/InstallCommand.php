@@ -11,6 +11,7 @@ use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Environment\EnvContentMerger;
 use Slipstream\Models\Pipeline;
 use Slipstream\Models\Server;
+use Slipstream\Release\DeployRef;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\Activity;
@@ -72,6 +73,10 @@ class InstallCommand extends Command
             return self::FAILURE;
         }
 
+        // On its own connection this node's schema is not tracked by the
+        // app's (shared) migrations table, so bring it current here as well.
+        $tables->ensureCurrentIfOwnConnection();
+
         Pipeline::query()->firstOrCreate(
             ['name' => 'main'],
             [
@@ -84,8 +89,9 @@ class InstallCommand extends Command
 
         // Seed the default deploy hooks (build/migrate/optimize/storage/horizon/
         // reverb). All editable in the dashboard — nothing is locked to them.
-        // PCI mode seeds them too: they are the build, not an extra.
-        DefaultHooks::seed();
+        // PCI mode seeds them too: they are the build, not an extra. A release
+        // that carries a hooks file needs none of them.
+        $hooks = DefaultHooks::seedFor(base_path());
 
         Server::query()->updateOrCreate(
             ['server_name' => Slipstream::serverName()],
@@ -103,8 +109,9 @@ class InstallCommand extends Command
             $this->enablePciMode();
         }
 
-        $hadSecret = $settings->webhookSecret() !== null;
-        $secret = $settings->ensureWebhookSecret();
+        // Poll mode has no webhook, so it needs no secret to share with a git host.
+        $hadSecret = Slipstream::pollMode() || $settings->webhookSecret() !== null;
+        $secret = Slipstream::pollMode() ? null : $settings->ensureWebhookSecret();
         if (! $hadSecret) {
             // Fresh install: give the fleet its own signing key from day one, so
             // the secret shared with the git host is never the trust root for
@@ -131,16 +138,26 @@ class InstallCommand extends Command
 
         $path = Slipstream::path();
         $database = "Database:  {$connection} ({$tables->describe($connection)})";
+        try {
+            $trigger = Slipstream::pollMode()
+                ? 'Trigger:   poll · '.DeployRef::fromConfig()->describe().' (no webhook route)'
+                : "Webhook:   /{$path}/hooks/deploy".($pci ? ' (the only route registered in PCI mode)' : '');
+        } catch (\Throwable $e) {
+            $trigger = 'Trigger:   poll · invalid SLIPSTREAM_DEPLOY_REF: '.$e->getMessage();
+        }
+
         $this->components->info('Slipstream installed.');
         $this->components->bulletList($pci ? [
-            "Webhook:   /{$path}/hooks/deploy (the only route registered in PCI mode)",
+            $trigger,
             'PCI mode:  on — no dashboard, .env editor, env sync, relay or fleet queue on this server',
             $database,
+            "Hooks:     {$hooks}",
             'Next:      php artisan slipstream:provision, then php artisan slipstream:doctor',
         ] : [
             "Dashboard: /{$path} (local-only until you define Slipstream::auth or viewSlipstream gate)",
-            "Webhook:   /{$path}/hooks/deploy",
+            $trigger,
             $database,
+            "Hooks:     {$hooks}",
             'Next:      php artisan slipstream:provision  (server bootstrap)',
         ]);
 

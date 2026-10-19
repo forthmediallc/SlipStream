@@ -21,7 +21,9 @@ php artisan slipstream:install
 ```
 
 For a server inside a PCI cardholder data environment, or anywhere the dashboard must not
-exist, install with `--pci` instead — see [PCI mode](#pci-mode).
+exist, install with `--pci` instead — see [PCI mode](#pci-mode). For an Auto Scaling group,
+or any fleet a webhook can't reach node by node, see
+[Poll mode and Auto Scaling groups](#poll-mode-and-auto-scaling-groups).
 
 ### Authorize the dashboard
 
@@ -73,7 +75,9 @@ can never be driven from a stale page without re-passing it:
 **The exception — hook endpoints.** `/hooks/deploy`, `/hooks/relay`, `/hooks/env-sync`, and
 `/hooks/deploy-sync` are intentionally *not* behind the dashboard gate: they are
 unauthenticated, machine-to-machine POSTs verified by HMAC signature/secret (see
-[Security](#security)). Everything else requires passing the gate above.
+[Security](#security)). Everything else requires passing the gate above. In
+[poll mode](#poll-mode-and-auto-scaling-groups) `/hooks/deploy` and `/hooks/relay` are not
+registered at all.
 
 Optional pre-swap checks (throw on failure):
 
@@ -105,6 +109,12 @@ Published as `config/slipstream.php`:
 | `pci.sentinel_keys` | `.env` keys that mark a CDE server; `doctor` fails when one is present and PCI mode is off (`SLIPSTREAM_PCI_SENTINEL_KEYS`) |
 | `webhook.allowed_ips` | IPs/CIDRs the provider hook accepts deliveries from; empty = any (`SLIPSTREAM_WEBHOOK_ALLOWED_IPS`) |
 | `audit.enabled` / `audit.channel` | Structured audit lines to a log channel — on in PCI mode by default (`SLIPSTREAM_AUDIT_LOG`, `SLIPSTREAM_AUDIT_LOG_CHANNEL`) |
+| `trigger.*` | `webhook` (default) or `poll`, the deploy ref, the repository, poll interval, jitter and back-off (`SLIPSTREAM_TRIGGER`, `SLIPSTREAM_DEPLOY_REF`, …). See [Poll mode](#poll-mode-and-auto-scaling-groups) |
+| `migrations.*` | The migrate step: a command run once per commit across the fleet, whether this node runs it, how long others wait (`SLIPSTREAM_MIGRATE_COMMAND`, `SLIPSTREAM_RUN_MIGRATIONS`, `SLIPSTREAM_MIGRATE_WAIT`) |
+| `node.paused` | Hold every node that reads this `.env`: no deploy starts (`SLIPSTREAM_PAUSED`) |
+| `hooks.file` | Deploy hooks file the app repository carries, read from each release (`SLIPSTREAM_HOOKS_FILE`, default `slipstream-hooks.php`) |
+| `notifications.*` | Notification targets from the environment; each wins over the stored setting when set (`SLIPSTREAM_NOTIFY_*`) |
+| `fleet.forget_after_hours` | The daily prune forgets servers silent this many hours; 0 = never (`SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS`) |
 
 Re-publish after package upgrades:
 
@@ -179,7 +189,9 @@ Ensure the scheduler runs (heartbeats and future scheduled work):
 
 ## Webhooks
 
-Dashboard → **Webhook** shows the endpoint and secret for this server.
+Dashboard → **Webhook** shows the endpoint and secret for this server. (In
+[poll mode](#poll-mode-and-auto-scaling-groups) there is no webhook: each node finds new
+releases itself.)
 
 - **URL:** `POST https://your-app/slipstream/hooks/deploy` (path is configurable)
 - **GitHub:** push events, secret = HMAC (`X-Hub-Signature-256`)
@@ -232,19 +244,20 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 | `slipstream:deployments` | List deployments, newest first: `--active`, `--failed`, `--status=`, `--server=this`, `--limit=` (`--json`) |
 | `slipstream:deployment` | One deployment with its log; `--follow` tails a running one and exits non-zero if it fails (`--tail=`, `--json`) |
 | `slipstream:deliveries` | Recent webhook deliveries and their outcome — "why didn't my push deploy?" (`--json`) |
-| `slipstream:hooks` | Deploy hooks: `list`, `show <id>`, `add`, `edit <id>`, `enable`/`disable <id>`, `delete <id>`, `move <id> up\|down` |
-| `slipstream:servers` | Fleet servers: `list`, `pause`/`resume`, `enable`/`disable`, `set --base-url=… --run-migrations=…`, `forget <name>` |
+| `slipstream:hooks` | Deploy hooks: `list` (stored and [file](#hooks-from-the-repository) hooks, with where each comes from), `show <id>`, `add`, `edit <id>`, `enable`/`disable <id>`, `delete <id>`, `move <id> up\|down` |
+| `slipstream:servers` | Fleet servers: `list`, `pause`/`resume` (`resume` also lifts a [pin](#rollback-in-poll-mode)), `enable`/`disable`, `set --base-url=… --run-migrations=…`, `forget <name>` |
 | `slipstream:pipelines` | Pipelines: `list`, `add --name= --branch=`, `edit`, `enable`/`disable`, `delete` |
 | `slipstream:settings` | `show`, or `set --repo= --branch= --keep-releases= --shared-path=in:on --mail= --slack-url= … --relay=on\|off` |
 | `slipstream:webhook-secret` | Show (`--reveal`) or replace (`--rotate`) the webhook secret; `--rotate-fleet-key` separates or rotates the fleet key |
-| `slipstream:database` | Where Slipstream's records live: `status`, `copy --to=<connection>`, `drop-source` — moves them off the app database |
+| `slipstream:database` | Where Slipstream's records live: `status`, `copy --to=<connection>`, `drop-source` — moves them off the app database; `ensure` brings a node's own Slipstream database up to this version's schema |
 | `slipstream:provision` | Deploy key, bare mirror, directory layout; `--adopt` converts a live checkout into the first release |
+| `slipstream:bootstrap` | Bring a new instance up: tables, registry, mirror, the deploy ref deployed and health-checked; exits non-zero unless the node can serve. See [Bootstrapping a new instance](#bootstrapping-a-new-instance) |
 | `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access, webhook reachability and the PCI-mode checks — with the fix for each |
-| `slipstream:deploy` | Run a deploy here (or `--deployment=`); `--sha=` pins a commit, `--tag=` deploys a tag, `--skip-hooks=1,2` skips hooks once, `--fleet` is the dashboard's fleet-wide Deploy |
-| `slipstream:rollback` | Point `current` at the previous release; `--fleet` rolls every eligible server back to its own previous release |
-| `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom) |
-| `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, and fail deploys orphaned by a killed process (scheduled every minute) |
-| `slipstream:prune` | Trim old deploy events + webhook deliveries + terminal env pushes; fail stuck deploys/applies (scheduled daily) |
+| `slipstream:deploy` | Run a deploy here (or `--deployment=`); `--sha=` pins a commit, `--tag=` deploys a tag, `--skip-hooks=1,2` skips hooks once, `--fleet` is the dashboard's fleet-wide Deploy. In poll mode, with nothing named, it deploys the deploy ref's commit now |
+| `slipstream:rollback` | Point `current` at the previous release; `--fleet` rolls every eligible server back to its own previous release. In poll mode it also pins the node |
+| `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom); prints the release it ran in |
+| `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, and fail deploys orphaned by a killed process; in poll mode, check the deploy ref and start a deploy when it moved (scheduled every minute) |
+| `slipstream:prune` | Trim old deploy events + webhook deliveries + terminal env pushes; fail stuck deploys/applies; forget long-silent servers when `SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS` is set (scheduled daily) |
 | `slipstream:relay` | Fan a stored relay payload out to peers (spawned detached; not run by hand) |
 | `slipstream:env-apply` | Apply this node’s queued shared `.env` push (spawned detached by a nudge; also the manual escape hatch) |
 | `slipstream:env-nudge` | Nudge peers to apply a queued env push (spawned detached; not run by hand) |
@@ -266,7 +279,11 @@ Manual escape hatch if the app is hard-down: run `php artisan slipstream:deploy`
   multi-server fleet this lock **must** live on a shared cache store (Redis, database,
   memcached) — with the `file`/`array` driver each node gets its own lock and all of them
   migrate. Pin it with `SLIPSTREAM_MIGRATION_LOCK_STORE` if your default store isn't shared.
-- Pause a server to accept webhooks but skip builds.
+  The seeded hook only keeps two servers from migrating *at the same moment*; for "exactly
+  once per commit, and the others wait for it", set `SLIPSTREAM_MIGRATE_COMMAND` — see
+  [Migrations once per commit](#migrations-once-per-commit).
+- Pause a server to accept webhooks but skip builds (in poll mode: checks go on, no deploy
+  starts).
 - Notifications (mail, Slack, Discord, generic webhook) are configured under Settings.
 - **Horizon and Reverb restarts are auto-detected** — a deploy only restarts them when the
   package is actually installed in the release. Force or disable per node with
@@ -506,6 +523,10 @@ it back — only someone with shell access editing the file. (`install --pci` cl
 config and route table so the running app picks it up at once; a deploy's `optimize` rebuilds
 both from the shared `.env` anyway.)
 
+Behind a load balancer, or in an Auto Scaling group, add
+[poll mode](#poll-mode-and-auto-scaling-groups): the node then registers no route at all and
+deploys new releases by itself.
+
 | | Normal | PCI mode |
 |---|---|---|
 | Dashboard (`/slipstream/*`) | Gated UI | Not registered: `404`. The Livewire components are not registered either, and `Slipstream::check()` is always false as a backstop |
@@ -546,7 +567,8 @@ php artisan slipstream:doctor
 ```
 
 Each PCI node needs its own provider webhook — there is no relay, and `--fleet` is refused —
-and a fresh `install` gives a new database its own webhook secret and fleet key, so a vault
+unless it runs in [poll mode](#poll-mode-and-auto-scaling-groups), which needs none. A fresh
+`install` gives a new database its own webhook secret and fleet key, so a vault
 with its own database shares no secret with the rest of your fleet. Every change made this
 way is recorded in `slipstream_activity_log` with `via: cli` and, in PCI mode, in the audit
 log channel.
@@ -588,14 +610,17 @@ output, `.env` contents or settings values.
 
 ### Doctor checks
 
-`slipstream:doctor` reports the mode first and adds three checks around it:
+`slipstream:doctor` reports the mode first and adds these checks around it:
 
 - **PCI mode** — on/off; warns when `relay_enabled` is set in the settings table (ignored,
   but the configuration should read like the behaviour).
+- **deploy trigger** — warns in PCI mode on the webhook trigger: with no relay, a webhook
+  behind a load balancer reaches one node only. `SLIPSTREAM_TRIGGER=poll` is the fix.
 - **slipstream database** — warns in PCI mode while Slipstream's records are on the app's
   database (in every mode it fails a connection that is undefined, unreachable or missing the
   tables, and a SQLite file the pool user cannot write).
-- **webhook source** — warns in PCI mode when `SLIPSTREAM_WEBHOOK_ALLOWED_IPS` is empty.
+- **webhook source** — warns in PCI mode when `SLIPSTREAM_WEBHOOK_ALLOWED_IPS` is empty
+  (skipped in poll mode, which has no hook).
 - **PCI sentinel keys** — `pci.sentinel_keys` (config, so committed and shared by every
   server) names `.env` keys only a CDE server holds, e.g. the vault database host or a gateway
   credential ARN. A server that has one of them with PCI mode off **fails** the check: that is
@@ -612,6 +637,342 @@ gets pushed to the deployed branch (6.5.1), and where the vault's own secrets li
 manager rather than the `.env`) are the host's and the infrastructure's job. Deploy logs still
 hold raw hook output (`deploy/logs/*.log` at `0600`, and `slipstream_deployment_events`):
 nothing redacts it.
+
+## Poll mode and Auto Scaling groups
+
+A webhook reaches one address. In normal mode relay carries a push on to the peers; in PCI
+mode nothing does; and behind a load balancer, in an Auto Scaling group whose instances come
+and go, the git host cannot address the nodes at all. Poll mode turns the trigger around:
+each node watches the deploy ref from its minute heartbeat and converges on it by itself.
+Nothing reaches the node from outside.
+
+```dotenv
+SLIPSTREAM_TRIGGER=poll
+SLIPSTREAM_DEPLOY_REF=refs/heads/production       # or v*: the highest version tag
+SLIPSTREAM_REPOSITORY=git@github.com:org/app.git
+SLIPSTREAM_MIGRATE_COMMAND="migrate --force"
+SLIPSTREAM_MIGRATION_LOCK_STORE=slipstream         # a shared cache store of its own, see below
+```
+
+In poll mode the provider webhook (`/hooks/deploy`) and `/hooks/relay` are not registered, no
+webhook secret is generated, and `doctor` stops asking where the hook accepts deliveries from.
+With PCI mode on as well, Slipstream registers no route at all. Poll mode works the same with
+PCI mode off: app nodes in an Auto Scaling group have the same new-instance problem a vault
+does.
+
+### Settings come from the environment
+
+Everything a node needs has to come from the release or the shared `.env`, never only from
+its own database: an instance that boots with an empty one must deploy exactly like a node
+that has run for a year. So in poll mode the branch, the release count, the shared paths and
+whether a node runs migrations come from config and the shared `.env`, even where the
+dashboard or `slipstream:servers set` stored a value; the dashboard shows those fields
+read-only. (Webhook mode keeps preferring stored values, as before.)
+
+| Variable | Default | |
+|---|---|---|
+| `SLIPSTREAM_TRIGGER` | `webhook` | `poll` turns poll mode on |
+| `SLIPSTREAM_DEPLOY_REF` | the deploy branch (`SLIPSTREAM_BRANCH`) | A branch (`production` or `refs/heads/production`); one tag (`refs/tags/v1.4.2`), which holds the fleet on that release; or a tag pattern (`v*` or `refs/tags/v*`): the highest version among the matching tags |
+| `SLIPSTREAM_DEPLOY_PRERELEASES` | `false` | Let a tag pattern pick a pre-release such as `v2.0.0-rc.1` |
+| `SLIPSTREAM_REPOSITORY` | the stored setting | The repository a fresh node mirrors. Wins over the stored setting in either mode |
+| `SLIPSTREAM_POLL_INTERVAL` | `60` | Seconds between checks. The heartbeat runs once a minute, so less than 60 behaves as 60 |
+| `SLIPSTREAM_POLL_JITTER` | `20` | Each check first waits a random 0 to N seconds (at most 45), so a fleet doesn't reach the git host in the same second |
+| `SLIPSTREAM_POLL_RETRY_MINUTES`, `SLIPSTREAM_POLL_RETRY_MAX_MINUTES` | `5`, `240` | Back-off for a commit whose deploy failed on this node |
+| `SLIPSTREAM_MIGRATE_COMMAND` | unset | The [migrate step](#migrations-once-per-commit), e.g. `migrate --force` |
+| `SLIPSTREAM_RUN_MIGRATIONS` | `true` in poll mode; the server registry in webhook mode | `false` keeps a node from running the migrate step |
+| `SLIPSTREAM_MIGRATE_WAIT` | the lock TTL plus 60 | Seconds a node waits for another node's run of the same commit |
+| `SLIPSTREAM_PAUSED` | `false` | Hold every node that reads this `.env`: no deploy starts |
+| `SLIPSTREAM_KEEP_RELEASES` | `5` | Releases kept on each node |
+| `SLIPSTREAM_HOOKS_FILE` | `slipstream-hooks.php` | The [hooks file](#hooks-from-the-repository), relative to the release root |
+| `SLIPSTREAM_NOTIFY_MAIL`, `SLIPSTREAM_NOTIFY_SLACK_URL`, `SLIPSTREAM_NOTIFY_DISCORD_URL`, `SLIPSTREAM_NOTIFY_WEBHOOK_URL`, `SLIPSTREAM_NOTIFY_ON_SUCCESS`, `SLIPSTREAM_NOTIFY_ON_FAILURE` | the stored settings | Notification targets. Each wins over the stored setting in either mode |
+| `SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS` | `0` (never) | The daily prune forgets servers silent this long, so terminated instances don't pile up in a shared registry |
+
+Shared paths have no variable: they come from `deploy.shared_paths` in your published
+`config/slipstream.php`, which the repository carries. Keep `SLIPSTREAM_SERVER` out of a
+shared `.env`, or every instance claims the same identity; unset, a node is named after its
+hostname.
+
+### How releases are cut
+
+Releasing is a deliberate act in git: a merge to the release branch, or a pushed tag. With a
+tag pattern, nodes deploy the highest version among the matching tags (`v1.10.0` beats
+`v1.9.3`). Tags that aren't versions are ignored, pre-releases are skipped unless
+`SLIPSTREAM_DEPLOY_PRERELEASES=true`, and an annotated tag deploys the commit it points at.
+
+Protect whatever the ref names, because anyone who can move it deploys to every node. Use a
+branch ruleset on the release branch (pull requests with review, no force-push, no deletion),
+or a tag ruleset that limits who may create, move or delete the release tags. The reviewed
+merge or the tag is then the change-control record PCI DSS requirement 6.5.1 asks for.
+
+### What a node does each minute
+
+The scheduler's minute heartbeat (`slipstream:heartbeat`, run as the PHP-FPM pool user) runs
+the check when one is due:
+
+1. It waits a random 0 to `SLIPSTREAM_POLL_JITTER` seconds.
+2. It asks the git host where the deploy ref points: `git ls-remote` against the mirror's
+   origin, with the deploy key the node already fetches with.
+3. **up-to-date:** `current` already runs that commit.
+4. **held:** `SLIPSTREAM_PAUSED` is on, or this node is paused, disabled or
+   [pinned](#rollback-in-poll-mode). Checks go on; no deploy starts.
+5. **busy:** a deploy is pending or building on this node.
+6. **backoff:** that commit's deploy failed here. It is tried again after 5 minutes, then
+   10, 20 and so on up to 4 hours. Only failures since this node's last successful deploy
+   count, and a newer commit is tried at once. `php artisan slipstream:deploy --sha=<sha>`
+   forces it.
+7. Otherwise it starts the normal deploy of that commit, detached: fetch, shared links,
+   composer, migrate, health check, swap, FPM reload, prune.
+
+`slipstream:status` shows the last check, and the audit log records each change of result as
+`slipstream.poll.<result>`, and each deploy a check starts as `slipstream.poll.deploy_started`.
+The heartbeat runs in the background under a mutex of the node's own, so the wait never holds
+up the app's own scheduled tasks, and a cache store the fleet shares never makes one node skip
+another's heartbeat.
+
+### Hooks from the repository
+
+Hooks added with `slipstream:hooks add` or in the dashboard live in the node's database, and a
+fresh instance's database is empty. Put them in a file the repository carries instead,
+`slipstream-hooks.php` at its root. Each release's hooks are read from that release right after
+the fetch, so a hook ships with the commit that needs it:
+
+```php
+<?php
+
+// slipstream-hooks.php
+return [
+    [
+        'name' => 'Build assets',
+        'step' => 'composer',
+        'script' => '{{ npm }} ci --no-audit --no-fund && {{ npm }} run build && rm -rf node_modules',
+    ],
+    ['name' => 'Optimize', 'step' => 'composer', 'script' => '{{ php }} artisan optimize'],
+    ['name' => 'Link storage', 'step' => 'composer', 'script' => '{{ php }} artisan storage:link || true'],
+    ['name' => 'Restart Horizon', 'step' => 'fpm', 'script' => '{{ php }} artisan horizon:terminate || true'],
+];
+```
+
+Each hook takes `name`, `step` and `script` (required); `position` (`before` or `after`, default
+`after`); `servers` (a list of server names, default every node); `fleet_lock` (one node per
+commit runs it); and `enabled`. Steps run in this order: `fetch`, `link_shared`, `composer`,
+`migrate`, `health`, `swap`, `fpm`, `prune`. Scripts take the same placeholders as stored hooks:
+`{{ php }}`, `{{ composer }}`, `{{ npm }}`, `{{ release }}`, `{{ sha }}`, `{{ branch }}`,
+`{{ app_root }}`.
+
+When the file exists it replaces the default hooks Slipstream seeds (build assets, run
+migrations, optimize, link storage, restart Horizon and Reverb), so list the ones you need, as
+above. A default you edited is your own hook now and still runs, and so do the other hooks
+stored in the database: after the file's, in the same step. A file that fails to load, or names
+an unknown step, fails the deploy rather than building without its hooks. A hook that runs
+before the fetch can't come from the release it would run before, so keep that one in the
+database. `slipstream:hooks` lists both kinds and says where each comes from. The file works
+in webhook mode too.
+
+### Migrations once per commit
+
+```dotenv
+SLIPSTREAM_MIGRATE_COMMAND="migrate --force"       # any artisan command, e.g. vault:migrate --force --if-vault
+SLIPSTREAM_MIGRATION_LOCK_STORE=slipstream
+```
+
+With a command set, every deploy runs a migrate step after composer and before the health
+check, and exactly one node runs the command for a given commit: the first to take the lock in
+the shared store. The others wait for that run (up to `SLIPSTREAM_MIGRATE_WAIT`, by default the
+lock TTL plus a minute), then go on to the health check and the swap, or fail their deploy if
+the run failed. A node that deploys the commit later skips the command. If the node holding the
+lock dies, its lock expires and a waiting node takes the run over. A node with
+`SLIPSTREAM_RUN_MIGRATIONS=false` never runs the command, but it still waits for a run in
+progress and fails its deploy when the last run failed.
+
+With a command set, the seeded "Run migrations" hook stops running (unless you edited it,
+which makes it your own), and `install` and `bootstrap` stop seeding it. Leave the command
+unset and nothing changes: that hook runs as it always has.
+
+The record of which commits are migrated lives in the shared store, scoped to the command and
+to the app's database. A fleet running another command, or a staging environment sharing the
+cache server, never acts on it. It is a signal, not the guarantee: if it is lost to eviction
+or a flush, the next node runs the command again, so the command must be safe to repeat.
+`artisan migrate` is safe, because it only runs what is pending.
+
+Give the store a cache of its own that every node shares and nothing flushes: a deploy hook
+running `cache:clear`, or ordinary eviction in the app's cache, would erase the locks and the
+record. For example, a `slipstream` store in `config/cache.php` on a Redis database of its own:
+
+```php
+'slipstream' => [
+    'driver' => 'redis',
+    'connection' => 'slipstream',        // a connection in config/database.php's redis block
+    'lock_connection' => 'slipstream',
+],
+```
+
+When Slipstream keeps its records in a per-node database (`SLIPSTREAM_DB_CONNECTION`), each node
+also brings that database's schema current at bootstrap, in every deploy's migrate step, and
+from the minute heartbeat. The app's shared `migrations` table can't do it, because it records
+a Slipstream migration as run the first time any node runs it.
+
+### Bootstrapping a new instance
+
+A node has no `artisan` until its first release exists. `stubs/slipstream-bootstrap.sh` solves
+that: it makes a throwaway checkout, installs its dependencies, runs
+`php artisan slipstream:bootstrap` from it, and removes it. Bootstrap then:
+
+1. creates Slipstream's tables if they are missing, and brings them current;
+2. registers the server;
+3. mirrors `SLIPSTREAM_REPOSITORY` if the node has no mirror yet;
+4. deploys the deploy ref's commit, blocking: a normal deploy, with its hooks, migrate step
+   and health check;
+5. runs the health check again on what is live;
+
+and exits non-zero unless the node can serve. It is idempotent: on a node already serving the
+ref's commit it only re-checks. The real release's composer install mostly comes from
+composer's cache.
+
+The image holds the OS, PHP, nginx, supervisor, a copy of the stub, and the deploy user's
+`~/.ssh/known_hosts` with your git host's published host keys. The deploy key and the shared
+`.env` come from a secrets manager at boot. A launch template's user data, for example:
+
+```sh
+#!/bin/sh
+# EC2 user data: runs as root on first boot.
+set -eu
+APP_ROOT=/var/www/app
+REPO=git@github.com:org/app.git
+
+# Secrets at boot, never in the image.
+install -d -o deploy -g deploy -m 0755 "$APP_ROOT"       # nginx traverses it to current/public
+install -d -o deploy -g deploy -m 0700 /home/deploy/.ssh
+umask 077
+aws secretsmanager get-secret-value --secret-id app/shared-env \
+    --query SecretString --output text > "$APP_ROOT/.env"
+aws secretsmanager get-secret-value --secret-id app/deploy-key \
+    --query SecretString --output text > /home/deploy/.ssh/id_ed25519   # ssh's default key
+chown deploy:deploy "$APP_ROOT/.env" /home/deploy/.ssh/id_ed25519
+umask 022
+
+# Tables, registry, mirror, the deploy ref deployed and health-checked. As the
+# pool user, so everything it creates belongs to the user that deploys later.
+sudo -u deploy -H APP_ROOT="$APP_ROOT" REPO="$REPO" sh /opt/slipstream/slipstream-bootstrap.sh
+
+# The scheduler, as the pool user: its minute heartbeat is what polls.
+echo "* * * * * deploy cd $APP_ROOT/current && php artisan schedule:run >> /dev/null 2>&1" > /etc/cron.d/app
+
+# Only now may the instance take traffic.
+TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+aws autoscaling complete-lifecycle-action --auto-scaling-group-name app \
+    --lifecycle-hook-name launch --instance-id "$ID" --lifecycle-action-result CONTINUE
+```
+
+Give the group a launch lifecycle hook whose default result is `ABANDON`. An instance whose
+bootstrap fails then never completes the action; it is terminated when the hook times out,
+and the group launches another. The stub takes `PHP`, `COMPOSER` and `BOOTSTRAP_BRANCH` (a
+branch or tag for the throwaway checkout; any recent commit with Slipstream installed works,
+because bootstrap deploys the deploy ref itself).
+
+**When the ref's commit fails.** A broken release would otherwise stop the group from scaling
+out: each new instance would fail its health check and be replaced, over and over. So when the
+deploy ref's own commit fails to deploy, bootstrap deploys the fleet's last good commit
+instead: the last commit any node deployed successfully from the ref, kept in the shared store.
+It says so on its output and in the audit log (`slipstream.activity.bootstrap.fell_back`), and
+the node keeps retrying the ref, with back-off, like any other. Alarm on that line. Pass
+`--no-fallback` to fail instead.
+
+### Rollback in poll mode
+
+On one node, `php artisan slipstream:rollback` repoints `current` at the previous release and
+**pins** the node there. Without the pin, the next check would redeploy the commit you just
+stepped back from. Checks go on, but no deploy starts until someone resumes the node. Any
+deploy that leaves the ref pins the same way, such as `slipstream:deploy --sha=<another
+commit>` or a dashboard deploy of another commit. Deploying the ref's own commit (a forced
+retry, say) doesn't pin. `slipstream:status` shows the pin and how to lift it:
+
+```bash
+php artisan slipstream:servers resume      # unpin; the next check converges on the deploy ref
+```
+
+To roll back the whole fleet, move the ref. Revert the bad commit on the release branch; with
+tags, push a new version tag on the last good commit, or delete the bad tag. Every node
+converges on its next check. The move is a reviewed change like any release, so it leaves the
+same change-control record. As always, rollback is code only: it does not un-migrate the
+database.
+
+### Seeing the fleet
+
+- `slipstream:status` on a node shows the trigger and the deploy ref, the commit running, the
+  last check (when, its result and detail), the commit the ref pointed at then, and any hold
+  or back-off with what to run to clear it.
+- The audit log channel (on in PCI mode; `SLIPSTREAM_AUDIT_LOG=true` elsewhere) receives the
+  checks that start a deploy, every change in a check's result, every deployment status
+  change, migrations run, waited for or failed, every pin and resume, and bootstrap's outcome.
+  Ship it to CloudWatch or your SIEM for a fleet view that needs no shared database.
+- Every release carries a `RELEASE_SHA` file at its root, so the app's own health route can
+  report the commit it serves to a load balancer or a dashboard. `slipstream:healthcheck`
+  prints it too.
+
+### Doctor in poll mode
+
+`slipstream:doctor` checks that the deploy user's key can `ls-remote` the ref (and shows what it
+resolves to), warns when `SLIPSTREAM_DEPLOY_REF` is unset or no heartbeat ran in the last three
+minutes, and confirms the webhook route is absent. With a migrate command set, it checks that
+the lock store can be shared at all. A PCI node on the webhook trigger gets a warning that each
+node needs its own webhook, and a pointer to poll mode.
+
+### Poll mode in a PCI environment
+
+- Poll mode adds no inbound endpoint. It does add steady outbound traffic from every node to
+  the git host: the `ls-remote` each check, and the fetch when the ref moves. Allow that in your
+  egress rules, and nothing else.
+- The shared lock store coordinates deploys into the CDE, which puts it in scope. Give it its
+  own network path and credentials.
+- Fetch the shared `.env` and the deploy key from a secrets manager at boot; never bake them
+  into the image. Every copy of an image is a copy of both, and if `APP_KEY` encrypts
+  cardholder data it is a key under requirement 3.
+- Run the scheduler as the PHP-FPM pool user, like every deploy, and keep `SLIPSTREAM_SERVER`
+  out of the shared `.env`.
+
+### Not in this release
+
+Rollout caps (a limit on how many nodes build or swap at once), signed-release verification,
+and an artifact source (a tarball CI built once, named by an S3 object or an SSM parameter,
+in place of git) are not part of 0.5.0. Releases are found through an interface,
+`Slipstream\Release\ReleaseSource`, so a source other than git can be bound later.
+
+## Upgrading
+
+### To 0.5.0
+
+- Require `slipstream/slipstream:^0.5`. A `^0.4` constraint stays on 0.4.x.
+- The new migration adds the poll and pin columns to `slipstream_servers`; deploys run it with
+  the rest (`artisan migrate`). Like every Slipstream migration it is guarded, so it is safe to
+  run twice. Nodes that keep Slipstream's records in a database of their own
+  (`SLIPSTREAM_DB_CONNECTION`) bring it current themselves from the minute heartbeat;
+  `php artisan slipstream:database ensure` does it by hand.
+- Webhook mode is unchanged unless you set one of the new variables. `SLIPSTREAM_REPOSITORY` and
+  the `SLIPSTREAM_NOTIFY_*` variables win over the stored settings in either mode, but only when
+  set.
+- The migrate step and the hooks file are opt-in. Without `SLIPSTREAM_MIGRATE_COMMAND` the
+  "Run migrations" hook runs as before, and without a `slipstream-hooks.php` in the release the
+  stored hooks run as before.
+- A deploy runs with the Slipstream code of the release it deploys *from*. So the deploy that
+  installs 0.5.0 still runs as 0.4 did, and the migrate step and the hooks file take effect
+  from the deploy after it. Poll mode starts once 0.5.0 is live.
+- The lock for hooks marked `fleet_lock` is now named after the hook and the app's database,
+  instead of the hook's row id. Nodes still a release behind won't see the new lock, so let the
+  upgrade reach every node before the next deploy.
+- Slipstream's scheduled heartbeat and prune now hold a mutex per node, and the heartbeat runs
+  in the background. On a fleet sharing its default cache store, nodes no longer skip each
+  other's heartbeats.
+
+**Moving a fleet to poll mode.** Deploy 0.5.0 the usual way first. Then set
+`SLIPSTREAM_TRIGGER=poll` and `SLIPSTREAM_DEPLOY_REF` in the shared `.env`, and run
+`php artisan optimize` in `current/` and reload PHP-FPM, or deploy once more. Then remove the
+provider webhook at the git host, since its URL now returns `404`. If nodes opted out of
+migrations with `slipstream:servers set --run-migrations=0`, poll mode no longer reads that
+value: `SLIPSTREAM_RUN_MIGRATIONS=false` in the shared `.env` opts out every node that reads
+it. For a vault that ran its own migrations from a stored hook, set
+`SLIPSTREAM_MIGRATE_COMMAND="vault:migrate --force --if-vault"` instead, and delete the stored
+hook once a deploy has run the migrate step.
 
 ## Preview the dashboard locally (no host app)
 

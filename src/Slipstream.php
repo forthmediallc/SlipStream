@@ -241,6 +241,20 @@ class Slipstream
     }
 
     /**
+     * How deploys start: a provider webhook, or each node polling its deploy
+     * ref. Anything unrecognised reads as webhook, the safe default.
+     */
+    public static function triggerMode(): string
+    {
+        return strtolower(trim((string) config('slipstream.trigger.mode', 'webhook'))) === 'poll' ? 'poll' : 'webhook';
+    }
+
+    public static function pollMode(): bool
+    {
+        return static::triggerMode() === 'poll';
+    }
+
+    /**
      * The connection Slipstream's tables live on (SLIPSTREAM_DB_CONNECTION);
      * null means the app's default connection.
      */

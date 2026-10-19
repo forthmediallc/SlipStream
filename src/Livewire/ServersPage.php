@@ -4,6 +4,7 @@ namespace Slipstream\Livewire;
 
 use Livewire\Attributes\Locked;
 use Slipstream\Fleet\Drift;
+use Slipstream\Fleet\NodeHold;
 use Slipstream\Fleet\Heartbeat;
 use Slipstream\Models\EnvPush;
 use Slipstream\Models\EnvSnapshot;
@@ -35,7 +36,14 @@ class ServersPage extends SlipstreamComponent
     public function togglePause(int $id): void
     {
         $server = Server::query()->findOrFail($id);
-        $server->update(['paused' => ! $server->paused]);
+
+        // Resuming also lifts a poll-mode pin; it is a pause with a reason.
+        if ($server->paused) {
+            app(NodeHold::class)->resume($server);
+        } else {
+            $server->update(['paused' => true]);
+        }
+
         Activity::log('server.'.($server->paused ? 'paused' : 'resumed'), ['server' => $server->server_name]);
         session()->flash(
             'slipstream_status',
@@ -123,6 +131,8 @@ class ServersPage extends SlipstreamComponent
             // resolves to null and simply closes it.
             'editingServer' => $this->editingId ? Server::query()->find($this->editingId) : null,
             'pollingMs' => (int) config('slipstream.realtime.polling_ms', 1500),
+            // Poll mode takes run-migrations from SLIPSTREAM_RUN_MIGRATIONS only.
+            'pollMode' => Slipstream::pollMode(),
         ]);
     }
 }

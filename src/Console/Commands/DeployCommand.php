@@ -8,6 +8,8 @@ use Slipstream\Deploy\EventLogger;
 use Slipstream\Deploy\FailedReleases;
 use Slipstream\Fleet\DeployQueue;
 use Slipstream\Models\Deployment;
+use Slipstream\Release\DeployRef;
+use Slipstream\Release\ReleaseSource;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\Activity;
@@ -296,12 +298,29 @@ class DeployCommand extends Command
             throw new \InvalidArgumentException('--sha must be a 7-64 character hex object id.');
         }
 
+        $meta = [];
+
+        // Poll mode, nothing named: deploy what the deploy ref names right
+        // now — a forced poll. Marked as the ref, so it never pins the node.
+        if (! $sha && ! $tag && ! $branch && Slipstream::pollMode()) {
+            try {
+                $deployRef = DeployRef::fromConfig();
+                $release = app(ReleaseSource::class)->latest($deployRef);
+            } catch (\Throwable $e) {
+                throw new \InvalidArgumentException('Cannot resolve the deploy ref: '.$e->getMessage());
+            }
+
+            $sha = $release->sha;
+            $tag = $release->isTag ? $release->name : null;
+            $branch = $release->isTag ? null : $release->name;
+            $meta['poll_ref'] = $deployRef->key();
+        }
+
         $ref = trim((string) ($tag ?? $branch ?? $settings->branch()));
         if (! GitRef::isValidName($ref)) {
             throw new \InvalidArgumentException("\"{$ref}\" is not a valid git ref name.");
         }
 
-        $meta = [];
         if ($tag) {
             $meta['deploy_from'] = 'tag';
         }

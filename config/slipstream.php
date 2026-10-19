@@ -76,6 +76,122 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Deploy trigger
+    |--------------------------------------------------------------------------
+    |
+    | webhook (the default): a push's provider webhook starts the deploy.
+    | poll: each node checks the deploy ref from its minute heartbeat and
+    | converges on it by itself. No inbound endpoint exists at all, which is
+    | what an Auto Scaling group behind a load balancer needs — a webhook
+    | lands on one node. README: "Poll mode and Auto Scaling groups".
+    |
+    */
+    'trigger' => [
+        'mode' => env('SLIPSTREAM_TRIGGER', 'webhook'),
+
+        // What poll mode deploys: a branch (production, refs/heads/production)
+        // or tags (refs/tags/v*, or just v*): the highest version wins. An
+        // exact tag (refs/tags/v1.4.2) holds the fleet on that release.
+        // Null = the deploy branch.
+        'ref' => env('SLIPSTREAM_DEPLOY_REF'),
+
+        // The repository a fresh node mirrors (slipstream:bootstrap). Takes
+        // precedence over the dashboard setting when set.
+        'repository' => env('SLIPSTREAM_REPOSITORY'),
+
+        // Seconds between checks. The heartbeat runs once a minute, so values
+        // below 60 behave as 60. Each check first waits a random 0..jitter
+        // seconds so a fleet does not reach the git host in the same second.
+        'poll_interval' => (int) env('SLIPSTREAM_POLL_INTERVAL', 60),
+        'poll_jitter' => (int) env('SLIPSTREAM_POLL_JITTER', 20),
+
+        // A commit whose deploy failed is retried after this many minutes,
+        // doubling per failure up to the cap. A newer commit is tried at once.
+        'retry_minutes' => (int) env('SLIPSTREAM_POLL_RETRY_MINUTES', 5),
+        'retry_max_minutes' => (int) env('SLIPSTREAM_POLL_RETRY_MAX_MINUTES', 240),
+
+        // Tag refs skip pre-releases (v2.0.0-rc.1) unless this is on.
+        'prereleases' => filter_var(env('SLIPSTREAM_DEPLOY_PRERELEASES', false), FILTER_VALIDATE_BOOLEAN),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Migrate step
+    |--------------------------------------------------------------------------
+    |
+    | With a command set, every deploy runs it in the new release before the
+    | health check — exactly once per commit across every node that shares
+    | the lock store (deploy.migration_lock_store). The other nodes wait for
+    | that run and fail their deploy if it failed. Unset, there is no migrate
+    | step and the seeded "Run migrations" hook works as it always has; set,
+    | that hook stops running.
+    |
+    */
+    'migrations' => [
+        // An artisan command line, e.g. "migrate --force".
+        'command' => env('SLIPSTREAM_MIGRATE_COMMAND'),
+
+        // Whether this node may run it. Null = the server registry
+        // (slipstream:servers set --run-migrations=…, on by default).
+        'enabled' => env('SLIPSTREAM_RUN_MIGRATIONS'),
+
+        // Seconds a node waits for another node's run of the same commit.
+        // Null = the lock TTL plus a minute, so a crashed run is taken over.
+        'wait_seconds' => env('SLIPSTREAM_MIGRATE_WAIT'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Node settings from the environment
+    |--------------------------------------------------------------------------
+    |
+    | The shared .env is the one thing every instance of an Auto Scaling
+    | group has, so what a node must not forget lives here, not in its
+    | database.
+    |
+    */
+    'node' => [
+        // Hold every node that reads this .env: no deploy starts. On top of
+        // slipstream:servers pause, which holds one node.
+        'paused' => filter_var(env('SLIPSTREAM_PAUSED', false), FILTER_VALIDATE_BOOLEAN),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Deploy hooks file
+    |--------------------------------------------------------------------------
+    |
+    | A PHP file in the app repository returning a list of hooks, read from
+    | each release as it is deployed, so a hook ships with the commit that
+    | needs it and a fresh node runs exactly what an old one does. Relative to
+    | the release root (an absolute path reads a file outside the repo). When
+    | the file exists it replaces the seeded default hooks; hooks stored in the
+    | database still run after its own.
+    |
+    */
+    'hooks' => [
+        'file' => env('SLIPSTREAM_HOOKS_FILE', 'slipstream-hooks.php'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Notification targets from the environment
+    |--------------------------------------------------------------------------
+    |
+    | Any of these, when set, wins over the dashboard setting.
+    |
+    */
+    'notifications' => [
+        'mail' => env('SLIPSTREAM_NOTIFY_MAIL'),
+        'slack_url' => env('SLIPSTREAM_NOTIFY_SLACK_URL'),
+        'discord_url' => env('SLIPSTREAM_NOTIFY_DISCORD_URL'),
+        'webhook_url' => env('SLIPSTREAM_NOTIFY_WEBHOOK_URL'),
+        'on_success' => env('SLIPSTREAM_NOTIFY_ON_SUCCESS'),
+        'on_failure' => env('SLIPSTREAM_NOTIFY_ON_FAILURE'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | PCI mode
     |--------------------------------------------------------------------------
     |
@@ -85,7 +201,9 @@ return [
     | else: no dashboard, no Livewire components, no shared .env editor or
     | env sync (no snapshots, no pushes, no /hooks/env-sync), no relay fan-out
     | or /hooks/relay, and no fleet deploy queue (/hooks/deploy-sync, heartbeat
-    | claiming). What remains is "receive a signed push, build a release, swap".
+    | claiming). What remains is "receive a signed push, build a release, swap"
+    | — and with the poll trigger on top, not even that route: the node finds
+    | releases itself and registers none.
     |
     | Enable it with `php artisan slipstream:install --pci` (writes the env
     | line) or by setting SLIPSTREAM_PCI_MODE=true in the shared .env. It is
@@ -330,6 +448,11 @@ return [
     'fleet' => [
         // Mark a server offline if no heartbeat within this many seconds.
         'heartbeat_stale_seconds' => (int) env('SLIPSTREAM_HEARTBEAT_STALE', 120),
+
+        // The daily prune forgets servers silent for this many hours (0 = never),
+        // so instances an Auto Scaling group terminated stop piling up in a
+        // shared registry.
+        'forget_after_hours' => (int) env('SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS', 0),
     ],
 
     /*

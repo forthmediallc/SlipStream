@@ -4,12 +4,17 @@ namespace Slipstream\Deploy;
 
 use Illuminate\Support\Facades\Cache;
 use RuntimeException;
+use Slipstream\Database\Tables;
 use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Fleet\Heartbeat;
+use Slipstream\Fleet\LastGood;
+use Slipstream\Fleet\NodeHold;
+use Slipstream\Fleet\SharedStore;
 use Slipstream\Models\Deployment;
 use Slipstream\Models\DeploymentHook;
 use Slipstream\Models\Server;
 use Slipstream\Notifications\DeployNotifier;
+use Slipstream\Release\DeployRef;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\GitRef;
@@ -53,6 +58,14 @@ class Deployer
 
     /** @var list<string> Post-swap issues that don't fail the deploy but must surface. */
     protected array $warnings = [];
+
+    /**
+     * Hooks from the release's own hooks file, loaded once it is extracted;
+     * null when the release has none.
+     *
+     * @var list<DeploymentHook>|null
+     */
+    protected ?array $fileHooks = null;
 
     public function __construct(
         protected Deployment $deployment,
@@ -111,6 +124,7 @@ class Deployer
             $this->stepFetch();
             $this->stepLinkShared();
             $this->stepComposer();   // default hooks (build/migrate/optimize/storage) run after
+            $this->stepMigrate();    // SLIPSTREAM_MIGRATE_COMMAND, once per commit; a no-op when unset
             $this->stepHealth();
             $this->stepSwap();
             $this->stepReloadFpm();  // default hooks (horizon/reverb restart) run after
@@ -127,6 +141,7 @@ class Deployer
             ]);
 
             $this->touchServerHeartbeat();
+            $this->afterSuccess();
 
             if ($this->warnings !== []) {
                 $this->log->error(sprintf(
@@ -267,8 +282,123 @@ class Deployer
             'release_path' => $this->releasePath,
         ]);
 
+        $this->loadFileHooks();
+
         $this->log->stepEnd($step, "Building release {$ts}_{$short}");
         $this->runHooks($step, 'after');
+    }
+
+    /**
+     * The hooks file comes from the release being built, not the one running,
+     * so a hook change takes effect with the commit that makes it — and a
+     * first deploy on a fresh node has the same recipe as every other node.
+     */
+    protected function loadFileHooks(): void
+    {
+        $this->fileHooks = HookFile::load((string) $this->releasePath);
+
+        if ($this->fileHooks !== null) {
+            $this->log->info(sprintf(
+                '%s: %d hook(s); the seeded defaults step aside.',
+                basename(HookFile::path((string) $this->releasePath)),
+                count($this->fileHooks)
+            ), 'fetch');
+        }
+    }
+
+    /**
+     * The migrate step. Without SLIPSTREAM_MIGRATE_COMMAND it does nothing and
+     * migrations stay with the seeded hook, exactly as before. With it, the
+     * command runs in the new release, once per commit across every node that
+     * shares the lock store; the others wait for that run and fail if it did.
+     */
+    protected function stepMigrate(): void
+    {
+        $step = 'migrate';
+        $this->runHooks($step, 'before');
+        $this->ensureSlipstreamSchema($step);
+
+        $command = MigrationCoordinator::command();
+
+        if ($command !== null) {
+            $this->log->stepStart($step, "Migrations: {$command}");
+            $this->warnIfUnsharedLockStore(config('slipstream.deploy.migration_lock_store'), $step);
+
+            if (! MigrationCoordinator::enabledHere()) {
+                // Not this node's to run; still never swap mid-migration, or
+                // onto a schema whose migration failed.
+                $this->log->info('This node is set not to run migrations.', $step);
+                app(MigrationCoordinator::class)->awaitRun(
+                    (string) $this->sha,
+                    fn (string $line) => $this->log->info($line, $step),
+                );
+            } else {
+                app(MigrationCoordinator::class)->run(
+                    (string) $this->sha,
+                    fn () => $this->shell($this->releasePath)->run(
+                        $this->renderHookScript('{{ php }} artisan '.$command),
+                        $this->releasePath,
+                        $step,
+                        timeout: max(60, (int) config('slipstream.deploy.migrate_timeout', 600)),
+                    ),
+                    fn (string $line) => $this->log->info($line, $step),
+                );
+            }
+
+            $this->log->stepEnd($step);
+        }
+
+        $this->runHooks($step, 'after');
+    }
+
+    /**
+     * With its own connection, Slipstream's schema is not covered by the app's
+     * migrations table — that one is shared, and records a migration as run
+     * the first time any node runs it. So the release brings its own schema
+     * current before it goes live. Best-effort: a release from before this
+     * existed cannot do it, and the next heartbeat will.
+     */
+    protected function ensureSlipstreamSchema(string $step): void
+    {
+        if (! app(Tables::class)->hasOwnConnection()) {
+            return;
+        }
+
+        [$code] = $this->shell($this->releasePath)->run(
+            [$this->php, 'artisan', 'slipstream:database', 'ensure'],
+            $this->releasePath,
+            $step,
+            throw: false
+        );
+
+        if ($code !== 0) {
+            $this->log->warning("The new release could not bring Slipstream's own schema current; the next heartbeat will.", $step);
+        }
+    }
+
+    /**
+     * After a successful deploy: remember the commit as the fleet's last good
+     * one when it came from the deploy ref, and pin the node when, in poll
+     * mode, it now runs something the ref does not name.
+     */
+    protected function afterSuccess(): void
+    {
+        try {
+            $this->deployment->refresh();
+
+            if (in_array($this->deployment->trigger, [Deployment::TRIGGER_POLL, Deployment::TRIGGER_BOOTSTRAP], true)
+                && ($this->deployment->meta['poll_ref'] ?? null) !== null
+                && $this->sha) {
+                $ref = DeployRef::fromConfig();
+                if ($ref->key() === $this->deployment->meta['poll_ref']) {
+                    app(LastGood::class)->record($ref, $this->sha, (string) $this->branch);
+                }
+            }
+
+            app(NodeHold::class)->afterDeploy($this->deployment);
+        } catch (\Throwable $e) {
+            $this->log->warning('Recording the deploy outcome failed (the deploy itself succeeded): '.$e->getMessage());
+        }
     }
 
     protected function stepLinkShared(): void
@@ -554,6 +684,14 @@ class Deployer
 
         $lock->clearPending();
 
+        // In poll mode the next check converges on the ref, and a catch-up to
+        // the branch tip would neither follow a tag ref nor respect a pin.
+        if (Slipstream::pollMode()) {
+            $this->log->info('A trigger arrived during this deploy; in poll mode the next check picks up anything newer.');
+
+            return;
+        }
+
         $shell = $this->shell();
         [$code, $out] = $shell->run(
             ['git', '--git-dir='.$this->repo, 'ls-remote', 'origin', '-h', 'refs/heads/'.$this->branch],
@@ -671,15 +809,52 @@ class Deployer
         }
     }
 
-    protected function runHooks(string $step, string $position): void
+    /**
+     * The hooks for one step and position, in run order: the release's hooks
+     * file first, then the database. Seeded defaults nobody edited step aside
+     * when the file exists (it replaces them), and the "Run migrations"
+     * default steps aside when the migrate step is configured.
+     *
+     * @return list<DeploymentHook>
+     */
+    protected function hooksFor(string $step, string $position): array
     {
-        $hooks = DeploymentHook::query()
+        $fromFile = array_values(array_filter(
+            $this->fileHooks ?? [],
+            fn (DeploymentHook $hook) => $hook->step === $step && $hook->position === $position && $hook->enabled
+        ));
+
+        $fromDatabase = [];
+        $migrateStep = MigrationCoordinator::command() !== null;
+
+        foreach (DeploymentHook::query()
             ->where('step', $step)
             ->where('position', $position)
             ->where('enabled', true)
             ->orderBy('sort_order')
             ->orderBy('id')
-            ->get();
+            ->get() as $hook) {
+            if ($this->fileHooks !== null && DefaultHooks::isUntouchedDefault($hook)) {
+                $this->log->info("Skipping default hook \"{$hook->name}\" — the release's hooks file replaces the defaults.", $step);
+
+                continue;
+            }
+
+            if ($migrateStep && DefaultHooks::isUntouchedDefault($hook, DefaultHooks::MIGRATE_HOOK)) {
+                $this->log->info("Skipping default hook \"{$hook->name}\" — the migrate step runs migrations.", $step);
+
+                continue;
+            }
+
+            $fromDatabase[] = $hook;
+        }
+
+        return [...$fromFile, ...$fromDatabase];
+    }
+
+    protected function runHooks(string $step, string $position): void
+    {
+        $hooks = $this->hooksFor($step, $position);
 
         $server = Slipstream::serverName();
         $cwd = $this->releasePath ?? $this->appRoot;
@@ -691,7 +866,7 @@ class Deployer
                 continue;
             }
 
-            if (in_array((int) $hook->id, $skipIds, true)) {
+            if ($hook->id !== null && in_array((int) $hook->id, $skipIds, true)) {
                 $this->log->info("Skipping hook \"{$hook->name}\" — deselected for this deploy.", $step);
 
                 continue;
@@ -716,9 +891,9 @@ class Deployer
      */
     protected function runFleetLockedHook(DeploymentHook $hook, string $cwd, string $step, string $position): void
     {
-        // A server flagged not to run migrations opts out of fleet-locked hooks.
-        $server = Server::query()->where('server_name', Slipstream::serverName())->first();
-        if ($server && ! $server->run_migrations) {
+        // A server flagged not to run migrations opts out of fleet-locked hooks
+        // (SLIPSTREAM_RUN_MIGRATIONS, when set, wins over the registry).
+        if (! MigrationCoordinator::enabledHere()) {
             $this->log->info("Skipping fleet-locked hook \"{$hook->name}\" — this server isn't fleet-task eligible.", $step);
 
             return;
@@ -731,7 +906,7 @@ class Deployer
         // Lock TTL is deliberately longer than any single hook so a slow task
         // never outlives its own lock and lets a peer double-run.
         $ttl = (int) config('slipstream.deploy.migration_lock_ttl', 900);
-        $lockKey = 'slipstream:hook:'.$hook->id.':'.($this->sha ?? 'unknown');
+        $lockKey = self::fleetLockKey($hook, $this->sha);
 
         $lock = $cache->lock($lockKey, $ttl);
         if ($lock->get()) {
@@ -744,6 +919,16 @@ class Deployer
         } else {
             $this->log->info("Skipping fleet-locked hook \"{$hook->name}\" — another server holds the lock.", $step);
         }
+    }
+
+    /**
+     * The fleet lock for one hook and commit, named by what the hook is rather
+     * than its row id: nodes with their own databases number their hooks
+     * independently, and a file hook has no row at all.
+     */
+    public static function fleetLockKey(DeploymentHook $hook, ?string $sha): string
+    {
+        return 'slipstream:hook:'.sha1($hook->step.'|'.$hook->position.'|'.$hook->name.'|'.SharedStore::scope()).':'.strtolower($sha ?? 'unknown');
     }
 
     /**

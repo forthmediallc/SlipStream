@@ -3,10 +3,12 @@
 namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
+use Slipstream\Database\Tables;
 use Slipstream\Deploy\StuckDeploymentsSweeper;
 use Slipstream\Environment\EnvSync;
 use Slipstream\Fleet\DeployQueue;
 use Slipstream\Fleet\Heartbeat;
+use Slipstream\Fleet\Poller;
 use Slipstream\Slipstream;
 
 class HeartbeatCommand extends Command
@@ -15,8 +17,19 @@ class HeartbeatCommand extends Command
 
     protected $description = 'Register / refresh this node in the Slipstream fleet registry';
 
-    public function handle(Heartbeat $heartbeat, EnvSync $sync, DeployQueue $queue, StuckDeploymentsSweeper $sweeper): int
+    public function handle(Heartbeat $heartbeat, EnvSync $sync, DeployQueue $queue, StuckDeploymentsSweeper $sweeper, Tables $tables, Poller $poller): int
     {
+        // A node with its own Slipstream database keeps that schema current
+        // itself: the app's migrations table is shared, and says a migration
+        // ran as soon as any node ran it.
+        try {
+            if ($tables->ensureCurrentIfOwnConnection()) {
+                $this->components->twoColumnDetail('slipstream schema', 'brought current');
+            }
+        } catch (\Throwable $e) {
+            $this->components->twoColumnDetail('slipstream schema', 'error: '.$e->getMessage());
+        }
+
         $server = $heartbeat->pulse();
 
         $this->components->twoColumnDetail(
@@ -59,6 +72,17 @@ class HeartbeatCommand extends Command
             }
         } catch (\Throwable $e) {
             $this->components->twoColumnDetail('stuck deploy sweep', 'error: '.$e->getMessage());
+        }
+
+        // Poll mode: look at the deploy ref and converge on it. Last, so the
+        // sweep above has already failed anything that died.
+        try {
+            $tick = $poller->tick();
+            if ($tick !== null) {
+                $this->components->twoColumnDetail('poll', $tick['result'].' — '.$tick['detail']);
+            }
+        } catch (\Throwable $e) {
+            $this->components->twoColumnDetail('poll', 'error: '.$e->getMessage());
         }
 
         return self::SUCCESS;

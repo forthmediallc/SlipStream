@@ -79,7 +79,7 @@
                                     Online
                                 </span>
                             @endif
-                            @if(! $server->run_migrations)
+                            @if(! $pollMode && ! $server->run_migrations)
                                 <div class="ss-muted ss-small">migrations off</div>
                             @endif
                         </td>
@@ -163,9 +163,12 @@
                         </div>
                         <div class="ss-field" style="margin-bottom:0">
                             <label class="ss-check">
-                                <input type="checkbox" wire:model="run_migrations">
+                                <input type="checkbox" wire:model="run_migrations" @disabled($pollMode)>
                                 Eligible to run fleet migrations (only one server per SHA actually migrates)
                             </label>
+                            @if($pollMode)
+                                <span class="ss-muted ss-small">Poll mode: <code>SLIPSTREAM_RUN_MIGRATIONS</code> in the shared <code>.env</code> decides, not this setting.</span>
+                            @endif
                         </div>
                     </div>
                     <div class="ss-modal-foot">

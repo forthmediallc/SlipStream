@@ -66,13 +66,21 @@ class DefaultHooks
         ],
     ];
 
+    public const MIGRATE_HOOK = 'Run migrations';
+
     /**
      * Seed any default hook that isn't already present (matched on step +
      * position + name, so a hook the user renamed or deleted stays that way).
+     *
+     * @param  list<string>  $except  names of defaults not to seed
      */
-    public static function seed(): void
+    public static function seed(array $except = []): void
     {
         foreach (self::DEFAULTS as $hook) {
+            if (in_array($hook['name'], $except, true)) {
+                continue;
+            }
+
             DeploymentHook::query()->firstOrCreate(
                 [
                     'step' => $hook['step'],
@@ -82,5 +90,56 @@ class DefaultHooks
                 $hook + ['enabled' => true],
             );
         }
+    }
+
+    /**
+     * Seed what an install at this release root should have: nothing when the
+     * release carries a hooks file (it replaces the defaults), the defaults
+     * minus "Run migrations" when the migrate step is configured, otherwise
+     * all of them. Returns what was done, for the install summary.
+     */
+    public static function seedFor(string $releaseRoot): string
+    {
+        if (HookFile::exists($releaseRoot)) {
+            return 'from '.basename(HookFile::path($releaseRoot)).' (defaults not seeded)';
+        }
+
+        if (MigrationCoordinator::command() !== null) {
+            self::seed([self::MIGRATE_HOOK]);
+
+            return 'defaults seeded; migrations run in the migrate step';
+        }
+
+        self::seed();
+
+        return 'defaults seeded';
+    }
+
+    /**
+     * A seeded default nobody has edited: same step, position, name and
+     * script. Edited defaults are the operator's own hooks now, and run.
+     */
+    public static function isUntouchedDefault(DeploymentHook $hook, ?string $name = null): bool
+    {
+        if ($hook->source !== 'database') {
+            return false;
+        }
+
+        $normalize = fn (?string $script) => trim(str_replace(["\r\n", "\r"], "\n", (string) $script));
+
+        foreach (self::DEFAULTS as $default) {
+            if ($name !== null && $default['name'] !== $name) {
+                continue;
+            }
+
+            if ($hook->step === $default['step']
+                && $hook->position === $default['position']
+                && $hook->name === $default['name']
+                && $normalize($hook->script) === $normalize($default['script'])) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

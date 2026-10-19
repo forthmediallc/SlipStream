@@ -29,8 +29,8 @@ class DeployNotifier
         $success = $deployment->status === Deployment::STATUS_DEPLOYED
             || $deployment->status === Deployment::STATUS_ROLLED_BACK;
 
-        $notifySuccess = filter_var($this->settings->get('notify_on_success', true), FILTER_VALIDATE_BOOLEAN);
-        $notifyFailure = filter_var($this->settings->get('notify_on_failure', true), FILTER_VALIDATE_BOOLEAN);
+        $notifySuccess = filter_var($this->settings->notification('on_success'), FILTER_VALIDATE_BOOLEAN);
+        $notifyFailure = filter_var($this->settings->notification('on_failure'), FILTER_VALIDATE_BOOLEAN);
 
         if ($success && ! $notifySuccess) {
             return;
@@ -96,7 +96,7 @@ class DeployNotifier
 
     protected function sendMail(string $subject, string $body, bool $success): void
     {
-        $to = $this->settings->get('notification_mail');
+        $to = $this->settings->notification('mail');
         if (! is_string($to) || $to === '') {
             return;
         }
@@ -112,7 +112,7 @@ class DeployNotifier
 
     protected function sendSlack(string $text, bool $success): void
     {
-        $url = $this->settings->get('notification_slack_url');
+        $url = $this->settings->notification('slack_url');
         if (! is_string($url) || $url === '') {
             return;
         }
@@ -130,7 +130,7 @@ class DeployNotifier
 
     protected function sendDiscord(string $text, bool $success): void
     {
-        $url = $this->settings->get('notification_discord_url');
+        $url = $this->settings->notification('discord_url');
         if (! is_string($url) || $url === '') {
             return;
         }
@@ -146,7 +146,7 @@ class DeployNotifier
 
     protected function sendGenericWebhook(array $payload): void
     {
-        $url = $this->settings->get('notification_webhook_url');
+        $url = $this->settings->notification('webhook_url');
         if (! is_string($url) || $url === '') {
             return;
         }

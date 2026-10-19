@@ -4,6 +4,7 @@ namespace Slipstream\Settings;
 
 use Illuminate\Support\Facades\Crypt;
 use Slipstream\Models\Setting;
+use Slipstream\Release\DeployRef;
 use Slipstream\Slipstream;
 
 class SettingsRepository
@@ -191,18 +192,51 @@ class SettingsRepository
         return $secret;
     }
 
+    /**
+     * In poll mode the settings that shape a deploy come from config and the
+     * shared .env only — a node's database holds state, never settings — so a
+     * fresh instance with an empty database deploys exactly like an old one.
+     * In webhook mode the dashboard's values win, as they always have.
+     */
     public function branch(): string
     {
+        if (Slipstream::pollMode()) {
+            try {
+                $ref = DeployRef::fromConfig();
+                if ($ref->kind === DeployRef::BRANCH) {
+                    return $ref->name;
+                }
+            } catch (\InvalidArgumentException) {
+                // A malformed SLIPSTREAM_DEPLOY_REF is the poller's and
+                // doctor's to report; status and the dashboard stay readable.
+            }
+
+            return (string) config('slipstream.deploy.branch', 'main');
+        }
+
         return (string) ($this->get('branch') ?: config('slipstream.deploy.branch', 'main'));
     }
 
     public function keepReleases(): int
     {
+        if (Slipstream::pollMode()) {
+            return max(1, (int) config('slipstream.deploy.keep_releases', 5));
+        }
+
         return (int) ($this->get('keep_releases') ?: config('slipstream.deploy.keep_releases', 5));
     }
 
+    /**
+     * SLIPSTREAM_REPOSITORY when set — what a fresh node mirrors — else the
+     * dashboard setting.
+     */
     public function repoUrl(): ?string
     {
+        $configured = config('slipstream.trigger.repository');
+        if (is_string($configured) && trim($configured) !== '') {
+            return trim($configured);
+        }
+
         $url = $this->get('repo_url');
 
         return is_string($url) && $url !== '' ? $url : null;
@@ -213,12 +247,33 @@ class SettingsRepository
      */
     public function sharedPaths(): array
     {
-        $fromDb = $this->get('shared_paths');
-        if (is_array($fromDb) && $fromDb !== []) {
-            return $fromDb;
+        if (! Slipstream::pollMode()) {
+            $fromDb = $this->get('shared_paths');
+            if (is_array($fromDb) && $fromDb !== []) {
+                return $fromDb;
+            }
         }
 
         return (array) config('slipstream.deploy.shared_paths', []);
+    }
+
+    /**
+     * A notification setting: the SLIPSTREAM_NOTIFY_* value when set, else
+     * the dashboard setting. Names: mail, slack_url, discord_url, webhook_url,
+     * on_success, on_failure.
+     */
+    public function notification(string $name): mixed
+    {
+        $configured = config("slipstream.notifications.{$name}");
+        if ($configured !== null && $configured !== '') {
+            return $configured;
+        }
+
+        return match ($name) {
+            'on_success' => $this->get('notify_on_success', true),
+            'on_failure' => $this->get('notify_on_failure', true),
+            default => $this->get('notification_'.$name),
+        };
     }
 
     protected function tableReady(): bool

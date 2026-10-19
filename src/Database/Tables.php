@@ -54,6 +54,66 @@ class Tables
         return is_array(config("database.connections.{$connection}"));
     }
 
+    /**
+     * Whether Slipstream's tables live apart from the app's database. Then the
+     * app's migrations table — shared across nodes, and the only record the
+     * migrator keeps — says nothing about this node's Slipstream schema.
+     */
+    public function hasOwnConnection(): bool
+    {
+        return ! $this->sameDatabase($this->activeConnection(), $this->defaultConnection());
+    }
+
+    /**
+     * Bring Slipstream's tables on a connection up to this package's
+     * migrations. Cheap when already current: a signature of the migration
+     * files is kept on that connection and compared first. Every migration is
+     * guarded, so running them again over a current schema changes nothing.
+     * Returns whether the migrations ran.
+     */
+    public function ensureCurrent(string $connection): bool
+    {
+        $signature = $this->migrationsSignature();
+
+        try {
+            $stored = Schema::connection($connection)->hasTable('slipstream_settings')
+                ? DB::connection($connection)->table('slipstream_settings')->where('key', self::SCHEMA_KEY)->value('value')
+                : null;
+        } catch (\Throwable) {
+            $stored = null;
+        }
+
+        if ($stored === $signature) {
+            return false;
+        }
+
+        $this->createOn($connection);
+
+        DB::connection($connection)->table('slipstream_settings')->updateOrInsert(
+            ['key' => self::SCHEMA_KEY],
+            ['value' => $signature, 'encrypted' => false, 'created_at' => now(), 'updated_at' => now()]
+        );
+
+        return true;
+    }
+
+    /**
+     * ensureCurrent() for Slipstream's own connection, when it has one. A node
+     * on the app's default connection leaves its schema to `artisan migrate`,
+     * as before.
+     */
+    public function ensureCurrentIfOwnConnection(): bool
+    {
+        return $this->hasOwnConnection() && $this->ensureCurrent($this->activeConnection());
+    }
+
+    public const SCHEMA_KEY = 'schema_migrations';
+
+    protected function migrationsSignature(): string
+    {
+        return sha1(implode(',', array_map('basename', $this->migrationFiles())));
+    }
+
     public function driver(string $connection): string
     {
         return (string) config("database.connections.{$connection}.driver", '?');

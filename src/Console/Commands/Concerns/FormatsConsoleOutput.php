@@ -170,7 +170,7 @@ trait FormatsConsoleOutput
         return $servers->map(fn (Server $server) => [
             $server->server_name.($server->server_name === $self ? ' (this)' : ''),
             $server->last_heartbeat_at && $server->last_heartbeat_at->gte($cutoff) ? 'online' : 'offline',
-            ! $server->enabled ? 'disabled' : ($server->paused ? 'paused' : 'active'),
+            ! $server->enabled ? 'disabled' : ($server->isPinned() ? 'pinned '.$this->shortSha($server->pinned_sha) : ($server->paused ? 'paused' : 'active')),
             $this->shortSha($server->current_sha),
             $this->ago($server->last_heartbeat_at),
             (string) ($server->php_version ?: '—'),
@@ -198,6 +198,8 @@ trait FormatsConsoleOutput
             'online' => (bool) ($server->last_heartbeat_at && $server->last_heartbeat_at->gte($cutoff)),
             'enabled' => (bool) $server->enabled,
             'paused' => (bool) $server->paused,
+            'pinned_sha' => $server->isPinned() ? $server->pinned_sha : null,
+            'pinned_reason' => $server->isPinned() ? $server->pinned_reason : null,
             'current_sha' => $server->current_sha,
             'last_heartbeat_at' => $server->last_heartbeat_at?->toIso8601String(),
             'php_version' => $server->php_version,

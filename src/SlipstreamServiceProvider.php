@@ -8,6 +8,7 @@ use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
+use Slipstream\Console\Commands\BootstrapCommand;
 use Slipstream\Console\Commands\DatabaseCommand;
 use Slipstream\Console\Commands\DeliveriesCommand;
 use Slipstream\Console\Commands\DeployCommand;
@@ -41,6 +42,8 @@ use Slipstream\Livewire\ProjectChrome;
 use Slipstream\Livewire\ServersPage;
 use Slipstream\Livewire\SettingsPage;
 use Slipstream\Livewire\WebhookPage;
+use Slipstream\Release\GitRefSource;
+use Slipstream\Release\ReleaseSource;
 use Slipstream\Settings\SettingsRepository;
 
 class SlipstreamServiceProvider extends ServiceProvider
@@ -51,6 +54,10 @@ class SlipstreamServiceProvider extends ServiceProvider
 
         $this->app->singleton(Slipstream::class, fn () => new Slipstream);
         $this->app->singleton(SettingsRepository::class);
+
+        // Where poll mode and bootstrap learn what to deploy. Git today; an
+        // artifact source (S3 or SSM pointer to a CI-built tarball) slots in here.
+        $this->app->bindIf(ReleaseSource::class, GitRefSource::class);
     }
 
     public function boot(): void
@@ -120,6 +127,7 @@ class SlipstreamServiceProvider extends ServiceProvider
             PipelinesCommand::class,
             SettingsCommand::class,
             DatabaseCommand::class,
+            BootstrapCommand::class,
         ]);
     }
 
@@ -201,15 +209,26 @@ class SlipstreamServiceProvider extends ServiceProvider
     protected function registerSchedule(): void
     {
         $this->callAfterResolving(Schedule::class, function (Schedule $schedule) {
+            // Laravel names the overlap mutex after the command alone and keeps
+            // it in the default cache store. On a fleet sharing that store, one
+            // node's run would make every other node skip its own; these are
+            // per-node tasks, so the mutex is per node.
+            $perNode = fn (string $task) => 'framework'.DIRECTORY_SEPARATOR.'schedule-'.sha1($task.'|'.Slipstream::serverName());
+
             $schedule->command('slipstream:heartbeat')
                 ->everyMinute()
                 ->name('slipstream-heartbeat')
-                ->withoutOverlapping();
+                ->withoutOverlapping()
+                ->createMutexNameUsing($perNode('slipstream-heartbeat'))
+                // In poll mode the check first waits a random few seconds; in
+                // the background that never holds up the app's own tasks.
+                ->runInBackground();
 
             $schedule->command('slipstream:prune')
                 ->daily()
                 ->name('slipstream-prune')
-                ->withoutOverlapping();
+                ->withoutOverlapping()
+                ->createMutexNameUsing($perNode('slipstream-prune'));
         });
     }
 }

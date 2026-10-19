@@ -8,6 +8,7 @@ use InvalidArgumentException;
 use Slipstream\Console\Commands\Concerns\FormatsConsoleOutput;
 use Slipstream\Fleet\Drift;
 use Slipstream\Fleet\Heartbeat;
+use Slipstream\Fleet\NodeHold;
 use Slipstream\Models\EnvPush;
 use Slipstream\Models\EnvSnapshot;
 use Slipstream\Models\Server;
@@ -92,12 +93,22 @@ class ServersCommand extends Command
 
     protected function pause(Server $server, bool $paused): int
     {
-        $server->update(['paused' => $paused]);
+        $wasPinned = $server->isPinned();
+
+        if ($paused) {
+            $server->update(['paused' => true]);
+        } else {
+            // Resuming lifts a poll-mode pin too: it is a pause with a reason.
+            app(NodeHold::class)->resume($server);
+        }
 
         Activity::log('server.'.($paused ? 'paused' : 'resumed'), ['server' => $server->server_name, 'via' => 'cli']);
-        $this->components->info($paused
-            ? "{$server->server_name} paused — webhooks accepted but builds skipped."
-            : "{$server->server_name} resumed.");
+        $this->components->info(match (true) {
+            $paused && Slipstream::pollMode() => "{$server->server_name} paused — polling continues, no deploy starts.",
+            $paused => "{$server->server_name} paused — webhooks accepted but builds skipped.",
+            $wasPinned => "{$server->server_name} unpinned and resumed — the next check converges on the deploy ref.",
+            default => "{$server->server_name} resumed.",
+        });
 
         return self::SUCCESS;
     }
@@ -147,6 +158,9 @@ class ServersCommand extends Command
             $this->components->twoColumnDetail($column, is_bool($value) ? ($value ? 'yes' : 'no') : ($value ?? '(config default)'));
         }
         $this->components->info("Settings saved for {$server->server_name}.");
+        if (array_key_exists('run_migrations', $changes) && Slipstream::pollMode()) {
+            $this->components->warn('Poll mode reads SLIPSTREAM_RUN_MIGRATIONS from the shared .env, not the registry: this value has no effect while poll mode is on.');
+        }
 
         return self::SUCCESS;
     }

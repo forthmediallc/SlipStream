@@ -27,7 +27,7 @@ class DatabaseCommand extends Command
     use FormatsConsoleOutput;
 
     protected $signature = 'slipstream:database
-                            {action=status : status | copy | drop-source}
+                            {action=status : status | copy | drop-source | ensure}
                             {--from= : Connection that holds the tables now (default: the app default connection)}
                             {--to= : Connection to copy them to (default: SLIPSTREAM_DB_CONNECTION)}
                             {--force : copy: go ahead with deployments in flight. drop-source: skip the completeness check and the prompt}
@@ -42,6 +42,7 @@ class DatabaseCommand extends Command
                 'status' => $this->status($tables),
                 'copy' => $this->copy($tables),
                 'drop-source' => $this->dropSource($tables),
+                'ensure' => $this->ensure($tables),
                 default => $this->unknownAction(),
             };
         } catch (InvalidArgumentException $e) {
@@ -49,6 +50,31 @@ class DatabaseCommand extends Command
 
             return self::FAILURE;
         }
+    }
+
+    /**
+     * Bring Slipstream's schema on its connection up to this release's
+     * migrations. Deploys run it from inside each new release before it goes
+     * live; it is also safe to run by hand.
+     */
+    protected function ensure(Tables $tables): int
+    {
+        $connection = $tables->activeConnection();
+
+        try {
+            $tables->ensureSqliteFile($connection);
+            $ran = $tables->ensureCurrent($connection);
+        } catch (\Throwable $e) {
+            $this->components->error("Could not bring Slipstream's schema on {$connection} current: ".$e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        $this->components->info($ran
+            ? "Brought Slipstream's schema on {$connection} current."
+            : "Slipstream's schema on {$connection} is current.");
+
+        return self::SUCCESS;
     }
 
     protected function status(Tables $tables): int
@@ -308,7 +334,7 @@ class DatabaseCommand extends Command
 
     protected function unknownAction(): int
     {
-        $this->components->error('Unknown action "'.$this->argument('action').'". Use: status, copy, drop-source.');
+        $this->components->error('Unknown action "'.$this->argument('action').'". Use: status, copy, drop-source, ensure.');
 
         return self::FAILURE;
     }

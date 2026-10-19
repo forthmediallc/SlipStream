@@ -6,8 +6,11 @@ use Illuminate\Console\Command;
 use Slipstream\Deploy\StuckDeploymentsSweeper;
 use Slipstream\Models\DeploymentEvent;
 use Slipstream\Models\EnvPush;
+use Slipstream\Models\EnvSnapshot;
+use Slipstream\Models\Server;
 use Slipstream\Models\WebhookDelivery;
 use Slipstream\Slipstream;
+use Slipstream\Support\Activity;
 
 /**
  * Keeps the DB-backed log tables bounded and clears deploys orphaned in
@@ -51,8 +54,39 @@ class PruneCommand extends Command
         }
 
         $this->pruneEnvPushes();
+        $this->forgetSilentServers();
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Instances an Auto Scaling group terminated never say goodbye; without
+     * this they pile up in a shared registry as offline servers forever.
+     * Off unless fleet.forget_after_hours is set. Never this node.
+     */
+    protected function forgetSilentServers(): void
+    {
+        $hours = (int) config('slipstream.fleet.forget_after_hours', 0);
+        if ($hours <= 0) {
+            return;
+        }
+
+        $cutoff = now()->subHours($hours);
+        $silent = Server::query()
+            ->where('server_name', '!=', Slipstream::serverName())
+            ->where(fn ($query) => $query
+                ->where('last_heartbeat_at', '<', $cutoff)
+                ->orWhere(fn ($never) => $never->whereNull('last_heartbeat_at')->where('created_at', '<', $cutoff)))
+            ->pluck('server_name');
+
+        foreach ($silent as $name) {
+            Server::query()->where('server_name', $name)->delete();
+            EnvSnapshot::query()->where('server_name', $name)->delete();
+            EnvPush::query()->where('server_name', $name)->delete();
+            Activity::log('server.forgotten', ['server' => $name, 'silent_hours' => $hours]);
+        }
+
+        $this->components->twoColumnDetail('Servers forgotten (silent > '.$hours.'h)', (string) $silent->count());
     }
 
     /**
