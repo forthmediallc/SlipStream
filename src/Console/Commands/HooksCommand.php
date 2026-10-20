@@ -79,10 +79,12 @@ class HooksCommand extends Command
         }
 
         $migrateStep = MigrationCoordinator::command() !== null;
-        $skipped = function (DeploymentHook $hook) use ($fileHooks, $migrateStep): ?string {
+        $artifact = Slipstream::artifactMode();
+        $skipped = function (DeploymentHook $hook) use ($fileHooks, $migrateStep, $artifact): ?string {
             return match (true) {
-                $fileHooks !== null && DefaultHooks::isUntouchedDefault($hook) => 'skipped: the hooks file replaces the defaults',
-                $migrateStep && DefaultHooks::isUntouchedDefault($hook, DefaultHooks::MIGRATE_HOOK) => 'skipped: the migrate step runs migrations',
+                $hook->source === 'database' && $fileHooks !== null && DefaultHooks::isUntouchedDefault($hook) => 'skipped: the hooks file replaces the defaults',
+                $hook->source === 'database' && $migrateStep && DefaultHooks::isUntouchedDefault($hook, DefaultHooks::MIGRATE_HOOK) => 'skipped: the migrate step runs migrations',
+                $artifact && DefaultHooks::whereOf($hook) === 'build' => 'skipped: built in CI (where: build)',
                 default => null,
             };
         };
@@ -113,13 +115,14 @@ class HooksCommand extends Command
         }
 
         $this->table(
-            ['ID', 'Source', 'On', 'Step', 'When', 'Name', 'Servers', 'Lock', 'Script'],
+            ['ID', 'Source', 'On', 'Step', 'When', 'Where', 'Name', 'Servers', 'Lock', 'Script'],
             $hooks->map(fn (DeploymentHook $h) => [
                 $h->id ? '#'.$h->id : '—',
                 $h->source,
                 $h->enabled ? ($skipped($h) ? 'no' : 'yes') : 'no',
                 $h->step,
                 $h->position,
+                DefaultHooks::whereOf($h),
                 $h->name.(($why = $skipped($h)) ? " ({$why})" : ''),
                 $h->server_names ? implode(', ', $h->server_names) : 'all',
                 $h->fleet_lock ? 'fleet' : '—',
@@ -370,6 +373,7 @@ class HooksCommand extends Command
             'step' => $hook->step,
             'position' => $hook->position,
             'name' => $hook->name,
+            'where' => DefaultHooks::whereOf($hook),
             'servers' => $hook->server_names,
             'fleet_lock' => (bool) $hook->fleet_lock,
             'sort_order' => $hook->sort_order,

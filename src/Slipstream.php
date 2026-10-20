@@ -301,6 +301,31 @@ class Slipstream
     }
 
     /**
+     * Where releases come from: git (nodes build the deploy ref from the
+     * mirror) or artifact (CI built, signed and stored them). Anything but
+     * 'artifact' reads as git.
+     */
+    public static function releaseSource(): string
+    {
+        return strtolower(trim((string) config('slipstream.release.source', 'git'))) === 'artifact' ? 'artifact' : 'git';
+    }
+
+    public static function artifactMode(): bool
+    {
+        return static::releaseSource() === 'artifact';
+    }
+
+    /**
+     * The environment releases are signed for; null when unset.
+     */
+    public static function releaseEnvironment(): ?string
+    {
+        $environment = trim((string) config('slipstream.release.environment', ''));
+
+        return $environment === '' ? null : $environment;
+    }
+
+    /**
      * The connection Slipstream's tables live on (SLIPSTREAM_DB_CONNECTION);
      * null means the app's default connection.
      */

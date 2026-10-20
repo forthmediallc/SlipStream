@@ -9,6 +9,9 @@ use Slipstream\Deploy\MigrationCoordinator;
 use Slipstream\Fleet\Heartbeat;
 use Slipstream\Fleet\NodeHold;
 use Slipstream\Fleet\Poller;
+use Slipstream\Release\ArtifactSequence;
+use Slipstream\Release\ArtifactSource;
+use Slipstream\Release\ArtifactStore;
 use Slipstream\Release\DeployRef;
 use Slipstream\Environment\EnvSync;
 use Slipstream\Fleet\Drift;
@@ -192,8 +195,27 @@ class StatusCommand extends Command
             $backoff = $state === null ? null : ['failures' => $state['failures'], 'until' => $state['until']->toIso8601String()];
         }
 
+        $artifact = null;
+        if (Slipstream::artifactMode()) {
+            $store = app(ArtifactStore::class);
+            $artifact = [
+                'disk' => $store->diskName(), 'prefix' => $store->prefix(), 'environment' => Slipstream::releaseEnvironment(),
+                'sha' => null, 'sequence' => null, 'published_at' => null, 'by' => null, 'key_id' => null, 'high_water' => null, 'error' => null,
+            ];
+            try {
+                $deployRef = DeployRef::fromConfig();
+                $artifact['high_water'] = app(ArtifactSequence::class)->highWater($deployRef);
+                $pointer = app(ArtifactSource::class)->pointer($deployRef, accept: false);
+                $artifact = ['sha' => $pointer->sha, 'sequence' => $pointer->sequence, 'published_at' => $pointer->publishedAt, 'by' => $pointer->by, 'key_id' => $pointer->keyId] + $artifact;
+            } catch (\Throwable $e) {
+                $artifact['error'] = $e->getMessage();
+            }
+        }
+
         return [
             'mode' => Slipstream::triggerMode(),
+            'source' => Slipstream::releaseSource(),
+            'artifact' => $artifact,
             'ref' => $ref,
             'ref_error' => $refError,
             'running_sha' => $running,
@@ -233,6 +255,13 @@ class StatusCommand extends Command
         }
 
         $this->components->twoColumnDetail('Trigger', 'poll · '.($state['ref'] ?? 'invalid ref: '.$state['ref_error']));
+        if ($state['artifact'] !== null) {
+            $artifact = $state['artifact'];
+            $this->components->twoColumnDetail('Source', 'artifact · disk '.($artifact['disk'] ?: '(unset)').($artifact['prefix'] !== '' ? ' · prefix '.$artifact['prefix'] : '').' · environment '.($artifact['environment'] ?? '(unset)'));
+            $this->components->twoColumnDetail('Pointer', $artifact['error'] !== null
+                ? 'unreadable: '.$artifact['error']
+                : $this->shortSha($artifact['sha']).' · sequence '.$artifact['sequence'].' · published '.$artifact['published_at'].' by '.$artifact['by'].' · key '.$artifact['key_id']);
+        }
         $this->components->twoColumnDetail('Running', $this->shortSha($state['running_sha']));
         $this->components->twoColumnDetail(
             'Last poll',

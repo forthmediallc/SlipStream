@@ -360,6 +360,15 @@ class ProvisionCommand extends Command
             );
             $process->run();
             $ok = $process->isSuccessful();
+
+            // An artifact node downloads what CI built: no build tool is needed,
+            // and on a PCI node none should be there.
+            if (Slipstream::artifactMode()) {
+                $this->components->twoColumnDetail($bin, $ok ? '<fg=yellow>found — not needed in artifact mode</>' : 'not needed (artifact mode)');
+
+                continue;
+            }
+
             $this->components->twoColumnDetail(
                 $bin,
                 $ok ? '<fg=green>found</>' : '<fg=red>missing</>'

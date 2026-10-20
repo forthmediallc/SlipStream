@@ -35,7 +35,7 @@ use Slipstream\Support\Activity;
 class BootstrapCommand extends Command
 {
     protected $signature = 'slipstream:bootstrap
-                            {--repo= : Repository to mirror when this node has none (default: SLIPSTREAM_REPOSITORY)}
+                            {--repo= : Repository to mirror when this node has none (default: SLIPSTREAM_REPOSITORY; unused in artifact mode)}
                             {--no-fallback : Fail rather than deploy the fleet\'s last good commit when the deploy ref\'s own commit fails}';
 
     protected $description = 'Bring a fresh instance up: tables, registry, mirror, the deploy ref deployed and health-checked; non-zero unless it can serve';
@@ -70,7 +70,8 @@ class BootstrapCommand extends Command
         $this->register($self);
         $this->components->twoColumnDetail('Hooks', DefaultHooks::seedFor(base_path()));
 
-        if (! is_dir($root.DIRECTORY_SEPARATOR.'repo.git') && ($code = $this->mirror($settings)) !== self::SUCCESS) {
+        // Artifact mode: no mirror, no git. The release comes from the store.
+        if (! Slipstream::artifactMode() && ! is_dir($root.DIRECTORY_SEPARATOR.'repo.git') && ($code = $this->mirror($settings)) !== self::SUCCESS) {
             return $code;
         }
 

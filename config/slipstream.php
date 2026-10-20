@@ -133,6 +133,72 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Release source
+    |--------------------------------------------------------------------------
+    |
+    | git (the default): nodes fetch the deploy ref from the mirror and build
+    | it. artifact: CI builds a release once, signs it and stores it; nodes
+    | download, verify and unpack it, and never run git, composer or npm.
+    | Needs SLIPSTREAM_TRIGGER=poll. README: "Artifact releases".
+    |
+    */
+    'release' => [
+        'source' => env('SLIPSTREAM_RELEASE_SOURCE', 'git'),
+
+        // The environment a release is signed for (production, staging). It
+        // is bound into every signature, so a pointer copied from another
+        // environment's store verifies but is refused. Required in artifact
+        // mode.
+        'environment' => env('SLIPSTREAM_RELEASE_ENVIRONMENT'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Artifact store
+    |--------------------------------------------------------------------------
+    |
+    | Where CI puts releases and nodes read them: a disk in the app's
+    | config/filesystems.php (S3 in production, read through the VPC's
+    | gateway endpoint with the instance role's credentials). Under the
+    | prefix: releases/<sha>/{release.tar.gz, manifest.json, manifest.sig}
+    | and a signed pointer per deploy ref, refs/heads/<branch>.json.
+    |
+    */
+    'artifacts' => [
+        'disk' => env('SLIPSTREAM_ARTIFACTS_DISK'),
+        'prefix' => env('SLIPSTREAM_ARTIFACTS_PREFIX', ''),
+
+        // The Ed25519 public keys nodes verify releases with: id:base64,
+        // comma-separated, at most two (the one in use and the one it is
+        // rotating to), or file:/path holding the same list.
+        'public_keys' => env('SLIPSTREAM_RELEASE_PUBLIC_KEYS', ''),
+
+        // Paths slipstream:artifact package leaves out, beyond its own list
+        // (.git, node_modules, tests, .env*, auth.json, vendor/bin, …).
+        'exclude' => [],
+
+        // Paths a node writes into a release after unpacking it, which the
+        // live-release verification must not count as drift. storage/, the
+        // .env and auth.json links, RELEASE_SHA and .slipstream/ are always
+        // left out, as are the configured shared paths.
+        'generated' => ['bootstrap/cache', 'public/storage', 'public/hot'],
+
+        // What a node will download and unpack, at most.
+        'max_archive_bytes' => (int) env('SLIPSTREAM_ARTIFACTS_MAX_ARCHIVE_BYTES', 1073741824),
+        'max_unpacked_bytes' => (int) env('SLIPSTREAM_ARTIFACTS_MAX_UNPACKED_BYTES', 4294967296),
+        'max_entries' => (int) env('SLIPSTREAM_ARTIFACTS_MAX_ENTRIES', 250000),
+
+        // Re-hash the live release against its manifest once a week
+        // (slipstream:verify; PCI DSS 11.5.2).
+        'verify_weekly' => filter_var(env('SLIPSTREAM_ARTIFACTS_VERIFY_WEEKLY', true), FILTER_VALIDATE_BOOLEAN),
+
+        // CI only: what signs. sodium:<base64 secret>, file:<path>, or
+        // kms:<key id, ARN or alias> (through the AWS CLI).
+        'signing_key' => env('SLIPSTREAM_SIGNING_KEY'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Migrate step
     |--------------------------------------------------------------------------
     |
@@ -339,6 +405,12 @@ return [
         // lock at least the hour a hook may run + 120s) whatever this says.
         'migration_lock_ttl' => (int) env('SLIPSTREAM_MIGRATION_LOCK_TTL', 900),
         'migrate_timeout' => (int) env('SLIPSTREAM_MIGRATE_TIMEOUT', 600),
+        // What hooks and the detached deploy see in their environment.
+        // inherit: this process's whole environment, every .env value
+        // included (the default in git mode, as it always was). minimal:
+        // PATH, HOME, COMPOSER_HOME, LANG, LC_ALL, TZ and SLIPSTREAM_* only —
+        // artisan loads the .env itself (the default in artifact mode).
+        'hook_env' => env('SLIPSTREAM_HOOK_ENV'),
         // A deploy still "building" past this many minutes is treated as dead by
         // the watchdog (heartbeat, every minute) and marked failed. 0 disables.
         'stuck_minutes' => (int) env('SLIPSTREAM_STUCK_MINUTES', 120),

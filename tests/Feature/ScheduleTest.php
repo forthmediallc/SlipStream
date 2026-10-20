@@ -40,6 +40,24 @@ class ScheduleTest extends TestCase
         $this->assertSame(60, $this->event('slipstream:prune')->expiresAt);
     }
 
+    public function test_the_weekly_verify_is_scheduled_in_artifact_mode_only(): void
+    {
+        foreach (app(Schedule::class)->events() as $event) {
+            $this->assertStringNotContainsString('slipstream:verify', (string) $event->command, 'git mode has nothing to verify');
+        }
+    }
+
+    public function test_in_artifact_mode_the_live_release_is_verified_weekly(): void
+    {
+        config()->set('slipstream.release.source', 'artifact');
+
+        $verify = $this->event('slipstream:verify');
+
+        $this->assertSame('0 0 * * 0', $verify->expression);
+        $this->assertStringContainsString('--audit', (string) $verify->command);
+        $this->assertTrue($verify->withoutOverlapping);
+    }
+
     protected function event(string $command): Event
     {
         foreach (app(Schedule::class)->events() as $event) {

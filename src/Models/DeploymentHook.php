@@ -10,6 +10,14 @@ class DeploymentHook extends SlipstreamModel
      */
     public string $source = 'database';
 
+    /**
+     * Where the hook runs: on the node, during the deploy (every hook until
+     * 0.6.0), or at build time in CI (`where => build` in the hooks file).
+     * In artifact mode a node never runs a build-time hook. Not a column:
+     * stored hooks are always node hooks, since CI cannot read a database.
+     */
+    public string $where = 'node';
+
     protected $table = 'slipstream_deployment_hooks';
 
     protected $fillable = [

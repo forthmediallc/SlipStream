@@ -14,9 +14,15 @@ use Slipstream\Models\Deployment;
 use Slipstream\Models\DeploymentHook;
 use Slipstream\Models\Server;
 use Slipstream\Notifications\DeployNotifier;
+use Slipstream\Release\ArtifactFetcher;
+use Slipstream\Release\ArtifactSource;
+use Slipstream\Release\ArtifactStore;
+use Slipstream\Release\Core\ArtifactRefused;
+use Slipstream\Release\Core\Keys;
 use Slipstream\Release\DeployRef;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
+use Slipstream\Support\AuditLog;
 use Slipstream\Support\GitRef;
 use Slipstream\Support\PhpBinary;
 use Slipstream\Support\Sudo;
@@ -71,6 +77,9 @@ class Deployer
      * @var list<DeploymentHook>|null
      */
     protected ?array $fileHooks = null;
+
+    /** Artifact mode: where a release is unpacked and checked before it is a release. */
+    protected ?string $incomingPath = null;
 
     public function __construct(
         protected Deployment $deployment,
@@ -198,7 +207,9 @@ class Deployer
             );
         }
 
-        if (! is_dir($this->repo)) {
+        if (Slipstream::artifactMode()) {
+            $this->preflightArtifact();
+        } elseif (! is_dir($this->repo)) {
             throw new RuntimeException(
                 "FATAL: bare mirror not found at {$this->repo} — run php artisan slipstream:provision."
             );
@@ -209,11 +220,163 @@ class Deployer
         }
     }
 
+    /**
+     * Everything an artifact deploy needs, named before the store is touched.
+     */
+    protected function preflightArtifact(): void
+    {
+        if (! Slipstream::pollMode()) {
+            throw new RuntimeException('FATAL: artifact releases need SLIPSTREAM_TRIGGER=poll — a webhook names commits CI may never have built.');
+        }
+        if (! extension_loaded('sodium')) {
+            throw new RuntimeException('FATAL: artifact releases need ext-sodium to verify signatures.');
+        }
+        if (Slipstream::releaseEnvironment() === null) {
+            throw new RuntimeException('FATAL: SLIPSTREAM_RELEASE_ENVIRONMENT is not set — a release is signed for one environment.');
+        }
+
+        try {
+            $keys = Keys::parse((string) config('slipstream.artifacts.public_keys', ''));
+        } catch (\InvalidArgumentException $e) {
+            throw new RuntimeException('FATAL: '.$e->getMessage());
+        }
+        if ($keys->count() === 0) {
+            throw new RuntimeException('FATAL: SLIPSTREAM_RELEASE_PUBLIC_KEYS is empty — nothing to verify releases with.');
+        }
+
+        if (! app(ArtifactStore::class)->isConfigured()) {
+            throw new RuntimeException('FATAL: SLIPSTREAM_ARTIFACTS_DISK must name a disk in config/filesystems.php.');
+        }
+    }
+
     protected function stepFetch(): void
     {
         $step = 'fetch';
         $this->runHooks($step, 'before');
 
+        if (Slipstream::artifactMode()) {
+            $this->fetchArtifact($step);
+        } else {
+            $this->fetchFromGit($step);
+        }
+
+        file_put_contents($this->releasePath.DIRECTORY_SEPARATOR.'RELEASE_SHA', $this->sha."\n");
+        $this->deployment->update([
+            'sha' => $this->sha,
+            'release_path' => $this->releasePath,
+        ]);
+
+        $this->loadFileHooks();
+
+        $this->log->stepEnd($step, 'Building release '.basename((string) $this->releasePath));
+        $this->runHooks($step, 'after');
+    }
+
+    /**
+     * Artifact mode: the release CI built, from the store. Named by the
+     * pointer the poll followed (which binds the manifest it saw), or by a
+     * commit alone (`slipstream:deploy --sha=`, a bootstrap fallback), which
+     * the release's own signed statement vouches for. Unpacked into a
+     * dot-prefixed directory that prune and rollback never see, and renamed
+     * into place only once every check has passed.
+     */
+    protected function fetchArtifact(string $step): void
+    {
+        $source = app(ArtifactSource::class);
+        $store = $source->store();
+        $pointer = null;
+
+        $pollRef = $this->deployment->meta['poll_ref'] ?? null;
+        if (is_string($pollRef)) {
+            try {
+                $current = $source->pointer(DeployRef::parse(($this->deployment->deployFrom() === 'tag' ? 'refs/tags/' : 'refs/heads/').$this->branch));
+                if (! $this->deployment->sha || strtolower((string) $this->deployment->sha) === $current->sha) {
+                    $pointer = $current;
+                }
+            } catch (ArtifactRefused $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                $this->log->warning('Could not re-read the pointer ('.$e->getMessage().'); deploying the commit by its own signature.', $step);
+            }
+        }
+
+        $this->sha = $pointer?->sha ?? $store->resolveSha((string) $this->deployment->sha);
+        $this->assertValidSha($this->sha);
+        if (strlen($this->sha) !== 40) {
+            throw new RuntimeException('An artifact release is named by a full 40-character commit id.');
+        }
+
+        $short = substr($this->sha, 0, 7);
+        $ts = gmdate('Ymd_His');
+        $this->log->stepStart($step, "Fetching release {$short} from disk ".$store->diskName().($pointer ? " (pointer sequence {$pointer->sequence})" : ' (by commit)').'…');
+
+        $this->incomingPath = $this->releases.DIRECTORY_SEPARATOR.".incoming-{$ts}_{$short}";
+        if (! @mkdir($this->incomingPath, 0755, true)) {
+            throw new RuntimeException("Cannot create {$this->incomingPath}.");
+        }
+        @chmod($this->incomingPath, 0755);
+
+        try {
+            $result = app(ArtifactFetcher::class)->fetchInto(
+                $this->sha,
+                $pointer?->manifestSha256,
+                $this->incomingPath,
+                (string) Slipstream::releaseEnvironment(),
+                $source->keys(),
+                fn (string $line) => $this->log->info($line, $step),
+            );
+        } catch (ArtifactRefused $e) {
+            AuditLog::record('artifact.refused', [
+                'deployment' => $this->deployment->id,
+                'stage' => $e->stage,
+                'reason' => $e->reason,
+                'sha' => $this->sha,
+                'ref' => $pointer?->ref,
+            ] + $e->context);
+
+            throw $e;
+        }
+
+        if ($pointer !== null) {
+            file_put_contents(
+                $this->incomingPath.DIRECTORY_SEPARATOR.ArtifactFetcher::SIDECAR.DIRECTORY_SEPARATOR.'pointer.json',
+                json_encode($pointer->toPayload() + ['key_id' => $pointer->keyId], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n"
+            );
+        }
+
+        $final = $this->releases.DIRECTORY_SEPARATOR."{$ts}_{$short}";
+        if (! @rename($this->incomingPath, $final)) {
+            throw new RuntimeException("Cannot move the verified release into place at {$final}.");
+        }
+        @chmod($final, 0755);
+        $this->releasePath = $final;
+        $this->incomingPath = null;
+
+        $manifestSha256 = hash('sha256', $result['manifest_json']);
+        $this->deployment->update(['meta' => array_merge((array) $this->deployment->meta, ['artifact' => [
+            'sequence' => $pointer?->sequence,
+            'manifest_sha256' => $manifestSha256,
+            'key_id' => $result['key_id'],
+        ]])]);
+
+        AuditLog::record('artifact.verified', [
+            'deployment' => $this->deployment->id,
+            'sha' => $this->sha,
+            'ref' => $pointer?->ref,
+            'sequence' => $pointer?->sequence,
+            'manifest_sha256' => $manifestSha256,
+            'archive_sha256' => $result['manifest']->archiveSha256,
+            'key_id' => $result['key_id'],
+            'files' => $result['files'],
+            'bytes' => $result['manifest']->unpackedBytes,
+        ]);
+    }
+
+    /**
+     * Git mode: the deploy ref from the mirror, as it always was.
+     */
+    protected function fetchFromGit(string $step): void
+    {
         $deployFrom = $this->deployment->deployFrom();
 
         // The ref reaches git as its own argv element, so a value starting with
@@ -280,17 +443,6 @@ class Deployer
                 @unlink($tar);
             }
         }
-
-        file_put_contents($this->releasePath.DIRECTORY_SEPARATOR.'RELEASE_SHA', $this->sha."\n");
-        $this->deployment->update([
-            'sha' => $this->sha,
-            'release_path' => $this->releasePath,
-        ]);
-
-        $this->loadFileHooks();
-
-        $this->log->stepEnd($step, "Building release {$ts}_{$short}");
-        $this->runHooks($step, 'after');
     }
 
     /**
@@ -484,6 +636,17 @@ class Deployer
     {
         $step = 'composer';
         $this->runHooks($step, 'before');
+
+        if (Slipstream::artifactMode()) {
+            // vendor/ came with the artifact, verified file by file.
+            $this->log->stepStart($step, 'Dependencies came with the artifact; nothing to install.');
+            $this->assertSlipstreamInstalled();
+            $this->log->stepEnd($step);
+            $this->runHooks($step, 'after');
+
+            return;
+        }
+
         $this->log->stepStart($step, 'composer install…');
 
         $this->assertSlipstreamInLockfile();
@@ -652,6 +815,15 @@ class Deployer
             $this->log->info("Pruning old failed release: {$old}", $step);
         }
 
+        // A staging directory an artifact deploy left behind when it was
+        // killed outright (glob('*') never lists dot-prefixed entries).
+        foreach (glob($this->releases.DIRECTORY_SEPARATOR.'.incoming-*', GLOB_ONLYDIR) ?: [] as $stale) {
+            if (filemtime($stale) < time() - 7200) {
+                $this->log->info("Removing an abandoned download: {$stale}", $step);
+                $this->removePath($stale);
+            }
+        }
+
         $this->log->stepEnd($step);
         $this->runHooks($step, 'after');
     }
@@ -728,6 +900,21 @@ class Deployer
     protected function fail(\Throwable $e): void
     {
         $this->log->error('DEPLOY FAILED: '.$e->getMessage());
+
+        // A release refused before it was verified is deleted, never kept
+        // for inspection: there is nothing in it to re-run, and unverified
+        // bytes stay off the node. (The dot-prefixed staging directory is
+        // what holds it; a verified release that failed later keeps the
+        // usual .failed retention below.)
+        if ($this->incomingPath !== null && is_dir($this->incomingPath)) {
+            $this->log->info('Removing the unverified release: '.$this->incomingPath);
+            try {
+                $this->removePath($this->incomingPath);
+            } catch (\Throwable $cleanup) {
+                $this->log->warning('Could not remove the unverified release: '.$cleanup->getMessage());
+            }
+            $this->incomingPath = null;
+        }
 
         if ($this->releasePath && is_dir($this->releasePath)) {
             $live = realpath($this->current) ?: '';
@@ -854,7 +1041,22 @@ class Deployer
             $fromDatabase[] = $hook;
         }
 
-        return [...$fromFile, ...$fromDatabase];
+        $hooks = [...$fromFile, ...$fromDatabase];
+
+        // Build-time hooks ran in CI; an artifact node never builds. In git
+        // mode the node is the builder, and runs them.
+        if (Slipstream::artifactMode()) {
+            $hooks = array_values(array_filter($hooks, function (DeploymentHook $hook) use ($step) {
+                if (DefaultHooks::whereOf($hook) !== 'build') {
+                    return true;
+                }
+                $this->log->info("Skipping build-time hook \"{$hook->name}\" — it ran in CI (where: build).", $step);
+
+                return false;
+            }));
+        }
+
+        return $hooks;
     }
 
     protected function runHooks(string $step, string $position): void
@@ -943,16 +1145,28 @@ class Deployer
      */
     protected function renderHookScript(string $script): string
     {
-        return HookScript::render($script, [
+        $artifact = Slipstream::artifactMode();
+
+        $rendered = HookScript::render($script, [
             'release' => $this->releasePath ?? $this->appRoot,
             'sha' => (string) $this->sha,
             'branch' => $this->branch,
             'app_root' => $this->appRoot,
             'php' => $this->php,
-            'npm' => $this->npm,
-            'composer' => $this->composer,
+            // On an artifact node a build tool has no business running; a
+            // hook that still names one fails and says why.
+            'npm' => $artifact ? 'npm' : $this->npm,
+            'composer' => $artifact ? 'composer' : $this->composer,
         ]);
+
+        return $artifact ? self::ARTIFACT_GUARD."\n".$rendered : $rendered;
     }
+
+    /**
+     * Shell functions that shadow the build tools on an artifact node.
+     */
+    public const ARTIFACT_GUARD = 'npm() { echo "npm does not run on an artifact node; mark the hook where => build" >&2; return 1; }; '
+        .'composer() { echo "composer does not run on an artifact node; mark the hook where => build" >&2; return 1; }';
 
     protected function shell(?string $cwd = null): ShellRunner
     {

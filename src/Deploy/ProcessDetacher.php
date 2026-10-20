@@ -153,24 +153,15 @@ class ProcessDetacher
     }
 
     /**
+     * What the detached artisan sees: this process's environment, or the
+     * minimal one (SLIPSTREAM_HOOK_ENV; minimal by default in artifact
+     * mode). Artisan loads the .env itself either way.
+     *
      * @return array<string, string>
      */
     protected function environment(): array
     {
-        $env = $_ENV + $_SERVER;
-        $home = getenv('HOME') ?: (function_exists('posix_getpwuid')
-            ? (posix_getpwuid(posix_geteuid())['dir'] ?? null)
-            : null);
-
-        if ($home) {
-            $env['HOME'] = $home;
-            $env['COMPOSER_HOME'] = $env['COMPOSER_HOME'] ?? ($home.'/.config/composer');
-        }
-
-        $env['PATH'] = getenv('PATH') ?: '/usr/local/bin:/usr/bin:/bin';
-
-        // Only string values for proc_open
-        return array_filter($env, fn ($v) => is_string($v));
+        return \Slipstream\Support\HookEnvironment::build();
     }
 
     protected function logDirectory(): string

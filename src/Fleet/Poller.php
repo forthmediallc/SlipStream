@@ -6,6 +6,8 @@ use Carbon\CarbonInterface;
 use Slipstream\Deploy\ProcessDetacher;
 use Slipstream\Models\Deployment;
 use Slipstream\Models\Server;
+use Slipstream\Release\ArtifactSource;
+use Slipstream\Release\Core\ArtifactRefused;
 use Slipstream\Release\DeployRef;
 use Slipstream\Release\ReleaseRef;
 use Slipstream\Release\ReleaseSource;
@@ -31,6 +33,9 @@ class Poller
     public const BACKOFF = 'backoff';
 
     public const ERROR = 'error';
+
+    /** Artifact mode: the pointer in the store failed verification. */
+    public const REFUSED = 'refused';
 
     public function __construct(
         protected ReleaseSource $source,
@@ -63,6 +68,11 @@ class Poller
         try {
             $ref = DeployRef::fromConfig();
             $release = $this->source->latest($ref);
+        } catch (ArtifactRefused $e) {
+            // A pointer the node will not follow is not an error to retry
+            // harder: no deployment row, no back-off, and the node keeps
+            // serving. The source already audited why.
+            return $this->record($server, self::REFUSED, $e->getMessage());
         } catch (\Throwable $e) {
             return $this->record($server, self::ERROR, $e->getMessage());
         }
@@ -82,7 +92,7 @@ class Poller
             return $this->record($server, self::BUSY, "deployment #{$inFlight->id} is {$inFlight->status}", $release);
         }
 
-        if (($backoff = $this->backoff($release->sha)) !== null) {
+        if (($backoff = $this->backoff($release->sha, $this->manifestOf($ref))) !== null) {
             return $this->record(
                 $server,
                 self::BACKOFF,
@@ -100,9 +110,13 @@ class Poller
      * last successful deploy count, so a commit that once failed and later
      * deployed starts clean. Null when it may be tried now.
      *
+     * In artifact mode a failure belongs to the release it was, not only to
+     * the commit: a republished build of the same commit (a new manifest)
+     * is tried at once.
+     *
      * @return array{failures: int, until: CarbonInterface}|null
      */
-    public function backoff(string $sha): ?array
+    public function backoff(string $sha, ?string $manifestSha256 = null): ?array
     {
         $self = Slipstream::serverName();
         $lastSuccess = (int) Deployment::query()
@@ -116,7 +130,15 @@ class Poller
             ->where('status', Deployment::STATUS_FAILED)
             ->whereRaw('lower(sha) = ?', [strtolower($sha)])
             ->orderByDesc('id')
-            ->get(['id', 'finished_at', 'updated_at']);
+            ->get(['id', 'finished_at', 'updated_at', 'meta']);
+
+        if ($manifestSha256 !== null) {
+            $failures = $failures->filter(function (Deployment $failed) use ($manifestSha256) {
+                $failedManifest = $failed->meta['artifact']['manifest_sha256'] ?? null;
+
+                return $failedManifest === null || $failedManifest === $manifestSha256;
+            })->values();
+        }
 
         if ($failures->isEmpty()) {
             return null;
@@ -175,7 +197,10 @@ class Poller
      */
     protected function record(Server $server, string $result, string $detail, ?ReleaseRef $release = null, ?Deployment $deployment = null): array
     {
-        $changed = $server->poll_result !== $result || ($release && $server->poll_seen_sha !== $release->sha);
+        $changed = $server->poll_result !== $result
+            || ($release && $server->poll_seen_sha !== $release->sha)
+            // Each distinct bad pointer gets its own line; an unchanged one does not repeat every minute.
+            || ($result === self::REFUSED && $server->poll_detail !== mb_substr($detail, 0, 1000));
 
         $server->update(array_filter([
             'poll_checked_at' => now(),
@@ -212,6 +237,22 @@ class Poller
 
         if ($max > 0) {
             sleep(random_int(0, $max));
+        }
+    }
+
+    /**
+     * In artifact mode, the manifest the ref's pointer names now.
+     */
+    protected function manifestOf(DeployRef $ref): ?string
+    {
+        if (! $this->source instanceof ArtifactSource) {
+            return null;
+        }
+
+        try {
+            return $this->source->pointer($ref)->manifestSha256;
+        } catch (\Throwable) {
+            return null;
         }
     }
 

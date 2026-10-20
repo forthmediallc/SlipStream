@@ -8,6 +8,7 @@ use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
+use Slipstream\Console\Commands\ArtifactCommand;
 use Slipstream\Console\Commands\BootstrapCommand;
 use Slipstream\Console\Commands\DatabaseCommand;
 use Slipstream\Console\Commands\DeliveriesCommand;
@@ -31,6 +32,7 @@ use Slipstream\Console\Commands\RollbackCommand;
 use Slipstream\Console\Commands\ServersCommand;
 use Slipstream\Console\Commands\SettingsCommand;
 use Slipstream\Console\Commands\StatusCommand;
+use Slipstream\Console\Commands\VerifyCommand;
 use Slipstream\Console\Commands\WebhookRangesCommand;
 use Slipstream\Console\Commands\WebhookSecretCommand;
 use Slipstream\Http\Middleware\AuthorizeSlipstream;
@@ -43,6 +45,7 @@ use Slipstream\Livewire\ProjectChrome;
 use Slipstream\Livewire\ServersPage;
 use Slipstream\Livewire\SettingsPage;
 use Slipstream\Livewire\WebhookPage;
+use Slipstream\Release\ArtifactSource;
 use Slipstream\Release\GitRefSource;
 use Slipstream\Release\ReleaseSource;
 use Slipstream\Settings\SettingsRepository;
@@ -58,7 +61,11 @@ class SlipstreamServiceProvider extends ServiceProvider
 
         // Where poll mode and bootstrap learn what to deploy. Git today; an
         // artifact source (S3 or SSM pointer to a CI-built tarball) slots in here.
-        $this->app->bindIf(ReleaseSource::class, GitRefSource::class);
+        // Where a node learns what to deploy: the git mirror, or the artifact
+        // store CI publishes to. A host app's own binding wins.
+        $this->app->bindIf(ReleaseSource::class, fn ($app) => Slipstream::artifactMode()
+            ? $app->make(ArtifactSource::class)
+            : $app->make(GitRefSource::class));
     }
 
     public function boot(): void
@@ -130,6 +137,8 @@ class SlipstreamServiceProvider extends ServiceProvider
             DatabaseCommand::class,
             BootstrapCommand::class,
             WebhookRangesCommand::class,
+            ArtifactCommand::class,
+            VerifyCommand::class,
         ]);
     }
 
@@ -245,6 +254,16 @@ class SlipstreamServiceProvider extends ServiceProvider
                 ->name('slipstream-prune')
                 ->withoutOverlapping(60)
                 ->createMutexNameUsing($perNode('slipstream-prune'));
+
+            // Artifact mode: the live release against its signed manifest,
+            // weekly — change detection for the code a node serves.
+            if (Slipstream::artifactMode() && filter_var(config('slipstream.artifacts.verify_weekly', true), FILTER_VALIDATE_BOOLEAN)) {
+                $schedule->command('slipstream:verify --audit')
+                    ->weekly()
+                    ->name('slipstream-verify')
+                    ->withoutOverlapping(60)
+                    ->createMutexNameUsing($perNode('slipstream-verify'));
+            }
         });
     }
 }

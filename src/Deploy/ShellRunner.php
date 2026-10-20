@@ -3,6 +3,7 @@
 namespace Slipstream\Deploy;
 
 use RuntimeException;
+use Slipstream\Support\HookEnvironment;
 use Symfony\Component\Process\Process;
 
 /**
@@ -98,29 +99,13 @@ class ShellRunner
     }
 
     /**
+     * What the command sees: this process's environment, or the minimal one
+     * (SLIPSTREAM_HOOK_ENV; minimal by default in artifact mode).
+     *
      * @return array<string, string>
      */
     protected function env(): array
     {
-        $env = [];
-        foreach (array_merge($_ENV, $_SERVER) as $k => $v) {
-            if (is_string($k) && is_string($v)) {
-                $env[$k] = $v;
-            }
-        }
-
-        $path = getenv('PATH') ?: '/usr/local/bin:/usr/bin:/bin';
-        $env['PATH'] = $path;
-
-        $home = getenv('HOME');
-        if (! $home && function_exists('posix_getpwuid')) {
-            $home = posix_getpwuid(posix_geteuid())['dir'] ?? null;
-        }
-        if ($home) {
-            $env['HOME'] = $home;
-            $env['COMPOSER_HOME'] = $env['COMPOSER_HOME'] ?? ($home.'/.config/composer');
-        }
-
-        return $env;
+        return HookEnvironment::build();
     }
 }

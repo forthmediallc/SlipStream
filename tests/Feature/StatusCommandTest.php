@@ -6,6 +6,7 @@ use Slipstream\Models\Deployment;
 use Slipstream\Models\Pipeline;
 use Slipstream\Models\Server;
 use Slipstream\Settings\SettingsRepository;
+use Slipstream\Tests\Support\ArtifactFixture;
 use Slipstream\Tests\TestCase;
 
 class StatusCommandTest extends TestCase
@@ -24,6 +25,25 @@ class StatusCommandTest extends TestCase
 
         Pipeline::query()->create(['name' => 'main', 'branch_pattern' => 'main', 'auto_deploy' => true, 'enabled' => true, 'server_names' => null]);
         app(SettingsRepository::class)->set('repo_url', 'git@github.com:org/app.git');
+    }
+
+    public function test_artifact_mode_shows_the_source_and_the_pointer(): void
+    {
+        $fixture = (new ArtifactFixture)->configure()->writeCheckout()->package();
+        $fixture->publish('ci');
+
+        try {
+            $this->artisan('slipstream:status')
+                ->expectsOutputToContain('artifact · disk artifacts · prefix app · environment production')
+                ->expectsOutputToContain('aaaaaaa · sequence')
+                ->assertExitCode(0);
+
+            $this->artisan('slipstream:status --json')
+                ->expectsOutputToContain('"source": "artifact"')
+                ->assertExitCode(0);
+        } finally {
+            $fixture->remove();
+        }
     }
 
     public function test_the_overview_reads_like_the_front_page(): void

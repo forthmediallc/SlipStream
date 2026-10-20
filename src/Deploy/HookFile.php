@@ -4,6 +4,7 @@ namespace Slipstream\Deploy;
 
 use RuntimeException;
 use Slipstream\Models\DeploymentHook;
+use Slipstream\Slipstream;
 
 /**
  * Deploy hooks from a file the app repository carries (slipstream-hooks.php
@@ -20,16 +21,28 @@ use Slipstream\Models\DeploymentHook;
  * after), servers (list of server names; default all), fleet_lock (run on
  * one node per commit), enabled (default true), fail_fast (default true: a
  * script of several lines gets `set -e` first, so its first failing line
- * fails the deploy rather than only its last). A "before fetch" hook cannot
+ * fails the deploy rather than only its last), where (node, the default, or
+ * build: run by `slipstream:artifact package` in CI and never on an artifact
+ * node; only on the fetch and composer steps). A "before fetch" hook cannot
  * come from here — the release it lives in does not exist yet at that point.
  */
 final class HookFile
 {
+    public const WHERE = ['node', 'build'];
+
+    /** The steps a build-time hook can attach to: what happens before the release is a tree. */
+    public const BUILD_STEPS = ['fetch', 'composer'];
+
     public static function path(string $releaseRoot): string
     {
         $file = trim((string) config('slipstream.hooks.file', 'slipstream-hooks.php'));
 
         if ($file !== '' && ($file[0] === '/' || preg_match('#^[A-Za-z]:[\\\\/]#', $file) === 1)) {
+            // Only the verified tree may supply code to a node in artifact mode.
+            if (Slipstream::artifactMode()) {
+                throw new RuntimeException("SLIPSTREAM_HOOKS_FILE is absolute ({$file}); in artifact mode the hooks file must be inside the release.");
+            }
+
             return $file;
         }
 
@@ -113,6 +126,13 @@ final class HookFile
         if (! is_bool($failFast)) {
             throw new RuntimeException("{$where} (\"{$name}\"): fail_fast must be true or false.");
         }
+        $runsWhere = $definition['where'] ?? 'node';
+        if (! is_string($runsWhere) || ! in_array($runsWhere, self::WHERE, true)) {
+            throw new RuntimeException("{$where} (\"{$name}\"): where must be node or build.");
+        }
+        if ($runsWhere === 'build' && ! in_array($step, self::BUILD_STEPS, true)) {
+            throw new RuntimeException("{$where} (\"{$name}\"): a build-time hook can only attach to fetch or composer; {$step} happens on the node.");
+        }
 
         // Applied here rather than when the hook runs, so what `slipstream:hooks`
         // lists is exactly what a deploy executes.
@@ -127,6 +147,7 @@ final class HookFile
             'sort_order' => $number,
         ]);
         $hook->source = 'file';
+        $hook->where = $runsWhere;
 
         return $hook;
     }

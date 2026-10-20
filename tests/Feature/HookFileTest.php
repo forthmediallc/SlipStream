@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Cache;
 use RuntimeException;
 use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Deploy\Deployer;
+use Slipstream\Deploy\HookFile;
 use Slipstream\Deploy\MigrationCoordinator;
 use Slipstream\Models\Deployment;
 use Slipstream\Models\DeploymentHook;
@@ -280,6 +281,74 @@ PHP);
             'npm run build',
             "set -eu\nnpm run build\nrm -rf node_modules",
         ], $this->deployer()->hooks('composer', 'after')->commands());
+    }
+
+    public function test_where_defaults_to_node_and_must_be_node_or_build_on_a_build_step(): void
+    {
+        $this->writeHooks(<<<'PHP'
+<?php
+
+return [
+    ['name' => 'Build', 'step' => 'composer', 'where' => 'build', 'script' => 'echo build'],
+    ['name' => 'Warm', 'step' => 'swap', 'position' => 'before', 'script' => 'echo warm'],
+];
+PHP);
+        $hooks = HookFile::load($this->release);
+        $this->assertSame(['build', 'node'], [$hooks[0]->where, $hooks[1]->where]);
+
+        foreach ([
+            "<?php return [['name' => 'x', 'step' => 'composer', 'where' => 'ci', 'script' => 'y']];" => 'where must be node or build',
+            "<?php return [['name' => 'x', 'step' => 'swap', 'where' => 'build', 'script' => 'y']];" => 'can only attach to fetch or composer; swap happens on the node',
+        ] as $file => $message) {
+            $this->writeHooks($file);
+            try {
+                HookFile::load($this->release);
+                $this->fail("accepted a hooks file that should say: {$message}");
+            } catch (RuntimeException $e) {
+                $this->assertStringContainsString($message, $e->getMessage());
+            }
+        }
+    }
+
+    public function test_build_time_hooks_are_skipped_on_an_artifact_node_and_node_time_hooks_run(): void
+    {
+        $this->writeHooks(<<<'PHP'
+<?php
+
+return [
+    ['name' => 'Build', 'step' => 'composer', 'where' => 'build', 'script' => '{{ npm }} run build'],
+    ['name' => 'Warm', 'step' => 'swap', 'position' => 'before', 'script' => 'echo warm'],
+];
+PHP);
+
+        // Git mode: the node is the builder and runs both.
+        $commands = $this->deployer()->hooks('composer', 'after')->hooks('swap', 'before')->commands();
+        $this->assertSame(['npm run build', 'echo warm'], $commands);
+
+        // Artifact mode: the build ran in CI; a stray build tool fails loudly.
+        config()->set('slipstream.release.source', 'artifact');
+        $commands = $this->deployer()->hooks('composer', 'after')->hooks('swap', 'before')->commands();
+        $this->assertCount(1, $commands);
+        $this->assertSame(Deployer::ARTIFACT_GUARD."\necho warm", $commands[0]);
+        $this->assertStringContainsString('npm does not run on an artifact node', Deployer::ARTIFACT_GUARD);
+    }
+
+    public function test_an_untouched_build_assets_default_is_build_time_and_an_edited_one_is_not(): void
+    {
+        DefaultHooks::seed();
+        $assets = DeploymentHook::query()->where('name', 'Build assets')->sole();
+        $this->assertSame('build', DefaultHooks::whereOf($assets));
+        $this->assertSame('node', DefaultHooks::whereOf(DeploymentHook::query()->where('name', 'Optimize (cache config, routes, views)')->sole()));
+
+        $this->artisan('slipstream:hooks list --json')
+            ->expectsOutputToContain('"where": "build"')
+            ->assertExitCode(0);
+
+        config()->set('slipstream.release.source', 'artifact');
+        $this->assertSame([], array_filter($this->deployer()->hooks('composer', 'after')->commands(), fn ($c) => str_contains($c, 'run build')), 'the stored default never builds on an artifact node');
+
+        $assets->update(['script' => "set -e\nnpm run build:custom"]);
+        $this->assertSame('node', DefaultHooks::whereOf($assets->fresh()), 'edited: the operator owns it now');
     }
 
     protected function vaultHooks(): string

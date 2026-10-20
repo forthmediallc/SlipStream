@@ -27,6 +27,9 @@ class DefaultHooks
             'position' => 'after',
             'name' => 'Build assets',
             'sort_order' => 10,
+            // Build time: CI runs it when packaging an artifact; a node in
+            // artifact mode never does.
+            'where' => 'build',
             'script' => "set -e\n"
                 ."[ -f package.json ] || exit 0\n"
                 ."if [ -f package-lock.json ]; then {{ npm }} ci --no-audit --no-fund; else {{ npm }} install --no-audit --no-fund; fi\n"
@@ -127,15 +130,56 @@ class DefaultHooks
                 continue;
             }
 
+            // `where` is not a column: a stored hook is a node hook, and an
+            // untouched default takes its built-in `where` (whereOf).
             DeploymentHook::query()->firstOrCreate(
                 [
                     'step' => $hook['step'],
                     'position' => $hook['position'],
                     'name' => $hook['name'],
                 ],
-                $hook + ['enabled' => true],
+                array_diff_key($hook, ['where' => true]) + ['enabled' => true],
             );
         }
+    }
+
+    /**
+     * Where a hook runs: a file hook says; a stored hook runs on the node,
+     * unless it is an untouched default whose built-in definition says build.
+     */
+    public static function whereOf(DeploymentHook $hook): string
+    {
+        if ($hook->source !== 'database') {
+            return $hook->where;
+        }
+
+        foreach (self::DEFAULTS as $default) {
+            if (($default['where'] ?? 'node') === 'build' && self::isUntouchedDefault($hook, $default['name'])) {
+                return 'build';
+            }
+        }
+
+        return 'node';
+    }
+
+    /**
+     * The built-in defaults as unsaved hooks, for the packager when a
+     * checkout carries no hooks file.
+     *
+     * @return list<DeploymentHook>
+     */
+    public static function builtIn(): array
+    {
+        $hooks = [];
+
+        foreach (self::DEFAULTS as $default) {
+            $hook = new DeploymentHook(array_diff_key($default, ['where' => true]) + ['enabled' => true]);
+            $hook->source = 'default';
+            $hook->where = $default['where'] ?? 'node';
+            $hooks[] = $hook;
+        }
+
+        return $hooks;
     }
 
     /**

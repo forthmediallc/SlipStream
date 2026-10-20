@@ -6,6 +6,7 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Route;
 use Slipstream\Database\Tables;
+use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Deploy\FailedReleases;
 use Slipstream\Deploy\HookScript;
 use Slipstream\Deploy\MigrationCoordinator;
@@ -17,13 +18,20 @@ use Slipstream\Environment\EnvContentMerger;
 use Slipstream\Fleet\SharedStore;
 use Slipstream\Models\DeploymentHook;
 use Slipstream\Models\Server;
+use Slipstream\Release\ArtifactSource;
+use Slipstream\Release\ArtifactStore;
+use Slipstream\Release\Core\ArtifactRefused;
+use Slipstream\Release\Core\Keys;
 use Slipstream\Release\DeployRef;
+use Slipstream\Release\ReleaseRef;
 use Slipstream\Release\ReleaseSource;
+use Slipstream\Release\ReleaseVerifier;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\PhpBinary;
 use Slipstream\Support\Sudo;
 use Slipstream\Webhooks\WebhookSourceRanges;
+use Symfony\Component\Process\ExecutableFinder;
 use Symfony\Component\Process\Process;
 
 /**
@@ -50,6 +58,10 @@ class DoctorCommand extends Command
         $checks = [
             'checkPciMode',
             'checkTrigger',
+            'checkReleaseSource',
+            'checkArtifactPointer',
+            'checkLiveRelease',
+            'checkHookSources',
             'checkMigrateStep',
             'checkHookScripts',
             'checkDatabase',
@@ -539,6 +551,10 @@ class DoctorCommand extends Command
 
     protected function checkGitAccess(string $root): CheckResult
     {
+        if (Slipstream::artifactMode()) {
+            return CheckResult::skip('git mirror', 'artifact mode: nodes never run git');
+        }
+
         $mirror = $root.DIRECTORY_SEPARATOR.'repo.git';
 
         if (! is_dir($mirror)) {
@@ -611,6 +627,10 @@ class DoctorCommand extends Command
      */
     protected function checkPackageCommitted(string $root): CheckResult
     {
+        if (Slipstream::artifactMode()) {
+            return CheckResult::skip('package committed', 'artifact mode: the packager checks the build carries the package');
+        }
+
         $mirror = $root.DIRECTORY_SEPARATOR.'repo.git';
         $branch = (string) config('slipstream.deploy.branch', 'main');
         $symptom = 'Symptom when wrong: the deploy dies at the health step with "There are no commands defined '
@@ -984,7 +1004,10 @@ class DoctorCommand extends Command
 
         try {
             $ref = DeployRef::fromConfig();
-            $release = app(ReleaseSource::class)->latest($ref);
+            // A look, not an acceptance: doctor records nothing.
+            $release = Slipstream::artifactMode()
+                ? new ReleaseRef(app(ArtifactSource::class)->pointer($ref, accept: false)->sha, $ref->name, $ref->isTag())
+                : app(ReleaseSource::class)->latest($ref);
         } catch (\Throwable $e) {
             $pool = $this->poolUser();
 
@@ -992,8 +1015,10 @@ class DoctorCommand extends Command
                 'deploy trigger',
                 'poll mode cannot read the deploy ref',
                 $e->getMessage()."\n"
-                .'The deploy user\'s key must reach origin: '
-                .($pool ? "sudo -u {$pool} " : '').'git --git-dir='.$root.DIRECTORY_SEPARATOR.'repo.git ls-remote origin'
+                .(Slipstream::artifactMode()
+                    ? 'The node must read the pointer in the store: php artisan slipstream:artifact list'
+                    : 'The deploy user\'s key must reach origin: '
+                        .($pool ? "sudo -u {$pool} " : '').'git --git-dir='.$root.DIRECTORY_SEPARATOR.'repo.git ls-remote origin')
             );
         }
 
@@ -1107,6 +1132,190 @@ class DoctorCommand extends Command
         }
 
         return CheckResult::pass('webhook source', 'restricted to '.$summary);
+    }
+
+    /**
+     * Artifact mode stands on settings a node cannot do without, each named
+     * by its variable; git mode has nothing to check here.
+     */
+    protected function checkReleaseSource(string $root): CheckResult
+    {
+        if (! Slipstream::artifactMode()) {
+            return CheckResult::skip('release source', 'git (nodes build from the mirror)');
+        }
+
+        if (! Slipstream::pollMode()) {
+            return CheckResult::fail(
+                'release source',
+                'artifact releases need SLIPSTREAM_TRIGGER=poll',
+                'A webhook names commits CI may never have built; in poll mode each node follows the signed pointer CI publishes.'
+            );
+        }
+        if (! extension_loaded('sodium')) {
+            return CheckResult::fail('release source', 'ext-sodium is not loaded', 'Nodes verify Ed25519 signatures with PHP\'s sodium extension; install it.');
+        }
+        if (Slipstream::releaseEnvironment() === null) {
+            return CheckResult::fail(
+                'release source',
+                'SLIPSTREAM_RELEASE_ENVIRONMENT is not set',
+                'Name the environment releases are signed for (production, staging); it is bound into every signature.'
+            );
+        }
+
+        try {
+            $keys = Keys::parse((string) config('slipstream.artifacts.public_keys', ''));
+        } catch (\InvalidArgumentException $e) {
+            return CheckResult::fail('release source', 'SLIPSTREAM_RELEASE_PUBLIC_KEYS: '.$e->getMessage());
+        }
+        if ($keys->count() === 0) {
+            return CheckResult::fail(
+                'release source',
+                'SLIPSTREAM_RELEASE_PUBLIC_KEYS is empty',
+                'slipstream:artifact keygen prints a pair: CI signs with the secret, every node verifies with the public key.'
+            );
+        }
+
+        $store = app(ArtifactStore::class);
+        if (! $store->isConfigured()) {
+            return CheckResult::fail(
+                'release source',
+                'SLIPSTREAM_ARTIFACTS_DISK '.($store->diskName() === '' ? 'is not set' : 'names "'.$store->diskName().'", which config/filesystems.php does not define'),
+                'Name the disk CI publishes to (an S3 bucket read through the VPC endpoint with the instance role).'
+            );
+        }
+
+        try {
+            if (DeployRef::fromConfig()->kind === DeployRef::TAGS) {
+                return CheckResult::fail(
+                    'release source',
+                    'the deploy ref is a tag pattern',
+                    'CI publishes a pointer for one ref: SLIPSTREAM_DEPLOY_REF=refs/heads/production or refs/tags/v1.2.0.'
+                );
+            }
+        } catch (\Throwable) {
+            // The trigger check reports a malformed ref.
+        }
+
+        return CheckResult::pass(
+            'release source',
+            'artifact · disk "'.$store->diskName().'"'.($store->prefix() !== '' ? ' · prefix '.$store->prefix() : '')
+            .' · environment '.Slipstream::releaseEnvironment().' · keys '.implode(', ', $keys->ids())
+        );
+    }
+
+    /**
+     * The pointer the node would follow, checked but not accepted.
+     */
+    protected function checkArtifactPointer(string $root): CheckResult
+    {
+        if (! Slipstream::artifactMode()) {
+            return CheckResult::skip('artifact pointer', 'git mode');
+        }
+
+        try {
+            $pointer = app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), accept: false);
+        } catch (ArtifactRefused $e) {
+            return CheckResult::fail(
+                'artifact pointer',
+                'refused: '.$e->reason,
+                'The pointer in the store does not pass this node\'s checks. Publish again (slipstream:artifact publish), and find out who wrote that one.'
+            );
+        } catch (\Throwable $e) {
+            return CheckResult::fail(
+                'artifact pointer',
+                $e->getMessage(),
+                'The node must read the store: the instance role needs s3:GetObject on the bucket, through the VPC endpoint.'
+            );
+        }
+
+        $published = strtotime($pointer->publishedAt);
+        if ($published !== false && $published > time() + 86400) {
+            return CheckResult::warn('artifact pointer', "{$pointer->ref} → {$pointer->short()} · published {$pointer->publishedAt}, in the future", 'Check the clock on the node and in CI.');
+        }
+
+        return CheckResult::pass('artifact pointer', "{$pointer->ref} → {$pointer->short()} · sequence {$pointer->sequence} · published {$pointer->publishedAt} by {$pointer->by} · key {$pointer->keyId}");
+    }
+
+    /**
+     * The live release against its signed manifest: the same check
+     * slipstream:verify runs weekly.
+     */
+    protected function checkLiveRelease(string $root): CheckResult
+    {
+        if (! Slipstream::artifactMode()) {
+            return CheckResult::skip('live release', 'git mode: releases carry no manifest');
+        }
+
+        $current = $root.DIRECTORY_SEPARATOR.'current';
+        if (! is_dir($current)) {
+            return CheckResult::skip('live release', 'nothing deployed yet');
+        }
+
+        $verifier = app(ReleaseVerifier::class);
+        $result = $verifier->verify(realpath($current) ?: $current);
+
+        if (! $result['manifest']) {
+            return CheckResult::warn('live release', 'carries no manifest (deployed from git)', 'The next artifact deploy brings one; until then slipstream:verify has nothing to compare.');
+        }
+        if ($result['ok']) {
+            return CheckResult::pass('live release', "matches its signed manifest ({$result['files']} files, key {$result['key_id']})");
+        }
+
+        return CheckResult::fail(
+            'live release',
+            (string) $verifier->problemWith(realpath($current) ?: $current),
+            "php artisan slipstream:verify lists every path. A release that changed under its manifest is not the release CI signed:\n"
+            .'redeploy it (php artisan slipstream:deploy) and find out what wrote to it.'
+        );
+    }
+
+    /**
+     * On an artifact node the signed release is the one place code should
+     * come from: stored hooks are an unsigned path, and build tools have no
+     * business being installed at all in a CDE.
+     */
+    protected function checkHookSources(string $root): CheckResult
+    {
+        if (! Slipstream::artifactMode()) {
+            return CheckResult::skip('hook sources', 'git mode');
+        }
+
+        $warnings = [];
+
+        try {
+            $stored = DeploymentHook::query()->where('enabled', true)->get()
+                ->filter(fn (DeploymentHook $hook) => ! DefaultHooks::isUntouchedDefault($hook))
+                ->count();
+        } catch (\Throwable) {
+            $stored = 0;
+        }
+        if ($stored > 0) {
+            $warnings[] = "{$stored} stored hook(s) run unsigned";
+        }
+
+        $tools = [];
+        if (Slipstream::pciMode()) {
+            $finder = new ExecutableFinder;
+            foreach (['git', 'composer', 'npm'] as $bin) {
+                if ($finder->find($bin) !== null) {
+                    $tools[] = $bin;
+                }
+            }
+            if ($tools !== []) {
+                $warnings[] = implode(', ', $tools).' on PATH';
+            }
+        }
+
+        if ($warnings === []) {
+            return CheckResult::pass('hook sources', 'the signed release\'s hooks file only'.(Slipstream::pciMode() ? '; no build tools on PATH' : ''));
+        }
+
+        return CheckResult::warn(
+            'hook sources',
+            implode('; ', $warnings),
+            ($stored > 0 ? "Move stored hooks into slipstream-hooks.php, which ships inside the signed release (slipstream:hooks list shows them).\n" : '')
+            .($tools !== [] ? 'An artifact node needs no build tool; leave them out of the image so nothing can build in the CDE.' : '')
+        );
     }
 
     /**

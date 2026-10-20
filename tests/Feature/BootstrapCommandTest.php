@@ -269,6 +269,22 @@ class BootstrapCommandTest extends TestCase
         $this->assertCount(1, $this->runner->ran);
     }
 
+    public function test_in_artifact_mode_bootstrap_needs_no_mirror_and_never_provisions_one(): void
+    {
+        rmdir($this->root.DIRECTORY_SEPARATOR.'repo.git');
+        config()->set('slipstream.release.source', 'artifact');
+        config()->set('slipstream.release.environment', 'production');
+        config()->set('slipstream.trigger.ref', 'refs/heads/production');
+        $this->source->at(self::TAGGED, 'production');
+
+        $this->artisan('slipstream:bootstrap')
+            ->expectsOutputToContain('Ready: serving 2222222.')
+            ->assertExitCode(0);
+
+        $this->assertDirectoryDoesNotExist($this->root.DIRECTORY_SEPARATOR.'repo.git');
+        $this->assertSame(self::TAGGED, $this->running());
+    }
+
     public function test_a_failing_health_check_keeps_the_instance_out(): void
     {
         $this->health->ok = false;

@@ -147,8 +147,20 @@ class InstallCommand extends Command
         }
 
         $this->components->info('Slipstream installed.');
-        $this->components->bulletList($pci ? [
+        $releases = null;
+        if (Slipstream::artifactMode()) {
+            $keys = 0;
+            try {
+                $keys = \Slipstream\Release\Core\Keys::parse((string) config('slipstream.artifacts.public_keys', ''))->count();
+            } catch (\Throwable) {
+                // doctor names the problem
+            }
+            $releases = 'Releases:  artifact · disk "'.((string) config('slipstream.artifacts.disk') ?: 'unset').'" · '.$keys.' public key(s) · nodes never run git, composer or npm';
+        }
+
+        $this->components->bulletList(array_values(array_filter($pci ? [
             $trigger,
+            $releases,
             'PCI mode:  on — no dashboard, .env editor, env sync, relay or fleet queue on this server',
             $database,
             "Hooks:     {$hooks}",
@@ -156,10 +168,11 @@ class InstallCommand extends Command
         ] : [
             "Dashboard: /{$path} (local-only until you define Slipstream::auth or viewSlipstream gate)",
             $trigger,
+            $releases,
             $database,
             "Hooks:     {$hooks}",
             'Next:      php artisan slipstream:provision  (server bootstrap)',
-        ]);
+        ])));
 
         if ($pci && $tables->sameDatabase($connection, $tables->defaultConnection())) {
             $this->components->warn('Deployments, heartbeats and webhook deliveries are being written to the app database. To keep them out of it, give Slipstream its own: SLIPSTREAM_DB_CONNECTION (README → PCI mode).');

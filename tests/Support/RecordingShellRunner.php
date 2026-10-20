@@ -22,6 +22,14 @@ class RecordingShellRunner extends ShellRunner
     /** @var (Closure(string): void)|null */
     public ?Closure $during = null;
 
+    /**
+     * Commands containing one of these really run (the symlink swap, so a
+     * deploy test ends with a live release).
+     *
+     * @var list<string>
+     */
+    public array $passthrough = [];
+
     public function run(
         array|string $command,
         ?string $cwd = null,
@@ -31,6 +39,12 @@ class RecordingShellRunner extends ShellRunner
     ): array {
         $display = is_string($command) ? $command : implode(' ', $command);
         $this->commands[] = ['command' => $display, 'cwd' => $cwd, 'step' => $step, 'timeout' => $timeout];
+
+        foreach ($this->passthrough as $needle) {
+            if (str_contains($display, $needle)) {
+                return parent::run($command, $cwd, $step, $timeout, $throw);
+            }
+        }
 
         if ($this->during !== null) {
             ($this->during)($display);

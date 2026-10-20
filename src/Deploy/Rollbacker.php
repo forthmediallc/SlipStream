@@ -7,6 +7,7 @@ use Slipstream\Fleet\Heartbeat;
 use Slipstream\Fleet\NodeHold;
 use Slipstream\Models\Deployment;
 use Slipstream\Notifications\DeployNotifier;
+use Slipstream\Release\ReleaseVerifier;
 use Slipstream\Slipstream;
 use Slipstream\Support\PhpBinary;
 use Slipstream\Support\Sudo;
@@ -73,6 +74,16 @@ class Rollbacker
 
             if ($prev === null) {
                 throw new RuntimeException('No release older than the current one to roll back to.');
+            }
+
+            // Artifact mode: the older release must still be the release its
+            // signed manifest describes before anything is pointed at it.
+            if (Slipstream::artifactMode()) {
+                $problem = app(ReleaseVerifier::class)->problemWith($prev);
+                if ($problem !== null) {
+                    throw new RuntimeException("Refusing to roll back onto {$prev}: {$problem}");
+                }
+                $this->log->info('The release to roll back onto matches its signed manifest.');
             }
 
             $live = realpath($this->current) ?: '';

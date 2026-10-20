@@ -2,21 +2,27 @@
 # Bring a brand-new instance up with Slipstream, from a launch script.
 #
 # Before the first release exists there is no artisan to run, so this makes a
-# throwaway checkout with its dependencies, runs slipstream:bootstrap from it
-# (tables, registry, mirror, the deploy ref deployed and health-checked), and
-# removes the checkout. The release bootstrap builds is a normal one; the
-# second composer install it does mostly comes from composer's local cache.
+# throwaway checkout, runs slipstream:bootstrap from it (tables, registry, the
+# deploy ref deployed and health-checked), and removes the checkout.
 #
-# The checkout is the deploy ref itself, read from the shared .env: the branch
-# or tag SLIPSTREAM_DEPLOY_REF names (SLIPSTREAM_BRANCH when it is unset), or,
-# for a tag pattern, the highest version tag matching it. Composer's scripts
-# and artisan run with the production .env, so nothing but released code runs
-# before the first release. BOOTSTRAP_BRANCH (a branch or tag) overrides it.
+# Git mode (the default): the checkout is the deploy ref itself, read from the
+# shared .env — the branch or tag SLIPSTREAM_DEPLOY_REF names (SLIPSTREAM_BRANCH
+# when it is unset), or, for a tag pattern, the highest version tag matching it
+# — with its dependencies installed. Composer's scripts and artisan run with
+# the production .env, so nothing but released code runs before the first
+# release. BOOTSTRAP_BRANCH (a branch or tag) overrides it.
+#
+# Artifact mode (SLIPSTREAM_RELEASE_SOURCE=artifact in the shared .env): the
+# checkout is the release CI built, fetched from ARTIFACTS and verified with
+# slipstream-release.php — the signed pointer, the signed manifest, the
+# archive's hash and every file's — before anything in it runs. No git, no
+# composer, no deploy key.
 #
 # Run it as the deploy user — the PHP-FPM pool user — never as root, or the
 # releases and the mirror it creates belong to the wrong user:
 #
 #   sudo -u deploy APP_ROOT=/var/www/app REPO=git@github.com:org/app.git sh slipstream-bootstrap.sh
+#   sudo -u deploy APP_ROOT=/var/www/app ARTIFACTS=s3://app-releases/production sh slipstream-bootstrap.sh
 #
 # Options for slipstream:bootstrap, such as --no-fallback, go after the script
 # name or in BOOTSTRAP_ARGS.
@@ -24,17 +30,17 @@
 # Exits non-zero unless the node can serve, so a lifecycle hook can keep the
 # instance out of the load balancer until it succeeds. Safe to run again.
 #
-# Needs: git, composer, php, the deploy key for $REPO in ~/.ssh, and the shared
-# .env already at $APP_ROOT/.env (SLIPSTREAM_TRIGGER, SLIPSTREAM_DEPLOY_REF,
-# SLIPSTREAM_REPOSITORY and the rest).
+# Needs: php and the shared .env already at $APP_ROOT/.env. Git mode: git,
+# composer, the deploy key for $REPO in ~/.ssh. Artifact mode: the AWS CLI for
+# an s3:// store, and slipstream-release.php beside this script (RELEASE_TOOL).
 set -eu
 
 : "${APP_ROOT:?set APP_ROOT to the layout root, e.g. /var/www/app}"
-: "${REPO:?set REPO to the repository, e.g. git@github.com:org/app.git}"
 PHP="${PHP:-php}"
 COMPOSER="${COMPOSER:-composer}"
 BOOTSTRAP_BRANCH="${BOOTSTRAP_BRANCH:-}"
 BOOTSTRAP_ARGS="${BOOTSTRAP_ARGS:-}"
+RELEASE_TOOL="${RELEASE_TOOL:-$(dirname "$0")/slipstream-release.php}"
 
 if [ ! -f "$APP_ROOT/.env" ]; then
     echo "slipstream-bootstrap: no shared .env at $APP_ROOT/.env" >&2
@@ -51,60 +57,112 @@ env_value() {
               -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
 }
 
-# What to check out: BOOTSTRAP_BRANCH, else what the deploy ref names now.
-checkout="$BOOTSTRAP_BRANCH"
-if [ -z "$checkout" ]; then
-    ref=$(env_value SLIPSTREAM_DEPLOY_REF)
-    if [ -z "$ref" ]; then
-        branch=$(env_value SLIPSTREAM_BRANCH)
-        ref="refs/heads/${branch:-main}"
-    fi
-
-    name=${ref#refs/heads/}
-    name=${name#refs/tags/}
-
-    case "$name" in
-        *\**|*\?*|*\[*)
-            # A tag pattern: the highest version tag matching it, by the rules
-            # slipstream:bootstrap picks with (pre-releases only when allowed).
-            checkout=$(git ls-remote --tags --refs "$REPO" \
-                | PATTERN="$name" PRERELEASES="$(env_value SLIPSTREAM_DEPLOY_PRERELEASES)" "$PHP" -r '
-                    $best = null;
-                    foreach (preg_split("/\R/", stream_get_contents(STDIN)) as $line) {
-                        if (preg_match("#^[0-9a-f]{40}(?:[0-9a-f]{24})?\s+refs/tags/(\S+)$#i", trim($line), $m) !== 1
-                            || ! fnmatch(getenv("PATTERN"), $m[1])) {
-                            continue;
-                        }
-                        $version = ltrim(preg_replace("#^.*/#", "", $m[1]), "vV");
-                        if (preg_match("/^\d+(\.\d+)*([.-].*)?$/", $version) !== 1
-                            || (! filter_var(getenv("PRERELEASES"), FILTER_VALIDATE_BOOLEAN)
-                                && preg_match("/-|alpha|beta|rc|dev|pre/i", $version) === 1)) {
-                            continue;
-                        }
-                        if ($best === null || version_compare($version, $best[1], ">")) {
-                            $best = [$m[1], $version];
-                        }
-                    }
-                    echo $best[0] ?? "";
-                ')
-            if [ -z "$checkout" ]; then
-                echo "slipstream-bootstrap: no tag on $REPO matches $name" >&2
-                exit 1
-            fi
-            ;;
-        *)
-            checkout=$name
-            ;;
-    esac
+# The deploy ref, as the shared .env names it.
+ref=$(env_value SLIPSTREAM_DEPLOY_REF)
+if [ -z "$ref" ]; then
+    branch=$(env_value SLIPSTREAM_BRANCH)
+    ref="refs/heads/${branch:-main}"
 fi
+case "$ref" in
+    refs/heads/*|refs/tags/*) ;;
+    *\**|*\?*|*\[*) ref="refs/tags/$ref" ;;
+    *) ref="refs/heads/$ref" ;;
+esac
+name=${ref#refs/heads/}
+name=${name#refs/tags/}
 
 work=$(mktemp -d "$APP_ROOT/.bootstrap.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "slipstream-bootstrap: checking out $checkout"
-git clone --quiet --depth 1 --branch "$checkout" "$REPO" "$work/app"
+if [ "$(env_value SLIPSTREAM_RELEASE_SOURCE)" = "artifact" ]; then
+    : "${ARTIFACTS:?set ARTIFACTS to the store, e.g. s3://bucket/prefix (or file:///dir)}"
+    if [ ! -f "$RELEASE_TOOL" ]; then
+        echo "slipstream-bootstrap: no slipstream-release.php at $RELEASE_TOOL (RELEASE_TOOL)" >&2
+        exit 1
+    fi
+    case "$name" in
+        *\**|*\?*|*\[*)
+            echo "slipstream-bootstrap: tag patterns are unsupported in artifact mode; CI publishes one ref ($ref)" >&2
+            exit 1
+            ;;
+    esac
+    keys=$(env_value SLIPSTREAM_RELEASE_PUBLIC_KEYS)
+    environment=$(env_value SLIPSTREAM_RELEASE_ENVIRONMENT)
+    if [ -z "$keys" ] || [ -z "$environment" ]; then
+        echo "slipstream-bootstrap: SLIPSTREAM_RELEASE_PUBLIC_KEYS and SLIPSTREAM_RELEASE_ENVIRONMENT must be set in the shared .env" >&2
+        exit 1
+    fi
+
+    # One object from the store to a local file.
+    fetch() {
+        case "$ARTIFACTS" in
+            s3://*) aws s3 cp "${ARTIFACTS%/}/$1" "$2" --quiet ;;
+            file://*) cp "${ARTIFACTS#file://}/$1" "$2" ;;
+            *) echo "slipstream-bootstrap: ARTIFACTS must be s3://bucket/prefix or file:///dir" >&2; exit 1 ;;
+        esac
+    }
+
+    echo "slipstream-bootstrap: reading the pointer for $ref"
+    fetch "$ref.json" "$work/pointer.json"
+    # Prints sha=, manifest_sha256=, sequence=, previous_sha= — hex and digits
+    # only. The assignment carries the tool's exit status, so a refusal stops
+    # the script here with that status.
+    facts=$("$PHP" "$RELEASE_TOOL" verify-pointer --ref="$ref" --environment="$environment" --keys="$keys" --pointer="$work/pointer.json")
+    eval "$facts"
+
+    echo "slipstream-bootstrap: fetching release $sha"
+    fetch "releases/$sha/manifest.json" "$work/manifest.json"
+    fetch "releases/$sha/manifest.sig" "$work/manifest.sig"
+    fetch "releases/$sha/release.tar.gz" "$work/release.tar.gz"
+    "$PHP" "$RELEASE_TOOL" verify-release --sha="$sha" --manifest-sha256="$manifest_sha256" --environment="$environment" --keys="$keys" \
+        --manifest="$work/manifest.json" --signature="$work/manifest.sig" --archive="$work/release.tar.gz" --extract-to="$work/app"
+    rm -f "$work/release.tar.gz"
+else
+    : "${REPO:?set REPO to the repository, e.g. git@github.com:org/app.git}"
+
+    # What to check out: BOOTSTRAP_BRANCH, else what the deploy ref names now.
+    checkout="$BOOTSTRAP_BRANCH"
+    if [ -z "$checkout" ]; then
+        case "$name" in
+            *\**|*\?*|*\[*)
+                # A tag pattern: the highest version tag matching it, by the rules
+                # slipstream:bootstrap picks with (pre-releases only when allowed).
+                checkout=$(git ls-remote --tags --refs "$REPO" \
+                    | PATTERN="$name" PRERELEASES="$(env_value SLIPSTREAM_DEPLOY_PRERELEASES)" "$PHP" -r '
+                        $best = null;
+                        foreach (preg_split("/\R/", stream_get_contents(STDIN)) as $line) {
+                            if (preg_match("#^[0-9a-f]{40}(?:[0-9a-f]{24})?\s+refs/tags/(\S+)$#i", trim($line), $m) !== 1
+                                || ! fnmatch(getenv("PATTERN"), $m[1])) {
+                                continue;
+                            }
+                            $version = ltrim(preg_replace("#^.*/#", "", $m[1]), "vV");
+                            if (preg_match("/^\d+(\.\d+)*([.-].*)?$/", $version) !== 1
+                                || (! filter_var(getenv("PRERELEASES"), FILTER_VALIDATE_BOOLEAN)
+                                    && preg_match("/-|alpha|beta|rc|dev|pre/i", $version) === 1)) {
+                                continue;
+                            }
+                            if ($best === null || version_compare($version, $best[1], ">")) {
+                                $best = [$m[1], $version];
+                            }
+                        }
+                        echo $best[0] ?? "";
+                    ')
+                if [ -z "$checkout" ]; then
+                    echo "slipstream-bootstrap: no tag on $REPO matches $name" >&2
+                    exit 1
+                fi
+                ;;
+            *)
+                checkout=$name
+                ;;
+        esac
+    fi
+
+    echo "slipstream-bootstrap: checking out $checkout"
+    git clone --quiet --depth 1 --branch "$checkout" "$REPO" "$work/app"
+fi
 
 ln -s "$APP_ROOT/.env" "$work/app/.env"
 if [ -f "$APP_ROOT/auth.json" ]; then
@@ -124,10 +182,16 @@ done
 rm -rf "$work/app/storage"
 ln -s "$APP_ROOT/storage" "$work/app/storage"
 
-(cd "$work/app" && "$COMPOSER" install --no-dev --no-interaction --prefer-dist --no-progress --quiet)
+if [ "$(env_value SLIPSTREAM_RELEASE_SOURCE)" != "artifact" ]; then
+    (cd "$work/app" && "$COMPOSER" install --no-dev --no-interaction --prefer-dist --no-progress --quiet)
+fi
 
 cd "$work/app"
 # BOOTSTRAP_ARGS is a list of options: split on purpose, never globbed.
 set -f
 # shellcheck disable=SC2086
-SLIPSTREAM_APP_ROOT="$APP_ROOT" "$PHP" artisan slipstream:bootstrap --repo="$REPO" --no-interaction $BOOTSTRAP_ARGS "$@"
+if [ "$(env_value SLIPSTREAM_RELEASE_SOURCE)" = "artifact" ]; then
+    SLIPSTREAM_APP_ROOT="$APP_ROOT" "$PHP" artisan slipstream:bootstrap --no-interaction $BOOTSTRAP_ARGS "$@"
+else
+    SLIPSTREAM_APP_ROOT="$APP_ROOT" "$PHP" artisan slipstream:bootstrap --repo="$REPO" --no-interaction $BOOTSTRAP_ARGS "$@"
+fi

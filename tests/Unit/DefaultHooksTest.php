@@ -2,6 +2,7 @@
 
 namespace Slipstream\Tests\Unit;
 
+use Illuminate\Database\Eloquent\Model;
 use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Deploy\HookScript;
 use Slipstream\Models\ActivityLog;
@@ -82,6 +83,18 @@ class DefaultHooksTest extends TestCase
         $this->assertFalse($assets->enabled, 'only the text changes');
         $this->assertSame('echo custom', DeploymentHook::query()->where('name', 'Restart Horizon')->sole()->script);
         $this->assertTrue(ActivityLog::query()->where('action', 'hook.defaults_upgraded')->exists());
+    }
+
+    public function test_seeding_strips_where_even_under_strict_models(): void
+    {
+        Model::preventSilentlyDiscardingAttributes();
+
+        try {
+            DefaultHooks::seed();
+            $this->assertSame(count(DefaultHooks::DEFAULTS), DeploymentHook::query()->count());
+        } finally {
+            Model::preventSilentlyDiscardingAttributes(false);
+        }
     }
 
     public function test_no_previous_text_equals_the_current_one(): void
