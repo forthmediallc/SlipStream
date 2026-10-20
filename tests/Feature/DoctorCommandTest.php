@@ -3,7 +3,10 @@
 namespace Slipstream\Tests\Feature;
 
 use Illuminate\Support\Facades\Http;
+use Slipstream\Models\DeploymentHook;
+use Slipstream\Settings\SettingsRepository;
 use Slipstream\Tests\TestCase;
+use Slipstream\Webhooks\WebhookSourceRanges;
 
 class DoctorCommandTest extends TestCase
 {
@@ -234,6 +237,54 @@ class DoctorCommandTest extends TestCase
         if (posix_geteuid() === 0) {
             $this->markTestSkipped('root can write anything; nothing to prove.');
         }
+    }
+
+    public function test_a_stored_hook_of_several_lines_without_set_e_is_a_warning(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        DeploymentHook::query()->create([
+            'step' => 'composer', 'position' => 'after', 'name' => 'Build docs',
+            'script' => "npm run docs\nrm -rf node_modules", 'enabled' => true, 'sort_order' => 10,
+        ]);
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('without set -e: "Build docs" (#')
+            ->assertExitCode(1); // the bare layout fails elsewhere
+    }
+
+    public function test_a_keyword_never_downloaded_fails_the_webhook_source_check(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        config()->set('slipstream.webhook.allowed_ips', ['github']);
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('github ranges never downloaded')
+            ->assertExitCode(1);
+    }
+
+    public function test_stale_ranges_are_a_warning(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        config()->set('slipstream.webhook.allowed_ips', ['github']);
+        app(SettingsRepository::class)->set(WebhookSourceRanges::SETTING, ['github' => [
+            'cidrs' => ['140.82.112.0/20'], 'etag' => null, 'fetched_at' => now()->subDays(3)->toIso8601String(),
+            'last_attempt_at' => null, 'last_error' => null,
+        ]]);
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('restricted to github (1 ranges · downloaded 3 days ago)')
+            ->expectsOutputToContain('older than 48 hours')
+            ->assertExitCode(1);
+    }
+
+    public function test_an_entry_that_is_neither_address_nor_keyword_fails(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        config()->set('slipstream.webhook.allowed_ips', ['gitlab']);
+
+        $this->artisan('slipstream:doctor')
+            ->expectsOutputToContain('neither an address nor a provider keyword')
+            ->assertExitCode(1);
     }
 
     protected function otherPosixUser(): string

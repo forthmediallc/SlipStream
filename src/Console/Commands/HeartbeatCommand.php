@@ -4,12 +4,15 @@ namespace Slipstream\Console\Commands;
 
 use Illuminate\Console\Command;
 use Slipstream\Database\Tables;
+use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Deploy\StuckDeploymentsSweeper;
 use Slipstream\Environment\EnvSync;
 use Slipstream\Fleet\DeployQueue;
 use Slipstream\Fleet\Heartbeat;
 use Slipstream\Fleet\Poller;
+use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
+use Slipstream\Webhooks\WebhookSourceRanges;
 
 class HeartbeatCommand extends Command
 {
@@ -17,7 +20,7 @@ class HeartbeatCommand extends Command
 
     protected $description = 'Register / refresh this node in the Slipstream fleet registry';
 
-    public function handle(Heartbeat $heartbeat, EnvSync $sync, DeployQueue $queue, StuckDeploymentsSweeper $sweeper, Tables $tables, Poller $poller): int
+    public function handle(Heartbeat $heartbeat, EnvSync $sync, DeployQueue $queue, StuckDeploymentsSweeper $sweeper, Tables $tables, Poller $poller, SettingsRepository $settings, WebhookSourceRanges $ranges): int
     {
         // A node with its own Slipstream database keeps that schema current
         // itself: the app's migrations table is shared, and says a migration
@@ -37,6 +40,30 @@ class HeartbeatCommand extends Command
             ($server->current_sha ? substr($server->current_sha, 0, 7) : 'no-sha')
             .' · '.$server->last_heartbeat_at?->toDateTimeString()
         );
+
+        // A release that changes a seeded hook's text reaches existing installs
+        // here: install seeds only what is missing, and nobody re-runs it.
+        // Once per database, before any deploy this minute starts.
+        try {
+            $upgraded = DefaultHooks::upgradeOnce($settings);
+            if ($upgraded !== null) {
+                $this->components->twoColumnDetail('default hooks', $upgraded.' brought up to date');
+            }
+        } catch (\Throwable $e) {
+            $this->components->twoColumnDetail('default hooks', 'error: '.$e->getMessage());
+        }
+
+        // The git hosts' hook ranges behind the allow-list keywords, when one
+        // is due. Webhook mode only: poll mode has no hook to restrict.
+        if (! Slipstream::pollMode()) {
+            try {
+                foreach ($ranges->refreshIfDue() as $result) {
+                    $this->components->twoColumnDetail('webhook ranges '.$result['keyword'], $result['detail']);
+                }
+            } catch (\Throwable $e) {
+                $this->components->twoColumnDetail('webhook ranges', 'error: '.$e->getMessage());
+            }
+        }
 
         // Apply any .env push queued for this node (the reliable backstop for
         // the instant nudge). Never let it fail the heartbeat.

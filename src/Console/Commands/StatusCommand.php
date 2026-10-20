@@ -63,7 +63,7 @@ class StatusCommand extends Command
         $relay = filter_var($settings->get('relay_enabled', false), FILTER_VALIDATE_BOOLEAN);
         $syncOn = EnvSync::enabled();
         $pendingPushes = $syncOn ? EnvPush::query()->where('status', EnvPush::STATUS_PENDING)->count() : 0;
-        $hook = url('/'.Slipstream::path().'/hooks/deploy');
+        $hook = Slipstream::hookUrl('deploy');
 
         if ($this->option('json')) {
             $this->json([

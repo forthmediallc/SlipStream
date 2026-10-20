@@ -27,4 +27,17 @@ class ConfigAndRoutingTest extends TestCase
 
         $this->get('/slipstream/deployments/not-a-number')->assertNotFound();
     }
+
+    public function test_the_hooks_path_defaults_to_under_the_dashboard(): void
+    {
+        $this->assertSame('slipstream/hooks', Slipstream::hooksPath());
+        $this->assertSame('http://localhost/slipstream/hooks/deploy', Slipstream::hookUrl('deploy'));
+
+        config()->set('slipstream.path', 'deploys');
+        $this->assertSame('deploys/hooks', Slipstream::hooksPath());
+
+        config()->set('slipstream.hooks_path', '/_hooks/');
+        $this->assertSame('_hooks', Slipstream::hooksPath());
+        $this->assertSame('_hooks/relay', Slipstream::hookPath('relay'));
+    }
 }

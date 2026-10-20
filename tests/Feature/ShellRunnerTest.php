@@ -4,6 +4,7 @@ namespace Slipstream\Tests\Feature;
 
 use RuntimeException;
 use Slipstream\Deploy\EventLogger;
+use Slipstream\Deploy\HookScript;
 use Slipstream\Deploy\ShellRunner;
 use Slipstream\Models\Deployment;
 use Slipstream\Tests\TestCase;
@@ -72,5 +73,23 @@ class ShellRunnerTest extends TestCase
 
         $this->assertSame(0, $code);
         $this->assertStringContainsString('hello', $buffer);
+    }
+
+    /**
+     * The real shell, so the fix is proven where it matters: `sh -c` reports
+     * the last line's status, and `set -e` first makes the first failure the
+     * script's.
+     */
+    public function test_a_failing_line_only_fails_the_script_with_set_e(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('needs a POSIX sh.');
+        }
+
+        [$code] = $this->runner()->run("false\ntrue", throw: false);
+        $this->assertSame(0, $code, 'the trap: the last line decides');
+
+        [$code] = $this->runner()->run(HookScript::withFailFast("false\ntrue"), throw: false);
+        $this->assertNotSame(0, $code);
     }
 }

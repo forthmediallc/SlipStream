@@ -943,23 +943,14 @@ class Deployer
      */
     protected function renderHookScript(string $script): string
     {
-        $release = $this->releasePath ?? $this->appRoot;
-
-        return strtr($script, [
-            '{{ release }}' => $release,
-            '{{release}}' => $release,
-            '{{ sha }}' => (string) $this->sha,
-            '{{sha}}' => (string) $this->sha,
-            '{{ branch }}' => $this->branch,
-            '{{branch}}' => $this->branch,
-            '{{ app_root }}' => $this->appRoot,
-            '{{app_root}}' => $this->appRoot,
-            '{{ php }}' => $this->php,
-            '{{php}}' => $this->php,
-            '{{ npm }}' => $this->npm,
-            '{{npm}}' => $this->npm,
-            '{{ composer }}' => $this->composer,
-            '{{composer}}' => $this->composer,
+        return HookScript::render($script, [
+            'release' => $this->releasePath ?? $this->appRoot,
+            'sha' => (string) $this->sha,
+            'branch' => $this->branch,
+            'app_root' => $this->appRoot,
+            'php' => $this->php,
+            'npm' => $this->npm,
+            'composer' => $this->composer,
         ]);
     }
 

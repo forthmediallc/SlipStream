@@ -141,7 +141,7 @@ class InstallCommand extends Command
         try {
             $trigger = Slipstream::pollMode()
                 ? 'Trigger:   poll · '.DeployRef::fromConfig()->describe().' (no webhook route)'
-                : "Webhook:   /{$path}/hooks/deploy".($pci ? ' (the only route registered in PCI mode)' : '');
+                : 'Webhook:   /'.Slipstream::hookPath('deploy').($pci ? ' (the only route registered in PCI mode)' : '');
         } catch (\Throwable $e) {
             $trigger = 'Trigger:   poll · invalid SLIPSTREAM_DEPLOY_REF: '.$e->getMessage();
         }

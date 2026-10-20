@@ -11,7 +11,7 @@
         <p>
             Deployments may be triggered in three ways: manually using <strong>Deploy</strong>, by a push to a matching pipeline branch, or by a signed request to the webhook URL:
         </p>
-        <div class="ss-info-url">{{ url('/'.\Slipstream\Slipstream::path().'/hooks/deploy') }}</div>
+        <div class="ss-info-url">{{ \Slipstream\Slipstream::hookUrl('deploy') }}</div>
         <p class="ss-muted ss-small" style="margin-top:0.35rem">
             Configure the shared secret on the <a href="{{ route('slipstream.webhook') }}">Webhook</a> page. Optional
             <code>sha</code> or <code>branch</code> query parameters override what Slipstream will deploy when using the HTTP trigger path from your git host payload.

@@ -65,7 +65,8 @@ class DeployNudgeCommand extends Command
             ->where('base_url', '!=', '')
             ->get();
 
-        $path = trim(Slipstream::path(), '/');
+        // This node's hooks path: a fleet shares the setting.
+        $path = Slipstream::hookPath('deploy-sync');
         $timeout = (int) config('slipstream.webhook.relay.timeout', 5);
 
         $body = json_encode(['batch' => $batch ?: null, 'from_server' => $self], JSON_THROW_ON_ERROR);
@@ -74,7 +75,7 @@ class DeployNudgeCommand extends Command
 
         $sent = 0;
         foreach ($peers as $peer) {
-            $url = rtrim($peer->base_url, '/').'/'.$path.'/hooks/deploy-sync';
+            $url = rtrim($peer->base_url, '/').'/'.$path;
 
             try {
                 Http::timeout($timeout)

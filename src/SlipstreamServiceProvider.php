@@ -31,6 +31,7 @@ use Slipstream\Console\Commands\RollbackCommand;
 use Slipstream\Console\Commands\ServersCommand;
 use Slipstream\Console\Commands\SettingsCommand;
 use Slipstream\Console\Commands\StatusCommand;
+use Slipstream\Console\Commands\WebhookRangesCommand;
 use Slipstream\Console\Commands\WebhookSecretCommand;
 use Slipstream\Http\Middleware\AuthorizeSlipstream;
 use Slipstream\Livewire\DeployHooksPage;
@@ -128,6 +129,7 @@ class SlipstreamServiceProvider extends ServiceProvider
             SettingsCommand::class,
             DatabaseCommand::class,
             BootstrapCommand::class,
+            WebhookRangesCommand::class,
         ]);
     }
 
@@ -154,17 +156,27 @@ class SlipstreamServiceProvider extends ServiceProvider
         // The static except() arrived mid-11.x; older versions fall back to the
         // per-route exclusion alone.
         if (method_exists($middleware, 'except')) {
-            $middleware::except([Slipstream::path().'/hooks/*']);
+            $middleware::except([Slipstream::hooksPath().'/*']);
         }
     }
 
+    /**
+     * Two groups on the same domain and middleware: the hook endpoints under
+     * Slipstream::hooksPath() ({path}/hooks unless SLIPSTREAM_HOOKS_PATH moves
+     * them out from under an SSO proxy), then the dashboard under {path}.
+     */
     protected function registerRoutes(): void
     {
-        Route::group([
+        $shared = [
             'domain' => config('slipstream.domain'),
-            'prefix' => config('slipstream.path', 'slipstream'),
             'middleware' => config('slipstream.middleware', ['web']),
-        ], function () {
+        ];
+
+        Route::group($shared + ['prefix' => Slipstream::hooksPath()], function () {
+            $this->loadRoutesFrom(__DIR__.'/../routes/hooks.php');
+        });
+
+        Route::group($shared + ['prefix' => config('slipstream.path', 'slipstream')], function () {
             $this->loadRoutesFrom(__DIR__.'/../routes/web.php');
         });
     }

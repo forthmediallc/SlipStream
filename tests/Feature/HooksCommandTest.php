@@ -167,4 +167,13 @@ class HooksCommandTest extends TestCase
             ->expectsOutputToContain('Unknown action')
             ->assertExitCode(1);
     }
+
+    public function test_adding_a_multi_line_script_without_set_e_warns(): void
+    {
+        file_put_contents($this->dir.DIRECTORY_SEPARATOR.'build.sh', "npm run build\nrm -rf node_modules\n");
+
+        $this->artisan('slipstream:hooks', ['action' => 'add', '--step' => 'composer', '--name' => 'Build docs', '--script-file' => $this->dir.DIRECTORY_SEPARATOR.'build.sh'])
+            ->expectsOutputToContain('no `set -e`')
+            ->assertExitCode(0);
+    }
 }

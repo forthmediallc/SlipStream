@@ -18,7 +18,9 @@ use Slipstream\Models\DeploymentHook;
  *
  * Keys: name, step and script (required); position (before|after, default
  * after), servers (list of server names; default all), fleet_lock (run on
- * one node per commit), enabled (default true). A "before fetch" hook cannot
+ * one node per commit), enabled (default true), fail_fast (default true: a
+ * script of several lines gets `set -e` first, so its first failing line
+ * fails the deploy rather than only its last). A "before fetch" hook cannot
  * come from here — the release it lives in does not exist yet at that point.
  */
 final class HookFile
@@ -107,12 +109,18 @@ final class HookFile
         if ($servers !== null && (! is_array($servers) || array_filter($servers, fn ($s) => ! is_string($s)) !== [])) {
             throw new RuntimeException("{$where} (\"{$name}\"): servers must be a list of server names.");
         }
+        $failFast = $definition['fail_fast'] ?? true;
+        if (! is_bool($failFast)) {
+            throw new RuntimeException("{$where} (\"{$name}\"): fail_fast must be true or false.");
+        }
 
+        // Applied here rather than when the hook runs, so what `slipstream:hooks`
+        // lists is exactly what a deploy executes.
         $hook = new DeploymentHook([
             'step' => $step,
             'position' => $position,
             'name' => $name,
-            'script' => $script,
+            'script' => $failFast ? HookScript::withFailFast($script) : $script,
             'fleet_lock' => (bool) ($definition['fleet_lock'] ?? false),
             'enabled' => (bool) ($definition['enabled'] ?? true),
             'server_names' => $servers === null ? null : array_values($servers),

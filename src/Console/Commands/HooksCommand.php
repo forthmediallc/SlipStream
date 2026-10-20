@@ -9,6 +9,7 @@ use Slipstream\Console\Commands\Concerns\FormatsConsoleOutput;
 use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Deploy\DeploySteps;
 use Slipstream\Deploy\HookFile;
+use Slipstream\Deploy\HookScript;
 use Slipstream\Deploy\MigrationCoordinator;
 use Slipstream\Models\DeploymentHook;
 use Slipstream\Slipstream;
@@ -122,7 +123,7 @@ class HooksCommand extends Command
                 $h->name.(($why = $skipped($h)) ? " ({$why})" : ''),
                 $h->server_names ? implode(', ', $h->server_names) : 'all',
                 $h->fleet_lock ? 'fleet' : '—',
-                $this->truncate(strtok((string) $h->script, "\n") ?: '', 48).(str_contains((string) $h->script, "\n") ? ' …' : ''),
+                $this->truncate(HookScript::firstCommand((string) $h->script), 48).(HookScript::isMultiLine((string) $h->script) ? ' …' : ''),
             ])->all()
         );
         if ($fileHooks !== null) {
@@ -185,6 +186,7 @@ class HooksCommand extends Command
 
         Activity::log('hook.added', ['step' => $hook->step, 'position' => $hook->position, 'name' => $hook->name, 'via' => 'cli']);
         $this->components->info("Hook #{$hook->id} \"{$hook->name}\" added: {$hook->position} {$hook->step}.");
+        $this->warnUnlessFailFast($hook);
 
         return self::SUCCESS;
     }
@@ -211,8 +213,20 @@ class HooksCommand extends Command
 
         Activity::log('hook.updated', ['id' => $hook->id, 'name' => $hook->name, 'via' => 'cli']);
         $this->components->info("Hook #{$hook->id} \"{$hook->name}\" updated.");
+        $this->warnUnlessFailFast($hook);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * The moment an operator can act on it: a script of several lines
+     * without `set -e` reports only its last line's status.
+     */
+    protected function warnUnlessFailFast(DeploymentHook $hook): void
+    {
+        if (HookScript::isMultiLine((string) $hook->script) && ! HookScript::failsFast((string) $hook->script)) {
+            $this->components->warn('This script has several lines and no `set -e`: the shell reports only the last line\'s status, so an earlier failure would not fail the deploy. Put `set -e` first, or join the lines with &&.');
+        }
     }
 
     protected function toggle(DeploymentHook $hook, bool $enabled): int

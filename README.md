@@ -96,6 +96,7 @@ Published as `config/slipstream.php`:
 | `path` | Dashboard URL segment (default `slipstream`) |
 | `domain` | Optional subdomain for the dashboard |
 | `middleware` | Route middleware (default `['web']`) |
+| `hooks_path` | Where the hook endpoints are served; null = `{path}/hooks` (`SLIPSTREAM_HOOKS_PATH`). See [Behind an SSO proxy](#behind-an-sso-proxy) |
 | `local_open` | Allow any origin in `local` when no gate is set (`SLIPSTREAM_LOCAL_OPEN`, default off) |
 | `database.connection` | Connection for Slipstream's own tables; null = the app default (`SLIPSTREAM_DB_CONNECTION`). See [Slipstream's own database](#slipstreams-own-database) |
 | `webhook.allow_redeploy_same_sha` | Let a webhook redeploy the commit already live here (default off) |
@@ -107,7 +108,8 @@ Published as `config/slipstream.php`:
 | `deploy.pending_stuck_minutes` | Fail a deploy still `pending` after N minutes — its process never started (default 5) |
 | `pci.enabled` | [PCI mode](#pci-mode): provider webhook only, no dashboard / `.env` editor / env sync / peer traffic (`SLIPSTREAM_PCI_MODE`) |
 | `pci.sentinel_keys` | `.env` keys that mark a CDE server; `doctor` fails when one is present and PCI mode is off (`SLIPSTREAM_PCI_SENTINEL_KEYS`) |
-| `webhook.allowed_ips` | IPs/CIDRs the provider hook accepts deliveries from; empty = any (`SLIPSTREAM_WEBHOOK_ALLOWED_IPS`) |
+| `webhook.allowed_ips` | Sources the provider hook accepts deliveries from: IPs, CIDRs and the keywords `github` / `bitbucket`; empty = any (`SLIPSTREAM_WEBHOOK_ALLOWED_IPS`). See [Restricting the hook's source](#restricting-the-hooks-source) |
+| `webhook.ranges_refresh_hours` / `webhook.ranges_stale_hours` | How often a keyword's published ranges are downloaded (default 6) and when doctor calls them old (default 48) (`SLIPSTREAM_WEBHOOK_RANGES_REFRESH_HOURS`, `…_STALE_HOURS`) |
 | `audit.enabled` / `audit.channel` | Structured audit lines to a log channel — on in PCI mode by default (`SLIPSTREAM_AUDIT_LOG`, `SLIPSTREAM_AUDIT_LOG_CHANNEL`) |
 | `trigger.*` | `webhook` (default) or `poll`, the deploy ref, the repository, poll interval, jitter and back-off (`SLIPSTREAM_TRIGGER`, `SLIPSTREAM_DEPLOY_REF`, …). See [Poll mode](#poll-mode-and-auto-scaling-groups) |
 | `migrations.*` | The migrate step: a command run once per commit across the fleet, whether this node runs it, how long others wait (`SLIPSTREAM_MIGRATE_COMMAND`, `SLIPSTREAM_RUN_MIGRATIONS`, `SLIPSTREAM_MIGRATE_WAIT`) |
@@ -193,7 +195,8 @@ Dashboard → **Webhook** shows the endpoint and secret for this server. (In
 [poll mode](#poll-mode-and-auto-scaling-groups) there is no webhook: each node finds new
 releases itself.)
 
-- **URL:** `POST https://your-app/slipstream/hooks/deploy` (path is configurable)
+- **URL:** `POST https://your-app/slipstream/hooks/deploy` (`SLIPSTREAM_PATH` sets the prefix;
+  `SLIPSTREAM_HOOKS_PATH` moves the hook endpoints elsewhere, see below)
 - **GitHub:** push events, secret = HMAC (`X-Hub-Signature-256`)
 - **GitLab:** Push Hook, secret = token (`X-Gitlab-Token`)
 - **Bitbucket:** repo:push, secret = HMAC (`X-Hub-Signature`)
@@ -208,6 +211,23 @@ Peer traffic (relay, env-sync nudges, deploy-sync nudges) is signed with the **f
 not the webhook secret — see [Two secrets](#two-secrets).
 
 Without relay, add the same webhook URL once per server (each must be reachable without a single shared load-balanced VIP stealing the hook).
+
+### Behind an SSO proxy
+
+An SSO proxy in front of the dashboard (Cloudflare Access, say) must not stand in front of the
+git host's deliveries, or GitHub gets a login page instead of the hook. Either exempt every hook
+endpoint — all of `/slipstream/hooks/*`: `deploy`, and `relay`, `env-sync` and `deploy-sync`,
+which carry your own nodes' traffic — or move them out from under the dashboard prefix:
+
+```dotenv
+SLIPSTREAM_HOOKS_PATH=_hooks        # the hooks answer at /_hooks/deploy, /_hooks/relay, …
+```
+
+Then protect `/slipstream/*` as a whole. Every node of a fleet must share the value, because
+peers address each other's relay and nudge endpoints with it, and like `SLIPSTREAM_PATH` it is
+baked into a cached route table (`route:clear`, or a deploy). Behind Cloudflare, the source
+allow-list only sees GitHub's address when `TrustProxies` trusts Cloudflare's published ranges
+and nothing else: with `*` anyone can forge `X-Forwarded-For` past the list.
 
 ## Dashboard
 
@@ -249,14 +269,15 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 | `slipstream:pipelines` | Pipelines: `list`, `add --name= --branch=`, `edit`, `enable`/`disable`, `delete` |
 | `slipstream:settings` | `show`, or `set --repo= --branch= --keep-releases= --shared-path=in:on --mail= --slack-url= … --relay=on\|off` |
 | `slipstream:webhook-secret` | Show (`--reveal`) or replace (`--rotate`) the webhook secret; `--rotate-fleet-key` separates or rotates the fleet key |
+| `slipstream:webhook-ranges` | The git hosts' hook ranges behind the `github` / `bitbucket` allow-list keywords: `show`, `refresh [keyword]` |
 | `slipstream:database` | Where Slipstream's records live: `status`, `copy --to=<connection>`, `drop-source` — moves them off the app database; `ensure` brings a node's own Slipstream database up to this version's schema |
 | `slipstream:provision` | Deploy key, bare mirror, directory layout; `--adopt` converts a live checkout into the first release |
 | `slipstream:bootstrap` | Bring a new instance up: tables, registry, mirror, the deploy ref deployed and health-checked; exits non-zero unless the node can serve. See [Bootstrapping a new instance](#bootstrapping-a-new-instance) |
-| `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access, webhook reachability and the PCI-mode checks — with the fix for each |
+| `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access, webhook reachability and source, hook scripts and the PCI-mode checks — with the fix for each |
 | `slipstream:deploy` | Run a deploy here (or `--deployment=`); `--sha=` pins a commit, `--tag=` deploys a tag, `--skip-hooks=1,2` skips hooks once, `--fleet` is the dashboard's fleet-wide Deploy. In poll mode, with nothing named, it deploys the deploy ref's commit now |
 | `slipstream:rollback` | Point `current` at the previous release; `--fleet` rolls every eligible server back to its own previous release. In poll mode it also pins the node |
 | `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom); prints the release it ran in |
-| `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, and fail deploys orphaned by a killed process; in poll mode, check the deploy ref and start a deploy when it moved (scheduled every minute) |
+| `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, fail deploys orphaned by a killed process, bring untouched seeded hooks current after an upgrade, download due provider hook ranges; in poll mode, check the deploy ref and start a deploy when it moved (scheduled every minute) |
 | `slipstream:prune` | Trim old deploy events + webhook deliveries + terminal env pushes; fail stuck deploys/applies; forget long-silent servers when `SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS` is set (scheduled daily) |
 | `slipstream:relay` | Fan a stored relay payload out to peers (spawned detached; not run by hand) |
 | `slipstream:env-apply` | Apply this node’s queued shared `.env` push (spawned detached by a nudge; also the manual escape hatch) |
@@ -292,6 +313,10 @@ Manual escape hatch if the app is hard-down: run `php artisan slipstream:deploy`
   `SLIPSTREAM_RESTART_HORIZON` / `SLIPSTREAM_RESTART_REVERB` (`true`/`false`).
 - Relay fan-out is signed with a domain-separated, timestamped HMAC (replay-protected) and
   dispatched in a detached process, so the git provider always gets a fast `200`.
+- `SLIPSTREAM_HOOKS_PATH`, when set, must be identical on every node: peers append it to each
+  other's Base URL. The provider hook ranges behind an allow-list keyword are downloaded once
+  per shared database (any node's heartbeat serves the fleet); a PCI node with a database of
+  its own downloads its own.
 - **Scoped `.env` updates.** The Environment editor can write this server only, selected
   servers, or the whole fleet. Cross-server pushes are queued in the shared DB (the source
   of truth) and applied by each node’s minute heartbeat; peers with a **Base URL** also get
@@ -321,7 +346,7 @@ that doesn't extend Laravel's is beyond a package's reach. Add the exclusion you
 `bootstrap/app.php`:
 
 ```php
-$middleware->validateCsrfTokens(except: ['slipstream/hooks/*']);
+$middleware->validateCsrfTokens(except: ['slipstream/hooks/*']);   // or '<SLIPSTREAM_HOOKS_PATH>/*'
 ```
 
 `slipstream:doctor` POSTs to your own hook URL and reports which case you are in: `401` means
@@ -389,10 +414,28 @@ auto-detection, which defaulted `php_binary` to `PHP_BINARY` (re-publish it with
 `php artisan slipstream:publish --config`). The first line of every detach log records the exact
 command that was launched.
 
+**A hook's command failed but the deploy succeeded.** A hook script runs through `sh -c`, which
+reports only its *last* line's status: in a script of several lines a failed `npm run build`
+followed by `rm -rf node_modules` passes. Put `set -e` on the first line, or join the lines with
+`&&`. Since 0.5.2 the seeded defaults do, hooks from the release's hooks file get it
+automatically (unless they set `'fail_fast' => false`), and `slipstream:doctor` names stored hooks
+that still lack it.
+
+**Every delivery is refused with `source not allowed`.** The allow-list rejected the address it
+saw; `slipstream:deliveries` shows which. Behind a proxy or load balancer that is the proxy's
+address until `TrustProxies` trusts it. With a provider keyword (`github`, `bitbucket`) in the
+list, a keyword whose ranges were never downloaded matches nothing: `slipstream:webhook-ranges
+show` says so, `slipstream:webhook-ranges refresh` downloads them now, and the minute heartbeat
+keeps them current.
+
+**GitHub gets a redirect or an HTML login page from the hook.** An SSO proxy in front of the
+dashboard is in front of the hook too. Exempt `/slipstream/hooks/*` there, or move the hooks out
+from under the dashboard with `SLIPSTREAM_HOOKS_PATH` — see [Behind an SSO proxy](#behind-an-sso-proxy).
+
 ## Security notes
 
-- The hook endpoints (`/hooks/deploy`, `/hooks/relay`, `/hooks/env-sync`, `/hooks/deploy-sync`)
-  are the only unauthenticated routes: HMAC/token verified, CSRF-exempt (so provider POSTs work
+- The hook endpoints (`/hooks/deploy`, `/hooks/relay`, `/hooks/env-sync`, `/hooks/deploy-sync`,
+  under `SLIPSTREAM_HOOKS_PATH` when that is set) are the only unauthenticated routes: HMAC/token verified, CSRF-exempt (so provider POSTs work
   out of the box), rate limited, and body-capped. No host-app CSRF configuration is required in
   the common case — if your app registers its own CSRF middleware that doesn't extend Laravel's,
   see [Troubleshooting](#troubleshooting).
@@ -586,18 +629,27 @@ The signature is the control that matters; an allow-list is the second one an as
 for on an unauthenticated route:
 
 ```dotenv
-SLIPSTREAM_WEBHOOK_ALLOWED_IPS=<ips or CIDRs, comma-separated>
+SLIPSTREAM_WEBHOOK_ALLOWED_IPS=github,bitbucket,10.0.0.0/8     # keywords, IPs and CIDRs
 ```
 
 A delivery from any other address is refused with `403` before its body is read and recorded
-in the delivery log naming the address seen. GitHub publishes its hook ranges under `hooks` at
-`https://api.github.com/meta` and says they change over time; Bitbucket Cloud's are at
-`https://ip-ranges.atlassian.com/`; GitLab.com's are in its documentation. Refresh the list
-when a delivery is rejected. Behind a proxy or load balancer the app must trust it (Laravel's
-`TrustProxies`), or the address Slipstream sees is the proxy's and every delivery is refused —
-the rejected row tells you which address it saw. An `allow`/`deny` block on the hook
-`location` in nginx does the same job (`stubs/nginx-slipstream.conf` has one); in PCI mode
-`slipstream:doctor` warns when the in-app list is empty, which is expected if nginx does it.
+in the delivery log naming the address seen. The keywords stand for the provider's published
+hook ranges, which change over time: GitHub's under `hooks` at `https://api.github.com/meta`,
+Bitbucket Cloud's at `https://ip-ranges.atlassian.com/` (its egress ranges). The minute
+heartbeat downloads them every `SLIPSTREAM_WEBHOOK_RANGES_REFRESH_HOURS` (default 6) with an
+ETag, so an unchanged list costs no rate limit, and keeps the last good list when a download
+fails. A keyword never downloaded matches nothing, so every delivery is refused until the first
+download: run `php artisan slipstream:webhook-ranges refresh` right after adding one, or wait a
+minute. `slipstream:webhook-ranges show` prints what is stored; `slipstream:doctor` fails while a
+keyword has no ranges and warns once they are older than `SLIPSTREAM_WEBHOOK_RANGES_STALE_HOURS`
+(default 48). GitLab.com publishes no hook ranges, so there is no `gitlab` keyword: paste its
+documented addresses.
+
+Behind a proxy or load balancer the app must trust it (Laravel's `TrustProxies`), or the address
+Slipstream sees is the proxy's and every delivery is refused — the rejected row tells you which
+address it saw. An `allow`/`deny` block on the hook `location` in nginx does the same job
+(`stubs/nginx-slipstream.conf` has one); in PCI mode `slipstream:doctor` warns when the in-app
+list is empty, which is expected if nginx does it.
 
 ### Audit log
 
@@ -622,7 +674,10 @@ output, `.env` contents or settings values.
   database (in every mode it fails a connection that is undefined, unreachable or missing the
   tables, and a SQLite file the pool user cannot write).
 - **webhook source** — warns in PCI mode when `SLIPSTREAM_WEBHOOK_ALLOWED_IPS` is empty
-  (skipped in poll mode, which has no hook).
+  (skipped in poll mode, which has no hook); with a list, fails on an entry that is neither an
+  address nor a keyword and on a keyword never downloaded (both refuse every delivery), warns
+  when a keyword's ranges are old.
+- **hook scripts** — warns about stored hooks of several lines without `set -e`, in every mode.
 - **PCI sentinel keys** — `pci.sentinel_keys` (config, so committed and shared by every
   server) names `.env` keys only a CDE server holds, e.g. the vault database host or a gateway
   credential ARN. A server that has one of them with PCI mode off **fails** the check: that is
@@ -763,7 +818,8 @@ return [
 
 Each hook takes `name`, `step` and `script` (required); `position` (`before` or `after`, default
 `after`); `servers` (a list of server names, default every node); `fleet_lock` (one node per
-commit runs it); and `enabled`. Steps run in this order: `fetch`, `link_shared`, `composer`,
+commit runs it); `enabled`; and `fail_fast` (default true: a script of several lines gets
+`set -e` first, so its first failing line fails the deploy rather than only its last). Steps run in this order: `fetch`, `link_shared`, `composer`,
 `migrate`, `health`, `swap`, `fpm`, `prune`. Scripts take the same placeholders as stored hooks:
 `{{ php }}`, `{{ composer }}`, `{{ npm }}`, `{{ release }}`, `{{ sha }}`, `{{ branch }}`,
 `{{ app_root }}`.
@@ -965,6 +1021,22 @@ in place of git) are not part of 0.5. Releases are found through an interface,
 falls back only with a source that also implements `Slipstream\Release\ReleaseHistory`.
 
 ## Upgrading
+
+### To 0.5.2
+
+- **Multi-line default hooks now fail fast.** The seeded "Build assets", "Restart Horizon" and
+  "Restart Reverb" scripts begin with `set -e`, so a failing `npm run build` fails the deploy
+  instead of passing on `rm -rf node_modules`'s status. Untouched copies on existing installs
+  are brought up to date in place by `install`, `bootstrap`, or the first heartbeat after the
+  upgrade (once per database, recorded as `default_hooks_version`); a copy you edited is left
+  alone — add `set -e` yourself, and `slipstream:doctor` points at stored hooks that lack it.
+- **Multi-line scripts in `slipstream-hooks.php` fail fast too**, unless a hook sets
+  `'fail_fast' => false`. Single-line scripts are untouched.
+- `SLIPSTREAM_WEBHOOK_ALLOWED_IPS` accepts `github` and `bitbucket`. After adding a keyword run
+  `php artisan slipstream:webhook-ranges refresh`, or wait a minute for the heartbeat; until the
+  first download the hook refuses every delivery.
+- `SLIPSTREAM_HOOKS_PATH` is optional; unset, the hook endpoints stay at `{path}/hooks/*`.
+- No migration.
 
 ### To 0.5.1
 

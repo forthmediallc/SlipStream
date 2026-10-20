@@ -3,6 +3,7 @@
 namespace Slipstream\Webhooks\Providers;
 
 use Illuminate\Http\Request;
+use Slipstream\Slipstream;
 use Slipstream\Support\PeerSignature;
 use Slipstream\Webhooks\PushEvent;
 use Slipstream\Webhooks\RelayFanout;
@@ -23,7 +24,7 @@ class RelayProvider implements ProviderInterface
     {
         return $request->hasHeader('X-Slipstream-Signature')
             || $request->header('X-Slipstream-Relay') === '1'
-            || $request->is('*/hooks/relay');
+            || $request->is(Slipstream::hookPath('relay'));
     }
 
     public function parse(Request $request, string $rawBody, ?string $secret): PushEvent

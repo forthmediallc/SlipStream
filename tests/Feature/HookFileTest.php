@@ -172,6 +172,7 @@ class HookFileTest extends TestCase
             "<?php return ['build' => ['name' => 'x', 'step' => 'composer', 'script' => 'y']];" => 'must return a list',
             "<?php return [['step' => 'composer', 'script' => 'y']];" => 'needs a name',
             "<?php return [['name' => 'x', 'step' => 'fetch', 'position' => 'before', 'script' => 'y']];" => 'before-fetch',
+            "<?php return [['name' => 'x', 'step' => 'composer', 'script' => 'y', 'fail_fast' => 'no']];" => 'fail_fast must be true or false',
             '<?php return [' => 'could not be loaded',
         ] as $file => $message) {
             $this->writeHooks($file);
@@ -229,6 +230,56 @@ class HookFileTest extends TestCase
         if (function_exists('opcache_invalidate')) {
             @opcache_invalidate($this->release.DIRECTORY_SEPARATOR.'slipstream-hooks.php', true);
         }
+    }
+
+    public function test_the_seeded_build_hook_runs_under_set_e(): void
+    {
+        DefaultHooks::seed();
+
+        $build = array_values(array_filter(
+            $this->deployer()->hooks('composer', 'after')->commands(),
+            fn ($c) => str_contains($c, 'run build')
+        ));
+
+        $this->assertCount(1, $build);
+        $this->assertStringStartsWith("set -e\n", $build[0]);
+    }
+
+    /**
+     * An install upgraded to 0.5.2 whose heartbeat has not run yet still
+     * holds the 0.5.1 text of "Build assets": still a default, still steps
+     * aside for the file.
+     */
+    public function test_an_earlier_untouched_default_still_steps_aside_for_the_file(): void
+    {
+        DefaultHooks::seed();
+        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => DefaultHooks::PREVIOUS['Build assets'][0]]);
+        $this->writeHooks($this->vaultHooks());
+
+        $commands = $this->deployer()->hooks('composer', 'after')->commands();
+
+        $this->assertSame([], array_filter($commands, fn ($c) => str_contains($c, 'run build')));
+    }
+
+    public function test_a_multi_line_file_hook_fails_fast_unless_it_opts_out(): void
+    {
+        $this->writeHooks(<<<'PHP'
+<?php
+
+return [
+    ['name' => 'Two lines', 'step' => 'composer', 'script' => "npm run build\nrm -rf node_modules"],
+    ['name' => 'Opted out', 'step' => 'composer', 'script' => "npm run build\nrm -rf node_modules", 'fail_fast' => false],
+    ['name' => 'One line', 'step' => 'composer', 'script' => 'npm run build'],
+    ['name' => 'Already', 'step' => 'composer', 'script' => "set -eu\nnpm run build\nrm -rf node_modules"],
+];
+PHP);
+
+        $this->assertSame([
+            "set -e\nnpm run build\nrm -rf node_modules",
+            "npm run build\nrm -rf node_modules",
+            'npm run build',
+            "set -eu\nnpm run build\nrm -rf node_modules",
+        ], $this->deployer()->hooks('composer', 'after')->commands());
     }
 
     protected function vaultHooks(): string

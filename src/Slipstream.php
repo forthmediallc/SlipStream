@@ -235,6 +235,35 @@ class Slipstream
     }
 
     /**
+     * Where the hook endpoints live (no leading slash): SLIPSTREAM_HOOKS_PATH,
+     * else under the dashboard at {path}/hooks. Separate so an SSO proxy in
+     * front of the dashboard can leave the git host's deliveries alone.
+     */
+    public static function hooksPath(): string
+    {
+        $configured = trim((string) config('slipstream.hooks_path', ''), '/');
+
+        return $configured !== '' ? $configured : static::path().'/hooks';
+    }
+
+    /**
+     * The path of one hook endpoint (deploy, relay, env-sync, deploy-sync).
+     */
+    public static function hookPath(string $endpoint): string
+    {
+        return static::hooksPath().'/'.ltrim($endpoint, '/');
+    }
+
+    /**
+     * Its URL on this app, whether or not the route is registered here (poll
+     * and PCI mode register fewer), which is what install and status show.
+     */
+    public static function hookUrl(string $endpoint): string
+    {
+        return url('/'.static::hookPath($endpoint));
+    }
+
+    /**
      * Whether a dashboard section is enabled. Defaults to true when the key is
      * absent so a config published before a section existed doesn't 404 a nav
      * link the layout still renders.

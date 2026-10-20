@@ -86,7 +86,8 @@ class RelayFanout
             return [];
         }
 
-        $path = trim(Slipstream::path(), '/');
+        // This node's hooks path: a fleet shares the setting.
+        $path = Slipstream::hookPath('relay');
         $body = json_encode($fields, JSON_THROW_ON_ERROR);
         $timestamp = (string) time();
         $nonce = (string) ($fields['delivery_id'] ?? bin2hex(random_bytes(8)));
@@ -102,7 +103,7 @@ class RelayFanout
             ->get();
 
         foreach ($peers as $peer) {
-            $url = rtrim($peer->base_url, '/').'/'.$path.'/hooks/relay';
+            $url = rtrim($peer->base_url, '/').'/'.$path;
 
             try {
                 $response = Http::timeout($timeout)

@@ -2,9 +2,12 @@
 
 namespace Slipstream\Tests\Feature;
 
+use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Fleet\Heartbeat;
 use Slipstream\Models\Deployment;
+use Slipstream\Models\DeploymentHook;
 use Slipstream\Models\Server;
+use Slipstream\Settings\SettingsRepository;
 use Slipstream\Tests\TestCase;
 
 class HeartbeatTest extends TestCase
@@ -52,5 +55,31 @@ class HeartbeatTest extends TestCase
         $this->assertSame(Deployment::STATUS_FAILED, $stuck->fresh()->status);
         $this->assertStringContainsString('watchdog', $stuck->fresh()->failure_reason);
         $this->assertSame(Deployment::STATUS_BUILDING, $fresh->fresh()->status, 'a running deploy must be left alone');
+    }
+
+    /**
+     * An install upgraded to 0.5.2 still holds the earlier "Build assets"
+     * text; install seeds only what is missing, so the heartbeat brings the
+     * untouched copy up to date — once, keyed on a setting.
+     */
+    public function test_the_heartbeat_upgrades_earlier_default_hooks_once(): void
+    {
+        DefaultHooks::seed();
+        $old = DefaultHooks::PREVIOUS['Build assets'][0];
+        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => $old, 'enabled' => false]);
+
+        $this->artisan('slipstream:heartbeat')
+            ->expectsOutputToContain('1 brought up to date')
+            ->assertExitCode(0);
+
+        $hook = DeploymentHook::query()->where('name', 'Build assets')->sole();
+        $this->assertStringStartsWith("set -e\n", $hook->script);
+        $this->assertFalse($hook->enabled, 'only the text changes');
+        $this->assertSame((string) DefaultHooks::VERSION, app(SettingsRepository::class)->get(DefaultHooks::VERSION_SETTING));
+
+        // The old text put back by hand: the version flag is the only trigger.
+        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => $old]);
+        $this->artisan('slipstream:heartbeat')->assertExitCode(0);
+        $this->assertSame($old, DeploymentHook::query()->where('name', 'Build assets')->sole()->script);
     }
 }

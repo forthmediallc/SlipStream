@@ -77,4 +77,19 @@ class CsrfExclusionTest extends TestCase
 
         $this->assertContains('deploys/hooks/*', $this->neverVerify());
     }
+
+    public function test_it_follows_the_hooks_path_setting(): void
+    {
+        if (! method_exists($this->csrfClass(), 'except')) {
+            $this->markTestSkipped('this Laravel version has no static CSRF exclusion.');
+        }
+
+        $this->csrfClass()::flushState();
+
+        config()->set('slipstream.hooks_path', '_hooks');
+        (new \Slipstream\SlipstreamServiceProvider($this->app))->boot();
+
+        $this->assertContains('_hooks/*', $this->neverVerify());
+        $this->assertNotContains('slipstream/hooks/*', $this->neverVerify());
+    }
 }

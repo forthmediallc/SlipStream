@@ -67,7 +67,7 @@ class WebhookSecretCommand extends Command
         }
 
         if (! $reveal) {
-            $this->components->twoColumnDetail('Hook URL', url('/'.Slipstream::path().'/hooks/deploy'));
+            $this->components->twoColumnDetail('Hook URL', Slipstream::hookUrl('deploy'));
             $this->components->twoColumnDetail(
                 'Fleet key',
                 $settings->hasSeparatePeerSecret() ? 'separate from the webhook secret' : 'falls back to the webhook secret'

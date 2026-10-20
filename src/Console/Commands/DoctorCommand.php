@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Route;
 use Slipstream\Database\Tables;
 use Slipstream\Deploy\FailedReleases;
+use Slipstream\Deploy\HookScript;
 use Slipstream\Deploy\MigrationCoordinator;
 use Slipstream\Diagnostics\CheckResult;
 use Slipstream\Diagnostics\ComposerLockCheck;
@@ -14,6 +15,7 @@ use Slipstream\Diagnostics\FpmPool;
 use Slipstream\Diagnostics\Ownership;
 use Slipstream\Environment\EnvContentMerger;
 use Slipstream\Fleet\SharedStore;
+use Slipstream\Models\DeploymentHook;
 use Slipstream\Models\Server;
 use Slipstream\Release\DeployRef;
 use Slipstream\Release\ReleaseSource;
@@ -21,6 +23,7 @@ use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
 use Slipstream\Support\PhpBinary;
 use Slipstream\Support\Sudo;
+use Slipstream\Webhooks\WebhookSourceRanges;
 use Symfony\Component\Process\Process;
 
 /**
@@ -48,6 +51,7 @@ class DoctorCommand extends Command
             'checkPciMode',
             'checkTrigger',
             'checkMigrateStep',
+            'checkHookScripts',
             'checkDatabase',
             'checkPoolUser',
             'checkPhpBinary',
@@ -687,7 +691,7 @@ class DoctorCommand extends Command
         try {
             $url = route('slipstream.hooks.deploy');
         } catch (\Throwable) {
-            $url = url('/'.Slipstream::path().'/hooks/deploy');
+            $url = Slipstream::hookUrl('deploy');
         }
 
         try {
@@ -711,7 +715,7 @@ class DoctorCommand extends Command
                 'webhook endpoint',
                 '419 — CSRF middleware is intercepting the hook',
                 "The host app's CSRF middleware is defeating the package's route-level exclusion. Add:\n"
-                ."  \$middleware->validateCsrfTokens(except: ['".Slipstream::path()."/hooks/*']);\n"
+                ."  \$middleware->validateCsrfTokens(except: ['".Slipstream::hooksPath()."/*']);\n"
                 .'to bootstrap/app.php. GitHub deliveries fail with 419 until this is done.'
             ),
             $status === 404 => CheckResult::fail(
@@ -887,7 +891,7 @@ class DoctorCommand extends Command
         $allowed = Slipstream::webhookAllowedIps();
 
         if ($allowed !== []) {
-            return CheckResult::pass('webhook source', 'restricted to '.implode(', ', $allowed));
+            return $this->checkWebhookSourceList($allowed);
         }
 
         if (! Slipstream::pciMode()) {
@@ -1054,5 +1058,89 @@ class DoctorCommand extends Command
         }
 
         return CheckResult::pass('migrate step', "{$command} · {$where} · lock store ".SharedStore::name()." · held {$ttl}s");
+    }
+
+    /**
+     * The configured list, entry by entry. An entry that is neither an
+     * address nor a keyword matches nothing; a keyword never downloaded
+     * matches nothing either, and both refuse every delivery. Doctor never
+     * downloads: it reports what the heartbeat has done.
+     *
+     * @param  list<string>  $allowed
+     */
+    protected function checkWebhookSourceList(array $allowed): CheckResult
+    {
+        $ranges = app(WebhookSourceRanges::class);
+        $resolved = $ranges->resolve($allowed);
+
+        if ($resolved['unknown'] !== []) {
+            return CheckResult::fail(
+                'webhook source',
+                '"'.implode('", "', $resolved['unknown']).'" is neither an address nor a provider keyword',
+                'Entries are IPs, CIDRs, github or bitbucket. GitLab.com publishes no hook ranges: paste its documented'."\n"
+                .'addresses instead. As it stands the entry matches nothing, so deliveries from it are refused.'
+            );
+        }
+
+        if ($resolved['missing'] !== []) {
+            return CheckResult::fail(
+                'webhook source',
+                implode(', ', $resolved['missing']).' ranges never downloaded — every delivery is refused',
+                "Download them now: php artisan slipstream:webhook-ranges refresh\n"
+                .'The minute heartbeat keeps them current; make sure the scheduler runs as the pool user:'."\n"
+                .'* * * * * cd '.Slipstream::appRoot().'/current && php artisan schedule:run >> /dev/null 2>&1'
+            );
+        }
+
+        $summary = implode(', ', array_map(
+            fn (string $entry) => WebhookSourceRanges::isKeyword($entry) ? strtolower($entry).' ('.$ranges->describe(strtolower($entry)).')' : $entry,
+            $allowed
+        ));
+
+        if ($resolved['stale'] !== []) {
+            return CheckResult::warn(
+                'webhook source',
+                'restricted to '.$summary,
+                'The '.implode(', ', $resolved['stale']).' ranges are older than '.(int) config('slipstream.webhook.ranges_stale_hours', 48).' hours; the list in use is the last'."\n"
+                .'good one. Retry now: php artisan slipstream:webhook-ranges refresh'
+            );
+        }
+
+        return CheckResult::pass('webhook source', 'restricted to '.$summary);
+    }
+
+    /**
+     * A stored hook of several lines without `set -e` reports only its last
+     * line's status: an earlier line can fail and the deploy still passes.
+     * The seeded defaults and hooks from the release's file fail fast; a hook
+     * someone typed in may not.
+     */
+    protected function checkHookScripts(string $root): CheckResult
+    {
+        try {
+            $hooks = DeploymentHook::query()->where('enabled', true)->orderBy('id')->get();
+        } catch (\Throwable) {
+            return CheckResult::skip('hook scripts', 'no hooks table yet');
+        }
+
+        if ($hooks->isEmpty()) {
+            return CheckResult::skip('hook scripts', 'no stored hooks');
+        }
+
+        $lax = $hooks->filter(fn (DeploymentHook $hook) => HookScript::isMultiLine((string) $hook->script)
+            && ! HookScript::failsFast((string) $hook->script));
+
+        if ($lax->isEmpty()) {
+            return CheckResult::pass('hook scripts', 'every stored hook of several lines fails fast');
+        }
+
+        return CheckResult::warn(
+            'hook scripts',
+            $lax->count().' stored hook(s) run several lines without set -e: '
+            .$lax->map(fn (DeploymentHook $hook) => "\"{$hook->name}\" (#{$hook->id})")->implode(', '),
+            "The shell reports only the LAST line's status, so an earlier line can fail and the deploy still passes.\n"
+            .'Put `set -e` first (slipstream:hooks edit <id> --script-file=…) or join the lines with &&. Hooks from the'."\n"
+            .'release\'s hooks file get it automatically unless they set fail_fast => false.'
+        );
     }
 }

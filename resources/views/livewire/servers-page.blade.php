@@ -195,7 +195,7 @@
         </p>
         <p class="ss-muted" style="margin-bottom:0">
             This node’s endpoint:
-            <code>{{ url('/'.\Slipstream\Slipstream::path().'/hooks/deploy') }}</code>
+            <code>{{ \Slipstream\Slipstream::hookUrl('deploy') }}</code>
         </p>
     </div>
 </div>

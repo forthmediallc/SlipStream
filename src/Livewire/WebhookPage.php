@@ -80,7 +80,7 @@ class WebhookPage extends SlipstreamComponent
 
         $body = json_encode(['zen' => 'Slipstream test ping', 'hook_id' => 0], JSON_THROW_ON_ERROR);
         $request = Request::create(
-            url('/'.Slipstream::path().'/hooks/deploy'),
+            Slipstream::hookUrl('deploy'),
             'POST',
             [],
             [],
@@ -117,9 +117,8 @@ class WebhookPage extends SlipstreamComponent
 
     public function render(SettingsRepository $settings)
     {
-        $path = Slipstream::path();
-        $url = url('/'.$path.'/hooks/deploy');
-        $relayUrl = url('/'.$path.'/hooks/relay');
+        $url = Slipstream::hookUrl('deploy');
+        $relayUrl = Slipstream::hookUrl('relay');
 
         $peers = Server::query()
             ->where('server_name', '!=', Slipstream::serverName())

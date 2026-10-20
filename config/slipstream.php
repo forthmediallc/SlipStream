@@ -15,6 +15,23 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Hook endpoints path
+    |--------------------------------------------------------------------------
+    |
+    | Where the hook endpoints (deploy, relay, env-sync, deploy-sync) are
+    | served. Null = under the dashboard, at {path}/hooks. Set it when an SSO
+    | proxy such as Cloudflare Access fronts the dashboard: the git host's
+    | deliveries must reach the hook without a login page, so either exempt
+    | {path}/hooks/* there or move the hooks out from under {path} with this.
+    | Every node of a fleet must share the value (peers address each other's
+    | relay and nudge endpoints with it), and like `path` it is baked into a
+    | cached route table: route:clear or optimize after changing it.
+    |
+    */
+    'hooks_path' => env('SLIPSTREAM_HOOKS_PATH'),
+
+    /*
+    |--------------------------------------------------------------------------
     | Dashboard domain
     |--------------------------------------------------------------------------
     |
@@ -351,21 +368,28 @@ return [
         // Prune webhook delivery rows older than N days (0 = keep forever).
         'keep_delivery_days' => (int) env('SLIPSTREAM_KEEP_DELIVERY_DAYS', 30),
 
-        // Source addresses the provider hook (/hooks/deploy) accepts, as IPs
-        // or CIDR ranges, comma-separated. Empty = any source (the signature
-        // is still verified). A delivery from anywhere else is rejected with
-        // 403 and recorded in the delivery log before its body is read.
+        // Sources the provider hook (/hooks/deploy) accepts, comma-separated:
+        // IPs, CIDR ranges, and the keywords github and bitbucket, which stand
+        // for the provider's published hook ranges (GitLab.com publishes none,
+        // so there is no gitlab). Empty = any source (the signature is still
+        // verified). A delivery from anywhere else is rejected with 403 and
+        // recorded in the delivery log before its body is read.
         //
-        // GitHub publishes its hook ranges under "hooks" at
-        // https://api.github.com/meta, Bitbucket Cloud at
-        // https://ip-ranges.atlassian.com/ — both change over time, so refresh
-        // the list when a delivery is rejected. Behind a proxy or load
-        // balancer the app must trust it (TrustProxies) or the address seen
-        // here is the proxy's. Restricting at nginx is equivalent.
+        // The minute heartbeat downloads a keyword's ranges every
+        // ranges_refresh_hours with an ETag (an unchanged list costs no rate
+        // limit) and keeps the last good list when a download fails. A keyword
+        // never downloaded matches nothing, so every delivery is refused until
+        // the first download: `slipstream:webhook-ranges refresh` does it now,
+        // doctor fails until it happened and warns past ranges_stale_hours.
+        // Behind a proxy or load balancer the app must trust it (TrustProxies)
+        // or the address seen here is the proxy's. Restricting at nginx is
+        // equivalent.
         'allowed_ips' => array_values(array_filter(array_map(
             'trim',
             explode(',', (string) env('SLIPSTREAM_WEBHOOK_ALLOWED_IPS', ''))
         ))),
+        'ranges_refresh_hours' => (int) env('SLIPSTREAM_WEBHOOK_RANGES_REFRESH_HOURS', 6),
+        'ranges_stale_hours' => (int) env('SLIPSTREAM_WEBHOOK_RANGES_STALE_HOURS', 48),
 
         // Webhook deploys are idempotent per commit: a delivery naming the SHA
         // this node already deployed successfully is ignored. That bounds replay
