@@ -32,7 +32,7 @@ class ArtifactFetcher
      * @throws ArtifactRefused  for a release the node will not take
      * @throws RuntimeException  when the store or the disk is the problem
      */
-    public function fetchInto(string $sha, ?string $expectedManifestSha256, string $into, string $environment, Keys $keys, Closure $say): array
+    public function fetchInto(string $sha, ?string $expectedManifestSha256, string $into, string $environment, string $ref, Keys $keys, Closure $say): array
     {
         $sha = strtolower($sha);
         $short = substr($sha, 0, 7);
@@ -59,6 +59,9 @@ class ArtifactFetcher
         }
         if ($statement->environment !== $environment) {
             throw new ArtifactRefused('statement', "it is signed for environment \"{$statement->environment}\"; this node is \"{$environment}\"", $sha);
+        }
+        if ($statement->ref !== $ref) {
+            throw new ArtifactRefused('statement', "it was built for {$statement->ref}; this node deploys {$ref}", $sha);
         }
 
         $manifest = Manifest::fromJson($json);
@@ -102,9 +105,11 @@ class ArtifactFetcher
             }
 
             $say('Unpacking and checking every file against the manifest…');
+            // The manifest's own counts, so the reader inflates no more than
+            // this release and its headers need.
             $files = TarReader::extract($tarball, $into, [
                 'max_unpacked_bytes' => min($manifest->unpackedBytes, (int) config('slipstream.artifacts.max_unpacked_bytes', 4294967296)),
-                'max_entries' => (int) config('slipstream.artifacts.max_entries', 250000),
+                'max_entries' => min($manifest->entries, (int) config('slipstream.artifacts.max_entries', 250000)),
             ], $manifest->files);
         } catch (ArtifactRefused $e) {
             throw new ArtifactRefused($e->stage, $e->reason, $sha, $e->context);

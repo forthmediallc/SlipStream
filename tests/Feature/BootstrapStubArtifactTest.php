@@ -81,6 +81,42 @@ class BootstrapStubArtifactTest extends TestCase
         $this->assertFileDoesNotExist($this->fixture->appRoot.'/ran.txt');
     }
 
+    public function test_a_head_release_that_does_not_verify_falls_back_to_the_pointers_previous(): void
+    {
+        $this->fixture->publishSecond();
+        $this->fixture->tamperArchive(); // the head's archive
+
+        $process = $this->stub();
+
+        $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput().$process->getOutput());
+        $this->assertStringContainsString("falling back to the pointer's previous release {$this->fixture->firstSha}", $process->getErrorOutput());
+        $this->assertSame($this->fixture->firstSha.' slipstream:bootstrap --no-interaction', trim((string) file_get_contents($this->fixture->appRoot.'/ran.txt')));
+    }
+
+    public function test_no_fallback_stops_at_the_head(): void
+    {
+        $this->fixture->publishSecond();
+        $this->fixture->tamperArchive();
+
+        $process = $this->stub(['--no-fallback']);
+
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('did not verify; stopping (--no-fallback)', $process->getErrorOutput());
+        $this->assertFileDoesNotExist($this->fixture->appRoot.'/ran.txt');
+    }
+
+    public function test_an_object_larger_than_it_may_be_is_refused_before_the_download(): void
+    {
+        file_put_contents($this->fixture->appRoot.'/.env', "SLIPSTREAM_ARTIFACTS_MAX_ARCHIVE_BYTES=100\n", FILE_APPEND);
+
+        $process = $this->stub();
+
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('release.tar.gz is', $process->getErrorOutput());
+        $this->assertStringContainsString('more than the 100 it may be', $process->getErrorOutput());
+        $this->assertFileDoesNotExist($this->fixture->appRoot.'/ran.txt');
+    }
+
     public function test_a_tag_pattern_is_refused(): void
     {
         file_put_contents($this->fixture->appRoot.'/.env', str_replace('refs/heads/production', 'v*', (string) file_get_contents($this->fixture->appRoot.'/.env')));

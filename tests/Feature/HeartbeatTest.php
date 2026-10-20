@@ -7,7 +7,6 @@ use Slipstream\Fleet\Heartbeat;
 use Slipstream\Models\Deployment;
 use Slipstream\Models\DeploymentHook;
 use Slipstream\Models\Server;
-use Slipstream\Settings\SettingsRepository;
 use Slipstream\Tests\TestCase;
 
 class HeartbeatTest extends TestCase
@@ -58,28 +57,21 @@ class HeartbeatTest extends TestCase
     }
 
     /**
-     * An install upgraded to 0.5.2 still holds the earlier "Build assets"
-     * text; install seeds only what is missing, so the heartbeat brings the
-     * untouched copy up to date — once, keyed on a setting.
+     * Stored defaults are never rewritten: during an upgrade, a node still on
+     * older code would take a rewritten text for an edited hook and run it
+     * beside the hooks file. An untouched copy of an earlier text runs the
+     * current one instead.
      */
-    public function test_the_heartbeat_upgrades_earlier_default_hooks_once(): void
+    public function test_the_heartbeat_leaves_stored_default_hooks_as_they_are(): void
     {
         DefaultHooks::seed();
         $old = DefaultHooks::PREVIOUS['Build assets'][0];
-        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => $old, 'enabled' => false]);
+        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => $old]);
 
-        $this->artisan('slipstream:heartbeat')
-            ->expectsOutputToContain('1 brought up to date')
-            ->assertExitCode(0);
+        $this->artisan('slipstream:heartbeat')->assertExitCode(0);
 
         $hook = DeploymentHook::query()->where('name', 'Build assets')->sole();
-        $this->assertStringStartsWith("set -e\n", $hook->script);
-        $this->assertFalse($hook->enabled, 'only the text changes');
-        $this->assertSame((string) DefaultHooks::VERSION, app(SettingsRepository::class)->get(DefaultHooks::VERSION_SETTING));
-
-        // The old text put back by hand: the version flag is the only trigger.
-        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => $old]);
-        $this->artisan('slipstream:heartbeat')->assertExitCode(0);
-        $this->assertSame($old, DeploymentHook::query()->where('name', 'Build assets')->sole()->script);
+        $this->assertSame($old, $hook->script);
+        $this->assertStringStartsWith("set -e\n", DefaultHooks::effectiveScript($hook), 'it runs the current text');
     }
 }

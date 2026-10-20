@@ -167,6 +167,97 @@ class TarArchiveTest extends TestCase
         }
     }
 
+    /**
+     * Where tar readers disagree with each other, refuse: what a node
+     * unpacks must be what GNU tar or Python shows a reviewer.
+     */
+    public function test_entries_other_readers_read_differently_are_refused(): void
+    {
+        foreach ([
+            [$this->tar([['app', '5', str_repeat("\0", 512)], ['app/a.txt', '0', 'x']]), 'which claims 512 bytes of data'],
+            [$this->tar([['app/x/', '0', 'data']]), 'which is named like a directory'],
+            [$this->tar([['a.txt', '0', 'x']], '', "ustar  \0"), 'not a POSIX ustar header'],
+        ] as [$archive, $reason]) {
+            file_put_contents($this->base.'/odd.tar.gz', $archive);
+            $this->removeTree($this->base.'/out');
+            mkdir($this->base.'/out');
+
+            try {
+                TarReader::extract($this->base.'/odd.tar.gz', $this->base.'/out');
+                $this->fail("extracted an archive that should be refused: {$reason}");
+            } catch (ArtifactRefused $e) {
+                $this->assertStringContainsString($reason, $e->getMessage());
+            }
+        }
+    }
+
+    public function test_only_zero_padding_up_to_a_record_may_follow_the_end_marker(): void
+    {
+        file_put_contents($this->base.'/padded.tar.gz', $this->tar([['a.txt', '0', 'x']], str_repeat("\0", 9216)));
+        $this->assertSame(['a.txt'], array_keys(TarReader::extract($this->base.'/padded.tar.gz', $this->base.'/out')));
+
+        // More than a record of zeros is not inflated to the end to look for data.
+        file_put_contents($this->base.'/bomb.tar.gz', $this->tar([['a.txt', '0', 'x']], str_repeat("\0", 4 * 1048576)));
+        $this->removeTree($this->base.'/out');
+        mkdir($this->base.'/out');
+        try {
+            TarReader::extract($this->base.'/bomb.tar.gz', $this->base.'/out');
+            $this->fail('read a megabytes-long tail');
+        } catch (ArtifactRefused $e) {
+            $this->assertStringContainsString('data follows the end-of-archive marker', $e->getMessage());
+        }
+    }
+
+    public function test_every_decompressed_byte_counts_against_one_cap(): void
+    {
+        $this->assertSame(1000 + 2 * TarReader::ENTRY_OVERHEAD + TarReader::TAIL, TarReader::readCap(1000, 2));
+        $this->assertSame(PHP_INT_MAX, TarReader::readCap(PHP_INT_MAX, 10));
+
+        file_put_contents($this->base.'/some.gz', gzencode(str_repeat('z', 4096)));
+        $gz = gzopen($this->base.'/some.gz', 'rb');
+        try {
+            (new \Slipstream\Release\Core\TarStream($gz, 1000))->read(4096);
+            $this->fail('read past the cap');
+        } catch (ArtifactRefused $e) {
+            $this->assertStringContainsString('inflates past 1000 bytes', $e->getMessage());
+        } finally {
+            gzclose($gz);
+        }
+    }
+
+    /**
+     * A write that does not complete — a full disk, a quota, a file-size
+     * limit — must stop the extract, not leave a truncated file the hash of
+     * the stream vouches for.
+     */
+    public function test_a_write_that_does_not_complete_is_refused(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\' || (new Process(['sh', '-c', 'exit 0']))->run() !== 0) {
+            $this->markTestSkipped('needs a POSIX shell for ulimit.');
+        }
+
+        $big = '';
+        for ($i = 0; $i < 4096; $i++) {
+            $big .= hash('sha256', (string) $i)."\n";
+        }
+        $this->write('app/Big.php', $big);
+        TarWriter::create($this->base.'/release.tar.gz', $this->base.'/tree', ['app/Big.php']);
+
+        $child = new Process(['sh', '-c', 'ulimit -f 64; trap "" XFSZ; exec "$PHP" -r "$CODE"'], null, [
+            'PHP' => PHP_BINARY,
+            'CODE' => 'require getenv("AUTOLOAD"); try { Slipstream\Release\Core\TarReader::extract(getenv("TARGZ"), getenv("OUT"), [], json_decode(getenv("EXPECTED"), true)); echo "accepted"; } catch (Throwable $e) { echo get_class($e), ": ", $e->getMessage(); }',
+            'AUTOLOAD' => dirname(__DIR__, 2).'/vendor/autoload.php',
+            'TARGZ' => $this->base.'/release.tar.gz',
+            'OUT' => $this->base.'/out',
+            'EXPECTED' => json_encode($this->expected(['app/Big.php'])),
+        ]);
+        $child->run();
+
+        $this->assertStringNotContainsString('accepted', $child->getOutput());
+        $this->assertStringContainsString('RuntimeException', $child->getOutput());
+        $this->assertMatchesRegularExpression('/disk may be full|did not complete/', $child->getOutput());
+    }
+
     public function test_the_manifest_is_enforced_while_extracting(): void
     {
         $this->write('a.txt', 'alpha');
@@ -258,7 +349,7 @@ class TarArchiveTest extends TestCase
      *
      * @param  list<array{0: string, 1: string, 2: string, 3?: string}>  $entries
      */
-    protected function tar(array $entries, string $trailing = ''): string
+    protected function tar(array $entries, string $trailing = '', string $magic = "ustar\x0000"): string
     {
         $tar = '';
         foreach ($entries as $entry) {
@@ -268,7 +359,7 @@ class TarArchiveTest extends TestCase
                 .sprintf("%011o\0", strlen($data)).sprintf("%011o\0", 0)
                 .'        '.$type
                 .str_pad(substr($entry[3] ?? '', 0, 100), 100, "\0")
-                ."ustar\0".'00'.str_repeat("\0", 32).str_repeat("\0", 32)
+                .$magic.str_repeat("\0", 32).str_repeat("\0", 32)
                 .sprintf("%07o\0", 0).sprintf("%07o\0", 0)
                 .str_repeat("\0", 155).str_repeat("\0", 12);
             $sum = 0;

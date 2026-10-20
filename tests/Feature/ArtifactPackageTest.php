@@ -83,6 +83,88 @@ class ArtifactPackageTest extends TestCase
         $this->assertArrayNotHasKey('dist/release.tar.gz', $result['manifest']->files);
     }
 
+    public function test_a_relative_output_directory_inside_the_checkout_is_left_out_run_after_run(): void
+    {
+        $this->fixture->writeCheckout();
+        $cwd = getcwd();
+        chdir($this->fixture->checkout);
+
+        try {
+            foreach ([1, 2] as $run) {
+                $result = (new Packager)->package($this->fixture->checkout, [
+                    'sha' => $this->fixture->sha, 'ref' => 'refs/heads/production', 'environment' => 'production',
+                    'install' => false, 'output' => 'dist',
+                ], fn () => null);
+
+                $this->assertSame([], array_values(array_filter(array_keys($result['manifest']->files), fn (string $path) => str_starts_with($path, 'dist/'))), "run {$run} shipped dist/");
+            }
+        } finally {
+            chdir($cwd);
+        }
+    }
+
+    public function test_what_must_never_ship_is_left_out_at_any_depth_and_said(): void
+    {
+        $this->fixture->writeCheckout([
+            'app/Sub/.env' => 'DB_PASSWORD=x',
+            'app/Sub/auth.json' => '{}',
+            '.env~' => 'APP_KEY=x',
+            '.envrc' => 'export AWS_SECRET_ACCESS_KEY=x',
+            '.env.example' => 'APP_KEY=',
+            'vendor/acme/pkg/.git/config' => '[remote]',
+            'vendor/acme/pkg/data.sqlite' => 'a vendored database ships',
+            'packages/ui/node_modules/x.js' => 'x',
+            '.npmrc' => '//registry.npmjs.org/:_authToken=x',
+            '.yarnrc.yml' => 'npmAuthToken: x',
+            '.sentryclirc' => '[auth]',
+            'database/database.sqlite' => 'test data',
+        ]);
+
+        $said = [];
+        $result = (new Packager)->package($this->fixture->checkout, [
+            'sha' => $this->fixture->sha, 'ref' => 'refs/heads/production', 'environment' => 'production',
+            'install' => false, 'output' => $this->fixture->dist,
+        ], function (string $line) use (&$said) {
+            $said[] = $line;
+        });
+        $paths = array_keys($result['manifest']->files);
+
+        foreach (['app/Sub/.env', 'app/Sub/auth.json', '.env~', '.envrc', 'vendor/acme/pkg/.git/config', 'packages/ui/node_modules/x.js', '.npmrc', '.yarnrc.yml', '.sentryclirc', 'database/database.sqlite'] as $dropped) {
+            $this->assertNotContains($dropped, $paths);
+        }
+        $this->assertContains('.env.example', $paths);
+        $this->assertContains('vendor/acme/pkg/data.sqlite', $paths);
+
+        $leftOut = implode("\n", array_filter($said, fn (string $line) => str_starts_with($line, 'Left out by name')));
+        $this->assertStringContainsString('app/Sub/.env', $leftOut);
+        $this->assertStringContainsString('packages/ui/node_modules', $leftOut);
+    }
+
+    public function test_a_private_key_is_refused_by_content_and_a_public_certificate_ships(): void
+    {
+        $this->fixture->writeCheckout([
+            'resources/certs/global-bundle.pem' => "-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n",
+            'storage/oauth-private.key' => "-----BEGIN PRIVATE KEY-----\n", // storage/ never ships anyway
+            'config/saml/sp.key' => "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\n",
+            'vendor/acme/pkg/tests/key.pem' => "-----BEGIN EC PRIVATE KEY-----\n",
+        ]);
+
+        try {
+            $this->fixture->package();
+            $this->fail('packaged a private key');
+        } catch (RuntimeException $e) {
+            $this->assertStringContainsString('config/saml/sp.key holds a private key', $e->getMessage());
+            $this->assertStringNotContainsString('global-bundle.pem', $e->getMessage());
+            $this->assertStringNotContainsString('vendor/', $e->getMessage());
+        }
+
+        config()->set('slipstream.artifacts.allow', ['config/saml']);
+        $this->fixture->package();
+        $paths = array_keys(Manifest::fromJson((string) file_get_contents($this->fixture->dist.'/manifest.json'))->files);
+        $this->assertContains('config/saml/sp.key', $paths);
+        $this->assertContains('resources/certs/global-bundle.pem', $paths);
+    }
+
     public function test_build_hooks_run_in_step_order_and_node_hooks_do_not(): void
     {
         $this->fixture->writeCheckout([], <<<'PHP'

@@ -6,6 +6,7 @@ use Closure;
 use RuntimeException;
 use Slipstream\Diagnostics\ComposerLockCheck;
 use Slipstream\Release\Core\Manifest;
+use Slipstream\Release\Core\ReleaseRules;
 use Slipstream\Release\Core\TarWriter;
 use Symfony\Component\Process\Process;
 
@@ -57,6 +58,9 @@ class Packager
         if (! is_dir($output) && ! @mkdir($output, 0755, true)) {
             throw new RuntimeException("Cannot create {$output}.");
         }
+        // Resolved, so a relative dist/ inside the checkout is recognised
+        // and left out (a previous run's archive must never ship).
+        $output = rtrim(str_replace('\\', '/', realpath($output) ?: $output), '/');
 
         $say('Build hooks: after fetch');
         BuildHooks::run($checkout, $sha, $options['ref'], 'after-fetch', $say);
@@ -88,7 +92,19 @@ class Packager
         $say('Build hooks: after composer');
         BuildHooks::run($checkout, $sha, $options['ref'], 'after-composer', $say);
 
-        $files = $this->files($checkout, $output);
+        $dropped = [];
+        $files = $this->files($checkout, $output, $dropped);
+        if ($dropped !== []) {
+            $say('Left out by name (never shipped): '.implode(', ', array_slice($dropped, 0, 20)).(count($dropped) > 20 ? ', and '.(count($dropped) - 20).' more' : ''));
+        }
+
+        $allow = array_values(array_filter((array) config('slipstream.artifacts.allow', []), 'is_string'));
+        $problems = ReleaseRules::problems($checkout, $files, $allow);
+        if ($problems !== []) {
+            throw new RuntimeException('Refusing to package: '.implode('; ', array_slice($problems, 0, 10))
+                .(count($problems) > 10 ? '; and '.(count($problems) - 10).' more' : '')
+                .'. Keep key material out of the release (a secrets manager, or the node), or list the path in artifacts.allow.');
+        }
         $say(count($files).' files');
 
         $archive = $output.'/'.self::ARCHIVE;
@@ -141,9 +157,10 @@ class Packager
     /**
      * Every regular file that ships, sorted, forward slashes.
      *
+     * @param  list<string>  $dropped  what the never-ship name rules left out
      * @return list<string>
      */
-    protected function files(string $checkout, string $output): array
+    protected function files(string $checkout, string $output, array &$dropped = []): array
     {
         $exclude = array_merge(self::EXCLUDE, array_values(array_filter((array) config('slipstream.artifacts.exclude', []), 'is_string')));
         $exclude = array_map(fn (string $path) => trim(str_replace('\\', '/', $path), '/'), $exclude);
@@ -153,8 +170,9 @@ class Packager
         }
 
         $files = [];
-        $this->walk($checkout, '', $exclude, $files);
+        $this->walk($checkout, '', $exclude, $files, $dropped);
         sort($files, SORT_STRING);
+        sort($dropped, SORT_STRING);
 
         return $files;
     }
@@ -162,8 +180,9 @@ class Packager
     /**
      * @param  list<string>  $exclude
      * @param  list<string>  $files
+     * @param  list<string>  $dropped
      */
-    protected function walk(string $checkout, string $relative, array $exclude, array &$files): void
+    protected function walk(string $checkout, string $relative, array $exclude, array &$files, array &$dropped = []): void
     {
         $dir = $relative === '' ? $checkout : $checkout.'/'.$relative;
 
@@ -173,7 +192,13 @@ class Packager
             }
 
             $path = $relative === '' ? $name : $relative.'/'.$name;
-            if (in_array($path, $exclude, true) || preg_match('/^\.env\./', $name) === 1) {
+            if (in_array($path, $exclude, true)) {
+                continue;
+            }
+            // .git, node_modules, .env*, auth.json, .npmrc, … at any depth.
+            if (ReleaseRules::neverShips($path)) {
+                $dropped[] = $path;
+
                 continue;
             }
 
@@ -184,7 +209,7 @@ class Packager
             }
 
             if (is_dir($absolute)) {
-                $this->walk($checkout, $path, $exclude, $files);
+                $this->walk($checkout, $path, $exclude, $files, $dropped);
 
                 continue;
             }

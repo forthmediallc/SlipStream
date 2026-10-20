@@ -45,6 +45,41 @@ class HookFileTest extends TestCase
         parent::tearDown();
     }
 
+    /**
+     * In artifact mode only the verified tree may supply code: not an
+     * absolute path, not ../, and not a link that leads out of it.
+     */
+    public function test_in_artifact_mode_the_hooks_file_must_stay_inside_the_release(): void
+    {
+        config()->set('slipstream.release.source', 'artifact');
+
+        config()->set('slipstream.hooks.file', '../../elsewhere/hooks.php');
+        try {
+            HookFile::path($this->release);
+            $this->fail('accepted a hooks file outside the release');
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString('leaves the release', $e->getMessage());
+        }
+
+        if (DIRECTORY_SEPARATOR !== '\\') {
+            mkdir($this->root.'/shared', 0777, true);
+            file_put_contents($this->root.'/shared/hooks.php', '<?php return [];');
+            symlink($this->root.'/shared', $this->release.'/storage');
+            config()->set('slipstream.hooks.file', 'storage/hooks.php');
+            try {
+                HookFile::path($this->release);
+                $this->fail('followed a link out of the release');
+            } catch (\RuntimeException $e) {
+                $this->assertStringContainsString('outside the release', $e->getMessage());
+            }
+        }
+
+        // Git mode is as it was.
+        config()->set('slipstream.release.source', 'git');
+        config()->set('slipstream.hooks.file', '../../elsewhere/hooks.php');
+        $this->assertStringEndsWith('hooks.php', HookFile::path($this->release));
+    }
+
     public function test_file_defined_hooks_run_on_a_fresh_database(): void
     {
         $this->writeHooks($this->vaultHooks());

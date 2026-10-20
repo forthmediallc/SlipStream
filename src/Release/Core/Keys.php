@@ -26,6 +26,12 @@ final class Keys
             $entries = trim($entries);
             if (str_starts_with($entries, 'file:')) {
                 $path = substr($entries, 5);
+                // A relative path resolves against the working directory,
+                // which for artisan is the release: the trust anchors would
+                // come from the archive they are meant to check.
+                if (! self::isAbsolute($path)) {
+                    throw new \InvalidArgumentException("SLIPSTREAM_RELEASE_PUBLIC_KEYS=file:{$path} is a relative path; name the key file by an absolute path outside the release, e.g. file:/etc/slipstream/release-keys.");
+                }
                 $contents = is_file($path) ? @file_get_contents($path) : false;
                 if ($contents === false) {
                     throw new \InvalidArgumentException("SLIPSTREAM_RELEASE_PUBLIC_KEYS names {$path}, which cannot be read.");
@@ -69,6 +75,13 @@ final class Keys
     public static function none(): self
     {
         return new self([]);
+    }
+
+    public static function isAbsolute(string $path): bool
+    {
+        return str_starts_with($path, '/')
+            || str_starts_with($path, '\\\\')
+            || preg_match('#^[A-Za-z]:[\\\\/]#', $path) === 1;
     }
 
     /**

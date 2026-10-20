@@ -100,12 +100,13 @@ class ShellRunner
 
     /**
      * What the command sees: this process's environment, or the minimal one
-     * (SLIPSTREAM_HOOK_ENV; minimal by default in artifact mode).
+     * (SLIPSTREAM_HOOK_ENV; minimal by default in artifact mode), with the
+     * variables it leaves out set to false so Process does not add them back.
      *
-     * @return array<string, string>
+     * @return array<string, string|false>
      */
     protected function env(): array
     {
-        return HookEnvironment::build();
+        return HookEnvironment::forHook();
     }
 }

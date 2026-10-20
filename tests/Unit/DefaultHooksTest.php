@@ -68,21 +68,22 @@ class DefaultHooksTest extends TestCase
         $this->assertFalse(DefaultHooks::isUntouchedDefault($edited));
     }
 
-    public function test_seed_upgrades_untouched_rows_in_place_and_leaves_edited_ones(): void
+    public function test_an_untouched_earlier_default_runs_the_current_text_and_its_row_is_left_alone(): void
     {
         DefaultHooks::seed();
         $count = DeploymentHook::query()->count();
-        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => DefaultHooks::PREVIOUS['Build assets'][0], 'enabled' => false]);
-        DeploymentHook::query()->where('name', 'Restart Horizon')->update(['script' => 'echo custom']);
+        $old = DefaultHooks::PREVIOUS['Build assets'][0];
+        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => $old, 'enabled' => false]);
+        DeploymentHook::query()->where('name', 'Restart Horizon')->update(['script' => "echo one\necho two"]);
 
         DefaultHooks::seed();
 
         $this->assertSame($count, DeploymentHook::query()->count());
         $assets = DeploymentHook::query()->where('name', 'Build assets')->sole();
-        $this->assertStringStartsWith("set -e\n", $assets->script);
-        $this->assertFalse($assets->enabled, 'only the text changes');
-        $this->assertSame('echo custom', DeploymentHook::query()->where('name', 'Restart Horizon')->sole()->script);
-        $this->assertTrue(ActivityLog::query()->where('action', 'hook.defaults_upgraded')->exists());
+        $this->assertSame($old, $assets->script, 'seeding never rewrites a stored row');
+        $this->assertSame(DefaultHooks::DEFAULTS[0]['script'], DefaultHooks::effectiveScript($assets));
+        $this->assertSame("echo one\necho two", DefaultHooks::effectiveScript(DeploymentHook::query()->where('name', 'Restart Horizon')->sole()), 'an edited hook runs its own text');
+        $this->assertFalse(ActivityLog::query()->where('action', 'hook.defaults_upgraded')->exists());
     }
 
     public function test_seeding_strips_where_even_under_strict_models(): void

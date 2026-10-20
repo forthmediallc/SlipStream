@@ -46,7 +46,23 @@ final class HookFile
             return $file;
         }
 
-        return rtrim($releaseRoot, '/\\').DIRECTORY_SEPARATOR.ltrim($file, '/\\');
+        $path = rtrim($releaseRoot, '/\\').DIRECTORY_SEPARATOR.ltrim($file, '/\\');
+
+        // Relative is not enough: ../ or a link (storage/ is one) would still
+        // load code from outside the verified tree.
+        if (Slipstream::artifactMode()) {
+            if (in_array('..', preg_split('#[\\\\/]+#', $file) ?: [], true)) {
+                throw new RuntimeException("SLIPSTREAM_HOOKS_FILE ({$file}) leaves the release; in artifact mode the hooks file must be inside it.");
+            }
+
+            $real = realpath($path);
+            $root = realpath($releaseRoot);
+            if ($real !== false && $root !== false && ! str_starts_with($real, rtrim($root, '/\\').DIRECTORY_SEPARATOR)) {
+                throw new RuntimeException("SLIPSTREAM_HOOKS_FILE ({$file}) resolves to {$real}, outside the release; in artifact mode the hooks file must be inside it.");
+            }
+        }
+
+        return $path;
     }
 
     public static function exists(string $releaseRoot): bool

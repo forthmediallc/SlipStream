@@ -204,7 +204,7 @@ class StatusCommand extends Command
             ];
             try {
                 $deployRef = DeployRef::fromConfig();
-                $artifact['high_water'] = app(ArtifactSequence::class)->highWater($deployRef);
+                $artifact['high_water'] = app(ArtifactSequence::class)->highWater($deployRef)['sequence'];
                 $pointer = app(ArtifactSource::class)->pointer($deployRef, accept: false);
                 $artifact = ['sha' => $pointer->sha, 'sequence' => $pointer->sequence, 'published_at' => $pointer->publishedAt, 'by' => $pointer->by, 'key_id' => $pointer->keyId] + $artifact;
             } catch (\Throwable $e) {

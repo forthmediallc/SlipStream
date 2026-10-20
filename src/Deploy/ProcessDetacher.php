@@ -153,15 +153,16 @@ class ProcessDetacher
     }
 
     /**
-     * What the detached artisan sees: this process's environment, or the
-     * minimal one (SLIPSTREAM_HOOK_ENV; minimal by default in artifact
-     * mode). Artisan loads the .env itself either way.
+     * What the detached artisan sees: this process's environment, in every
+     * mode. It is Slipstream's own process and the one that downloads
+     * releases, so it keeps its proxy and AWS settings; the hooks it runs are
+     * trimmed by ShellRunner (SLIPSTREAM_HOOK_ENV).
      *
      * @return array<string, string>
      */
     protected function environment(): array
     {
-        return \Slipstream\Support\HookEnvironment::build();
+        return \Slipstream\Support\HookEnvironment::inherit();
     }
 
     protected function logDirectory(): string

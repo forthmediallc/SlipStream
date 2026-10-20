@@ -8,17 +8,30 @@ namespace Slipstream\Release\Core;
  * budget enforced as it goes, nothing written through a symlink, nothing
  * overwritten, and every file hashed while it is written and compared with
  * the manifest. Anything else refuses the archive.
+ *
+ * It reads exactly what TarWriter writes and nothing looser: POSIX ustar
+ * headers, size-0 directory entries, GNU long names, two zero blocks at the
+ * end. Where other tar readers disagree with each other (a directory with a
+ * size, a file named like a directory, a GNU header's prefix field), the
+ * archive is refused rather than read one way here and another in review.
  */
 final class TarReader
 {
     public const BLOCK = 512;
+
+    /** What a long name and a header may add to an entry, at most. */
+    public const ENTRY_OVERHEAD = 6144;
+
+    /** The end marker, plus the zero padding a record may carry after it. */
+    public const TAIL = 11264;
 
     /**
      * @param  array{max_unpacked_bytes?: int, max_entries?: int}  $limits
      * @param  array<string, array{0: string, 1: int}>|null  $expected  the manifest's files; when given, every file must be in it and match, and all of them must be present
      * @return array<string, array{0: string, 1: int}>  the files extracted, release-relative, each with its SHA-256 and size, in archive order
      *
-     * @throws ArtifactRefused
+     * @throws ArtifactRefused  for an archive the node will not take
+     * @throws \RuntimeException  when the disk is the problem (a write that does not complete)
      */
     public static function extract(string $tarGz, string $into, array $limits = [], ?array $expected = null): array
     {
@@ -29,6 +42,7 @@ final class TarReader
         if ($gz === false) {
             throw new ArtifactRefused('archive', 'the archive cannot be opened');
         }
+        $stream = new TarStream($gz, self::readCap($maxBytes, $maxEntries));
 
         $extracted = [];
         $bytes = 0;
@@ -38,26 +52,38 @@ final class TarReader
 
         try {
             while (true) {
-                $header = self::readBlock($gz);
-                if ($header === null) {
-                    throw new ArtifactRefused('archive', 'the archive ends without an end-of-archive marker');
+                $header = $stream->read(self::BLOCK);
+                if (strlen($header) !== self::BLOCK) {
+                    throw new ArtifactRefused('archive', $header === '' ? 'the archive ends without an end-of-archive marker' : 'the archive is truncated');
                 }
                 if ($header === str_repeat("\0", self::BLOCK)) {
-                    $second = self::readBlock($gz);
-                    if ($second !== str_repeat("\0", self::BLOCK)) {
+                    if ($longName !== null) {
+                        throw new ArtifactRefused('archive', 'a long-name entry is not followed by the entry it names');
+                    }
+                    if ($stream->readExactly(self::BLOCK) !== str_repeat("\0", self::BLOCK)) {
                         throw new ArtifactRefused('archive', 'the archive ends without an end-of-archive marker');
                     }
-                    while (($rest = gzread($gz, 65536)) !== false && $rest !== '') {
-                        if (trim($rest, "\0") !== '') {
-                            throw new ArtifactRefused('archive', 'data follows the end-of-archive marker');
-                        }
-                    }
+                    self::checkTail($stream);
                     break;
                 }
 
                 $fields = self::parseHeader($header);
                 $type = $fields['type'];
                 $size = $fields['size'];
+
+                if ($type === 'L') {
+                    if ($longName !== null) {
+                        throw new ArtifactRefused('archive', 'two long-name entries in a row');
+                    }
+                    if ($size < 1 || $size > Manifest::MAX_PATH + 1) {
+                        throw new ArtifactRefused('archive', 'a long-name entry of an impossible size');
+                    }
+                    $longName = rtrim($stream->readExactly($size), "\0");
+                    $stream->skip(self::padding($size));
+
+                    continue;
+                }
+
                 $name = $longName ?? $fields['name'];
                 $longName = null;
 
@@ -65,17 +91,14 @@ final class TarReader
                     throw new ArtifactRefused('archive', "more than {$maxEntries} entries");
                 }
 
-                if ($type === 'L') {
-                    if ($size < 1 || $size > Manifest::MAX_PATH + 1) {
-                        throw new ArtifactRefused('archive', 'a long-name entry of an impossible size');
-                    }
-                    $longName = rtrim(self::readData($gz, $size), "\0");
-
-                    continue;
-                }
-
                 if ($type !== '0' && $type !== "\0" && $type !== '5') {
                     throw new ArtifactRefused('archive', 'refusing '.self::describeType($type).' entry "'.self::printable($name).'"');
+                }
+                if ($type === '5' && $size !== 0) {
+                    throw new ArtifactRefused('archive', 'refusing the directory entry "'.self::printable($name).'", which claims '.$size.' bytes of data');
+                }
+                if ($type !== '5' && str_ends_with($name, '/')) {
+                    throw new ArtifactRefused('archive', 'refusing the file entry "'.self::printable($name).'", which is named like a directory');
                 }
 
                 $name = rtrim($name, '/');
@@ -85,7 +108,6 @@ final class TarReader
 
                 if ($type === '5') {
                     self::ensureDirectory($into, $name, $created);
-                    self::skipData($gz, $size);
 
                     continue;
                 }
@@ -110,28 +132,11 @@ final class TarReader
                 if (is_link($target) || file_exists($target)) {
                     throw new ArtifactRefused('archive', 'the archive lists '.self::printable($name).' twice');
                 }
-                $out = @fopen($target, 'xb');
-                if ($out === false) {
-                    throw new ArtifactRefused('archive', 'cannot write '.self::printable($name));
-                }
 
-                $hash = hash_init('sha256');
-                $remaining = $size;
-                while ($remaining > 0) {
-                    $chunk = gzread($gz, min(65536, $remaining));
-                    if ($chunk === false || $chunk === '') {
-                        fclose($out);
-                        throw new ArtifactRefused('archive', 'the archive is truncated inside '.self::printable($name));
-                    }
-                    hash_update($hash, $chunk);
-                    fwrite($out, $chunk);
-                    $remaining -= strlen($chunk);
-                }
-                fclose($out);
-                self::skipData($gz, ($size % self::BLOCK === 0) ? 0 : self::BLOCK - ($size % self::BLOCK));
+                $digest = self::writeFile($stream, $target, $name, $size);
+                $stream->skip(self::padding($size));
                 @chmod($target, ($fields['mode'] & 0100) ? 0755 : 0644);
 
-                $digest = hash_final($hash);
                 if ($expected !== null && $expected[$name][0] !== $digest) {
                     throw new ArtifactRefused('files', self::printable($name).' does not match the manifest', null, ['expected' => $expected[$name][0], 'actual' => $digest]);
                 }
@@ -143,7 +148,7 @@ final class TarReader
         }
 
         if ($expected !== null) {
-            $missing = array_diff(array_keys($expected), array_keys($extracted));
+            $missing = array_diff(array_map('strval', array_keys($expected)), array_map('strval', array_keys($extracted)));
             if ($missing !== []) {
                 throw new ArtifactRefused('files', count($missing).' file(s) the manifest lists are not in the archive: '.implode(', ', array_slice(array_values($missing), 0, 5)));
             }
@@ -153,55 +158,91 @@ final class TarReader
     }
 
     /**
-     * @param  resource  $gz
+     * How many decompressed bytes an archive within these limits can need.
      */
-    private static function readBlock($gz): ?string
+    public static function readCap(int $maxBytes, int $maxEntries): int
     {
-        $block = self::readData($gz, self::BLOCK, false);
+        $cap = (float) $maxBytes + (float) $maxEntries * self::ENTRY_OVERHEAD + self::TAIL;
 
-        return $block === '' ? null : $block;
+        return $cap >= PHP_INT_MAX ? PHP_INT_MAX : (int) $cap;
     }
 
     /**
-     * @param  resource  $gz
+     * Write one entry's data, hashing what goes to disk. A write that does
+     * not complete (a full disk, a quota, a file-size limit) stops the
+     * extract: the hash would otherwise vouch for bytes that never landed.
      */
-    private static function readData($gz, int $size, bool $strict = true): string
+    private static function writeFile(TarStream $stream, string $target, string $name, int $size): string
     {
-        $data = '';
-        while (strlen($data) < $size) {
-            $chunk = gzread($gz, $size - strlen($data));
-            if ($chunk === false || $chunk === '') {
-                break;
+        $out = @fopen($target, 'xb');
+        if ($out === false) {
+            throw new ArtifactRefused('archive', 'cannot write '.self::printable($name));
+        }
+
+        $hash = hash_init('sha256');
+        $remaining = $size;
+        try {
+            while ($remaining > 0) {
+                $chunk = $stream->read(min(65536, $remaining));
+                if ($chunk === '') {
+                    throw new ArtifactRefused('archive', 'the archive is truncated inside '.self::printable($name));
+                }
+                hash_update($hash, $chunk);
+                self::writeAll($out, $chunk, $name);
+                $remaining -= strlen($chunk);
             }
-            $data .= $chunk;
+        } catch (\Throwable $e) {
+            @fclose($out);
+
+            throw $e;
         }
 
-        if ($strict && strlen($data) !== $size) {
-            throw new ArtifactRefused('archive', 'the archive is truncated');
+        if (! fclose($out)) {
+            throw new \RuntimeException('Cannot finish writing '.self::printable($name).'; the disk may be full.');
         }
-        if (! $strict && $data !== '' && strlen($data) !== $size) {
-            throw new ArtifactRefused('archive', 'the archive is truncated');
-        }
-
-        if ($size % self::BLOCK !== 0 && $strict) {
-            self::skipData($gz, self::BLOCK - ($size % self::BLOCK));
+        clearstatcache(true, $target);
+        $onDisk = @filesize($target);
+        if ($onDisk !== $size) {
+            throw new \RuntimeException(self::printable($name).' is '.var_export($onDisk, true)." bytes on disk, not {$size}: the write did not complete (is the disk full?).");
         }
 
-        return $data;
+        return hash_final($hash);
     }
 
     /**
-     * @param  resource  $gz
+     * @param  resource  $out
      */
-    private static function skipData($gz, int $size): void
+    private static function writeAll($out, string $data, string $name): void
     {
-        while ($size > 0) {
-            $chunk = gzread($gz, min(65536, $size));
-            if ($chunk === false || $chunk === '') {
-                throw new ArtifactRefused('archive', 'the archive is truncated');
+        $offset = 0;
+        $length = strlen($data);
+        while ($offset < $length) {
+            $written = @fwrite($out, $offset === 0 ? $data : substr($data, $offset));
+            if ($written === false || $written === 0) {
+                throw new \RuntimeException('Cannot write '.self::printable($name).'; the disk may be full.');
             }
-            $size -= strlen($chunk);
+            $offset += $written;
         }
+    }
+
+    /**
+     * After the end marker: zero padding up to a record, then nothing. The
+     * rest is never inflated to look for more.
+     */
+    private static function checkTail(TarStream $stream): void
+    {
+        $padding = $stream->read(self::TAIL - 2 * self::BLOCK);
+        if (trim($padding, "\0") !== '') {
+            throw new ArtifactRefused('archive', 'data follows the end-of-archive marker');
+        }
+        if (strlen($padding) === self::TAIL - 2 * self::BLOCK && ! $stream->atEnd()) {
+            throw new ArtifactRefused('archive', 'data follows the end-of-archive marker');
+        }
+    }
+
+    private static function padding(int $size): int
+    {
+        return $size % self::BLOCK === 0 ? 0 : self::BLOCK - ($size % self::BLOCK);
     }
 
     /**
@@ -209,8 +250,10 @@ final class TarReader
      */
     private static function parseHeader(string $header): array
     {
-        if (substr($header, 257, 5) !== 'ustar') {
-            throw new ArtifactRefused('archive', 'not a ustar archive');
+        // POSIX ustar only, as TarWriter writes it. A GNU header ("ustar  ")
+        // uses the prefix field for other things, and readers disagree.
+        if (substr($header, 257, 6) !== "ustar\0" || substr($header, 263, 2) !== '00') {
+            throw new ArtifactRefused('archive', 'not a POSIX ustar header');
         }
 
         $sum = 0;
@@ -290,6 +333,8 @@ final class TarReader
 
     private static function printable(string $name): string
     {
-        return mb_strimwidth(preg_replace('/[^\x20-\x7e]/', '?', $name) ?? '', 0, 200, '…');
+        $clean = preg_replace('/[^\x20-\x7e]/', '?', $name) ?? '';
+
+        return strlen($clean) > 200 ? substr($clean, 0, 199).'...' : $clean;
     }
 }

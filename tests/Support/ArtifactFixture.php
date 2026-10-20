@@ -141,8 +141,24 @@ class ArtifactFixture
     public function publish(string $by = 'ci'): Pointer
     {
         return $this->pointer = (new Publisher(new ArtifactStore))
-            ->publish($this->dist, DeployRef::parse($this->ref), $this->signer, $by, $this->environment, fn () => null);
+            ->publish($this->dist, DeployRef::parse($this->ref), $this->sha, $this->signer, $by, $this->environment, fn () => null);
     }
+
+    /**
+     * A second release (another commit, another file), published on top of
+     * the first: the pointer's previous is then the first.
+     */
+    public function publishSecond(string $sha = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'): Pointer
+    {
+        $first = $this->sha;
+        $this->writeCheckout(['app/Hello.php' => "<?php\n\nclass Hello { /* v2 */ }\n"])->package($sha);
+        $pointer = $this->publish();
+        $this->firstSha = $first;
+
+        return $pointer;
+    }
+
+    public ?string $firstSha = null;
 
     public function rollbackTo(string $sha, string $by = 'ci'): Pointer
     {

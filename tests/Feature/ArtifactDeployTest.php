@@ -86,8 +86,137 @@ class ArtifactDeployTest extends TestCase
             'sequence' => $this->fixture->pointer->sequence,
             'manifest_sha256' => $this->fixture->pointer->manifestSha256,
             'key_id' => 'test-key',
+            'bound' => true,
         ], $deployment->meta['artifact']);
         $this->assertSame([], glob($this->fixture->appRoot.'/releases/.incoming-*'), 'nothing left staged');
+    }
+
+    public function test_a_poll_deploy_fetches_the_manifest_its_pointer_named_and_no_other(): void
+    {
+        $recorded = $this->recorded();
+        // The same commit republished with another manifest (what 0.6.0
+        // allowed): the deploy started from the first pointer refuses it.
+        $this->fixture->republishManifest(fn (array $m) => ['built_at' => '2026-10-20T00:00:00Z'] + $m);
+
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $recorded]);
+        try {
+            $deployer->run();
+            $this->fail('fetched a manifest the pointer it started from did not name');
+        } catch (ArtifactRefused $e) {
+            $this->assertSame('manifest', $e->stage);
+            $this->assertStringContainsString("the manifest's hash is not the one the pointer names", $e->reason);
+        }
+    }
+
+    public function test_a_pointer_that_moved_to_another_commit_supersedes_the_deploy(): void
+    {
+        $recorded = $this->recorded();
+        $first = $this->fixture->sha;
+        $this->fixture->publishSecond();
+
+        [$deployer, $deployment] = $this->deployer($first, ['poll_ref' => 'branch:production', 'pointer' => $recorded]);
+        $deployer->run();
+
+        $deployment->refresh();
+        $this->assertSame(Deployment::STATUS_SUPERSEDED, $deployment->status, 'not failed: back-off counts only failures');
+        $this->assertStringContainsString('moved to bbbbbbb', (string) $deployment->failure_reason);
+        $this->assertSame(self::OLD, trim((string) file_get_contents($this->fixture->appRoot.'/current/RELEASE_SHA')));
+        $this->assertSame(['20261001_000000_eeeeeee'], array_map('basename', glob($this->fixture->appRoot.'/releases/*') ?: []));
+    }
+
+    public function test_a_rollback_published_while_the_deploy_builds_wins_before_the_swap(): void
+    {
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $this->recorded()]);
+        $deployer->runner->during = function (string $command) {
+            if (str_contains($command, 'slipstream:healthcheck')) {
+                $this->fixture->publishSecond(); // CI moves the ref meanwhile
+            }
+        };
+
+        $deployer->run();
+
+        $this->assertSame(Deployment::STATUS_SUPERSEDED, $deployment->refresh()->status);
+        $this->assertSame(self::OLD, trim((string) file_get_contents($this->fixture->appRoot.'/current/RELEASE_SHA')), 'the release the ref left never went live');
+        $this->assertSame(['20261001_000000_eeeeeee'], array_map('basename', glob($this->fixture->appRoot.'/releases/*') ?: []), 'and is removed, not kept');
+    }
+
+    public function test_a_statement_built_for_another_ref_is_refused(): void
+    {
+        $this->fixture->republishManifest(fn (array $m) => ['ref' => 'refs/heads/staging'] + $m);
+
+        $this->assertRefused('statement', 'it was built for refs/heads/staging; this node deploys refs/heads/production');
+    }
+
+    public function test_a_commit_no_pointer_names_deploys_unbound_and_says_so(): void
+    {
+        config()->set('slipstream.audit.enabled', true);
+        \Illuminate\Support\Facades\Log::spy();
+        $this->fixture->publishSecond(str_repeat('b', 40));
+        $this->fixture->publishSecond(str_repeat('c', 40)); // pointer c, previous b; a is named by nothing
+
+        [$deployer, $deployment] = $this->deployer(str_repeat('a', 40));
+        $deployer->run();
+
+        $deployment->refresh();
+        $this->assertSame(Deployment::STATUS_DEPLOYED, $deployment->status);
+        $this->assertFalse($deployment->meta['artifact']['bound']);
+        $this->assertTrue(DeploymentEvent::query()->where('deployment_id', $deployment->id)->where('message', 'like', '%No pointer names aaaaaaa%')->exists());
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')->with('slipstream.artifact.verified', \Mockery::on(fn (array $c) => $c['bound'] === false && $c['sha'] === str_repeat('a', 40)))->once();
+
+        // The pointer's previous, by commit: vouched for, so bound.
+        [$deployer, $deployment] = $this->deployer(str_repeat('b', 40));
+        $deployer->run();
+        $this->assertTrue($deployment->refresh()->meta['artifact']['bound']);
+    }
+
+    public function test_the_generated_caches_are_recorded_just_before_the_swap(): void
+    {
+        config()->set('slipstream.audit.enabled', true);
+        \Illuminate\Support\Facades\Log::spy();
+        $this->fixture->writeCheckout([], <<<'PHP'
+<?php
+return [['name' => 'Optimize', 'step' => 'composer', 'script' => 'printf "<?php return [];" > bootstrap/cache/config.php']];
+PHP)->package(str_repeat('f', 40)); // a new commit: a published release is never replaced
+        $this->fixture->publish();
+
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $this->recorded()]);
+        $deployer->runner->passthrough[] = 'bootstrap/cache/config.php';
+        $deployer->run();
+
+        $live = realpath($this->fixture->appRoot.'/current');
+        $baseline = \Slipstream\Release\Core\Baseline::fromJson((string) file_get_contents($live.'/.slipstream/generated.json'));
+        $this->assertSame([hash('sha256', '<?php return [];'), 16], $baseline['bootstrap/cache/config.php']);
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')->with('slipstream.artifact.baseline', \Mockery::on(fn (array $c) => $c['files'] === ['bootstrap/cache/config.php' => hash('sha256', '<?php return [];')]))->once();
+        $this->assertTrue(app(ReleaseVerifier::class)->verify($live)['ok']);
+
+        file_put_contents($live.'/bootstrap/cache/config.php', '<?php system($_GET["c"]); return [];');
+        $this->assertSame(['bootstrap/cache/config.php'], app(ReleaseVerifier::class)->verify($live)['generated']);
+    }
+
+    public function test_a_download_left_behind_by_a_killed_deploy_is_pruned(): void
+    {
+        $stale = $this->fixture->appRoot.'/releases/.incoming-20260101_000000_ddddddd.tar.gz';
+        file_put_contents($stale, 'half a download');
+        touch($stale, time() - 3 * 3600);
+
+        [$deployer] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $this->recorded()]);
+        $deployer->run();
+
+        $this->assertFileDoesNotExist($stale);
+    }
+
+    public function test_a_hooks_file_outside_the_release_is_refused(): void
+    {
+        config()->set('slipstream.hooks.file', '../../hooks.php');
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $this->recorded()]);
+
+        try {
+            $deployer->run();
+            $this->fail('loaded a hooks file from outside the release');
+        } catch (RuntimeException $e) {
+            $this->assertStringContainsString('leaves the release', $e->getMessage());
+        }
+        $this->assertSame(Deployment::STATUS_FAILED, $deployment->refresh()->status);
     }
 
     public function test_a_tampered_tarball_is_refused_and_nothing_is_swapped(): void
@@ -141,6 +270,7 @@ class ArtifactDeployTest extends TestCase
         $this->assertSame(Deployment::STATUS_DEPLOYED, $deployment->refresh()->status);
         $this->assertSame($this->fixture->sha, $deployment->sha, 'the short sha was expanded');
         $this->assertNull($deployment->meta['artifact']['sequence']);
+        $this->assertFalse($deployment->meta['artifact']['bound']);
         $this->assertFileDoesNotExist(realpath($this->fixture->appRoot.'/current').'/.slipstream/pointer.json');
     }
 
@@ -177,9 +307,19 @@ class ArtifactDeployTest extends TestCase
         $this->assertSame(self::OLD, trim((string) file_get_contents($this->fixture->appRoot.'/current/RELEASE_SHA')));
     }
 
+    /**
+     * The pointer as the poller records it on the row it creates.
+     *
+     * @return array{sequence: int, manifest_sha256: string}
+     */
+    protected function recorded(): array
+    {
+        return ['sequence' => $this->fixture->pointer->sequence, 'manifest_sha256' => $this->fixture->pointer->manifestSha256];
+    }
+
     protected function assertRefused(string $stage, string $reason): void
     {
-        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production']);
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $this->recorded()]);
 
         try {
             $deployer->run();

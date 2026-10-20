@@ -4,6 +4,8 @@ namespace Slipstream\Tests\Unit;
 
 use Illuminate\Support\Facades\Storage;
 use Slipstream\Release\ArtifactSource;
+use Slipstream\Release\Core\Baseline;
+use Slipstream\Release\Core\SodiumSigner;
 use Slipstream\Release\DeployRef;
 use Slipstream\Tests\Support\ArtifactFixture;
 use Slipstream\Tests\TestCase;
@@ -11,8 +13,8 @@ use Symfony\Component\Process\Process;
 
 /**
  * stubs/slipstream-release.php: the generated single-file tool must be the
- * Core classes as committed, and must verify, refuse, unpack, publish and
- * roll back exactly as the node does.
+ * Core classes as committed, and must verify, refuse, unpack, publish, roll
+ * back and check a live tree exactly as the node does.
  */
 class ReleaseStubTest extends TestCase
 {
@@ -56,6 +58,7 @@ class ReleaseStubTest extends TestCase
         $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
         $this->assertStringContainsString('sha='.$this->fixture->sha."\n", $process->getOutput());
         $this->assertStringContainsString('sequence='.$this->fixture->pointer->sequence."\n", $process->getOutput());
+        $this->assertStringContainsString("previous_manifest_sha256=\n", $process->getOutput());
 
         $process = $this->tool('verify-pointer', ['--ref' => 'refs/heads/staging', '--environment' => 'production', '--keys' => $this->keys(), '--pointer' => $pointer]);
         $this->assertSame(1, $process->getExitCode());
@@ -68,16 +71,23 @@ class ReleaseStubTest extends TestCase
         $this->assertStringContainsString('signature does not verify', $process->getErrorOutput());
     }
 
+    public function test_verify_pointer_prints_the_previous_release_and_its_manifest(): void
+    {
+        $this->fixture->publishSecond();
+        $pointer = $this->fixture->root.'/pointer.json';
+        copy($this->fixture->store.'/app/refs/heads/production.json', $pointer);
+
+        $process = $this->tool('verify-pointer', ['--ref' => 'refs/heads/production', '--environment' => 'production', '--keys' => $this->keys(), '--pointer' => $pointer]);
+
+        $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
+        $this->assertStringContainsString('previous_sha='.$this->fixture->firstSha."\n", $process->getOutput());
+        $this->assertStringContainsString('previous_manifest_sha256='.$this->fixture->pointer->previous['manifest_sha256']."\n", $process->getOutput());
+    }
+
     public function test_it_verifies_and_unpacks_a_release_and_refuses_a_tampered_archive(): void
     {
-        $release = $this->fixture->store.'/app/releases/'.$this->fixture->sha;
         $into = $this->fixture->root.'/unpacked';
-        $arguments = [
-            '--sha' => $this->fixture->sha, '--environment' => 'production', '--keys' => $this->keys(),
-            '--manifest' => $release.'/manifest.json', '--signature' => $release.'/manifest.sig',
-            '--archive' => $release.'/release.tar.gz', '--extract-to' => $into,
-            '--manifest-sha256' => $this->fixture->pointer->manifestSha256,
-        ];
+        $arguments = $this->releaseArguments($into);
 
         $process = $this->tool('verify-release', $arguments);
         $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
@@ -93,15 +103,28 @@ class ReleaseStubTest extends TestCase
         $this->assertDirectoryDoesNotExist($this->fixture->root.'/unpacked-2/app');
     }
 
+    public function test_verify_release_refuses_another_ref_and_leaves_nothing_behind(): void
+    {
+        $process = $this->tool('verify-release', ['--ref' => 'refs/heads/staging'] + $this->releaseArguments($this->fixture->root.'/staging'));
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('it was built for refs/heads/production; this node deploys refs/heads/staging', $process->getErrorOutput());
+
+        // A file whose hash is wrong surfaces part-way through the unpack.
+        $this->fixture->publishWithFileHashMismatch();
+        $into = $this->fixture->root.'/partial';
+        $process = $this->tool('verify-release', $this->releaseArguments($into));
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('does not match the manifest', $process->getErrorOutput());
+        $this->assertDirectoryDoesNotExist($into, 'what was unpacked before the refusal is removed');
+    }
+
     public function test_it_publishes_and_rolls_back_through_a_file_store_as_the_node_reads_it(): void
     {
         $store = $this->fixture->root.'/ci-store';
         mkdir($store);
-        $secret = 'sodium:'.base64_encode(sodium_crypto_sign_secretkey(sodium_crypto_sign_keypair()));
-        $signer = \Slipstream\Release\Core\SodiumSigner::fromSpec($secret, 'ci-key');
-        $common = ['--ref' => 'refs/heads/production', '--environment' => 'production', '--key' => $secret, '--key-id' => 'ci-key', '--store' => 'file://'.$store, '--by' => 'actions'];
+        [$secret, $signer, $common] = $this->ciKey($store);
 
-        $process = $this->tool('publish', $common + ['--archive' => $this->fixture->dist.'/release.tar.gz', '--manifest' => $this->fixture->dist.'/manifest.json']);
+        $process = $this->tool('publish', $common + $this->built());
         $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
         $this->assertStringContainsString('refs/heads/production → aaaaaaa (sequence', $process->getOutput());
         $this->assertFileExists($store.'/releases/'.$this->fixture->sha.'/release.tar.gz');
@@ -119,16 +142,162 @@ class ReleaseStubTest extends TestCase
         // A second release, then a rollback to the first.
         $first = $this->fixture->sha;
         $this->fixture->writeCheckout(['app/Hello.php' => '<?php // v2'])->package(str_repeat('b', 40));
-        $process = $this->tool('publish', $common + ['--archive' => $this->fixture->dist.'/release.tar.gz', '--manifest' => $this->fixture->dist.'/manifest.json']);
+        $process = $this->tool('publish', ['--sha' => str_repeat('b', 40)] + $common + $this->built());
         $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
         $second = app(ArtifactSource::class)->pointer(DeployRef::parse('refs/heads/production'), fresh: true);
         $this->assertSame([str_repeat('b', 40), $first], [$second->sha, $second->previous['sha']]);
 
-        $process = $this->tool('rollback', $common + ['--sha' => $first]);
+        $process = $this->tool('rollback', ['--sha' => $first] + $common);
         $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
         $back = app(ArtifactSource::class)->pointer(DeployRef::parse('refs/heads/production'), fresh: true);
         $this->assertSame([$first, null], [$back->sha, $back->previous]);
         $this->assertGreaterThan($second->sequence, $back->sequence);
+    }
+
+    public function test_publish_needs_the_commit_and_the_nodes_keys_from_the_publish_job(): void
+    {
+        $store = $this->fixture->root.'/ci-store';
+        mkdir($store);
+        [, , $common] = $this->ciKey($store);
+
+        $process = $this->tool('publish', array_diff_key($common, ['--sha' => true]) + $this->built(), ['GITHUB_SHA' => '']);
+        $this->assertSame(2, $process->getExitCode());
+        $this->assertStringContainsString('--sha is required', $process->getErrorOutput());
+
+        $process = $this->tool('publish', ['--sha' => str_repeat('c', 40)] + $common + $this->built());
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('the build says it is '.$this->fixture->sha, $process->getErrorOutput());
+
+        $process = $this->tool('publish', array_diff_key($common, ['--keys' => true]) + $this->built());
+        $this->assertSame(2, $process->getExitCode());
+        $this->assertStringContainsString('--keys is required', $process->getErrorOutput());
+
+        // Signed with a key the nodes do not hold: refused before anything uploads.
+        $process = $this->tool('publish', ['--keys' => $this->keys()] + $common + $this->built());
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('Nodes would refuse the statement', $process->getErrorOutput());
+        $this->assertSame([], glob($store.'/*') ?: []);
+    }
+
+    public function test_a_published_release_is_never_replaced(): void
+    {
+        $store = $this->fixture->root.'/ci-store';
+        mkdir($store);
+        [, , $common] = $this->ciKey($store);
+
+        $this->assertSame(0, $this->tool('publish', $common + $this->built())->getExitCode());
+        $again = $this->tool('publish', $common + $this->built());
+        $this->assertSame(0, $again->getExitCode(), $again->getErrorOutput());
+        $this->assertStringContainsString('Already in the store: release.tar.gz', $again->getOutput());
+
+        $archive = hash_file('sha256', $store.'/releases/'.$this->fixture->sha.'/release.tar.gz');
+        $this->fixture->writeCheckout(['app/Hello.php' => '<?php // rebuilt'])->package();
+        $process = $this->tool('publish', $common + $this->built());
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('already in the store with different content', $process->getErrorOutput());
+        $this->assertSame($archive, hash_file('sha256', $store.'/releases/'.$this->fixture->sha.'/release.tar.gz'));
+    }
+
+    public function test_verify_tree_checks_the_live_release_from_outside_it(): void
+    {
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/one');
+        $tree = fn (array $extra = []) => $this->tool('verify-tree', $extra + ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production']);
+
+        $process = $tree();
+        $this->assertSame(0, $process->getExitCode(), $process->getOutput().$process->getErrorOutput());
+        $this->assertStringContainsString('ok: ', $process->getOutput());
+
+        // The verifier the release carries is just another file to it.
+        file_put_contents($release.'/vendor/slipstream/slipstream/composer.json', '{"name":"slipstream/slipstream","patched":true}');
+        $process = $tree(['--json' => true]);
+        $this->assertSame(1, $process->getExitCode());
+        $line = json_decode(trim($process->getOutput()), true);
+        $this->assertSame('artifact.verify_drift', $line['event']);
+        $this->assertSame(['vendor/slipstream/slipstream/composer.json'], $line['modified']);
+
+        unlink($release.'/.slipstream/manifest.json');
+        $process = $tree();
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('no signed manifest', $process->getOutput());
+    }
+
+    public function test_verify_tree_pins_the_recorded_cache_hashes_in_a_state_directory(): void
+    {
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/two');
+        @mkdir($release.'/bootstrap/cache', 0777, true);
+        file_put_contents($release.'/bootstrap/cache/config.php', '<?php return [];');
+        file_put_contents($release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($release)));
+        $state = $this->fixture->root.'/state';
+        $tree = fn () => $this->tool('verify-tree', ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production', '--state-dir' => $state]);
+
+        $this->assertSame(0, $tree()->getExitCode());
+        $this->assertCount(1, glob($state.'/*.json') ?: []);
+
+        // Someone with write access to the tree changes a cache and the
+        // record of it alike: the pinned copy still knows.
+        file_put_contents($release.'/bootstrap/cache/config.php', '<?php system($_GET["c"]); return [];');
+        file_put_contents($release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($release)));
+        $process = $tree();
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('bootstrap/cache/config.php', $process->getOutput());
+        $this->assertStringContainsString('the recorded hashes changed since the release was first checked', $process->getOutput());
+    }
+
+    public function test_verify_tree_accepts_links_only_at_the_shared_paths_it_is_told(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('needs symlinks.');
+        }
+
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/three');
+        mkdir($this->fixture->appRoot.'/shared/uploads', 0777, true);
+        symlink($this->fixture->appRoot.'/shared/uploads', $release.'/public/uploads');
+        $arguments = ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production'];
+
+        $process = $this->tool('verify-tree', $arguments);
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('symlinks (1): public/uploads', $process->getOutput());
+
+        $this->assertSame(0, $this->tool('verify-tree', $arguments + ['--shared' => 'public/uploads'])->getExitCode());
+    }
+
+    public function test_publish_writes_s3_objects_write_once_and_the_pointer_conditionally(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('the fake aws is a POSIX shell script.');
+        }
+
+        $s3 = $this->fixture->root.'/s3';
+        $bin = $this->fixture->root.'/bin';
+        mkdir($s3);
+        mkdir($bin);
+        file_put_contents($bin.'/fake-aws.php', self::FAKE_AWS);
+        file_put_contents($bin.'/aws', "#!/bin/sh\nexec \"".PHP_BINARY.'" "'.$bin."/fake-aws.php\" \"\$@\"\n");
+        chmod($bin.'/aws', 0755);
+        $env = ['PATH' => $bin.':'.getenv('PATH'), 'FAKE_S3_ROOT' => $s3];
+        [, , $common] = $this->ciKey('s3://app-releases/production');
+
+        $process = $this->tool('publish', $common + $this->built(), $env);
+        $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
+        $calls = (string) file_get_contents($s3.'/calls.log');
+        $this->assertStringContainsString('s3api put-object --bucket app-releases --key production/releases/'.$this->fixture->sha.'/release.tar.gz --body ', $calls);
+        $this->assertMatchesRegularExpression('#put-object --bucket app-releases --key production/releases/\S+/release\.tar\.gz --body \S+ --if-none-match \* #', $calls);
+        $this->assertMatchesRegularExpression('#put-object --bucket app-releases --key production/refs/heads/production\.json --body \S+ --output json --if-none-match \*#', $calls);
+
+        // A re-run: the release objects exist with the same bytes, so the
+        // 412s are compared and skipped; the pointer is replaced If-Match.
+        $process = $this->tool('publish', $common + $this->built(), $env);
+        $this->assertSame(0, $process->getExitCode(), $process->getErrorOutput());
+        $this->assertStringContainsString('Already in the store: release.tar.gz', $process->getOutput());
+        $this->assertMatchesRegularExpression('#refs/heads/production\.json --body \S+ --output json --if-match "[0-9a-f]{32}"#', (string) file_get_contents($s3.'/calls.log'));
+
+        // Another publish moved the pointer between the read and the write.
+        touch($s3.'/force-conflict');
+        $before = (string) file_get_contents($s3.'/app-releases/production/refs/heads/production.json');
+        $process = $this->tool('publish', $common + $this->built(), $env);
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('Another publish moved refs/heads/production.json while this one ran', $process->getErrorOutput());
+        $this->assertSame($before, (string) file_get_contents($s3.'/app-releases/production/refs/heads/production.json'));
     }
 
     public function test_usage_and_missing_options_exit_2(): void
@@ -139,22 +308,115 @@ class ReleaseStubTest extends TestCase
         $this->assertStringContainsString('--pointer is required', $process->getErrorOutput());
     }
 
+    /**
+     * An `aws` that keeps objects in a directory and honours the two
+     * conditional headers the tool sends; force-conflict makes the next
+     * pointer write lose a race.
+     */
+    protected const FAKE_AWS = <<<'PHP'
+<?php
+$root = getenv('FAKE_S3_ROOT');
+$args = array_slice($argv, 1);
+file_put_contents($root.'/calls.log', implode(' ', $args)."\n", FILE_APPEND);
+$opt = function (string $name) use ($args) {
+    $i = array_search('--'.$name, $args, true);
+    return $i === false ? null : ($args[$i + 1] ?? null);
+};
+$path = $root.'/'.$opt('bucket').'/'.$opt('key');
+$etag = fn (string $file) => '"'.md5_file($file).'"';
+$precondition = function () {
+    fwrite(STDERR, "\nAn error occurred (PreconditionFailed) when calling the PutObject operation: At least one of the pre-conditions you specified did not hold\n");
+    exit(254);
+};
+if (($args[0] ?? '') !== 's3api') {
+    fwrite(STDERR, "unsupported\n");
+    exit(2);
+}
+if ($args[1] === 'get-object') {
+    if (! is_file($path)) {
+        fwrite(STDERR, "\nAn error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist.\n");
+        exit(254);
+    }
+    copy($path, $args[6]);
+    echo json_encode(['ETag' => $etag($path)]);
+    exit(0);
+}
+if ($args[1] === 'put-object') {
+    if (str_ends_with($path, '.json') && str_contains($path, '/refs/') && is_file($root.'/force-conflict')) {
+        $precondition();
+    }
+    if ($opt('if-none-match') === '*' && is_file($path)) {
+        $precondition();
+    }
+    if (($match = $opt('if-match')) !== null && (! is_file($path) || $etag($path) !== $match)) {
+        $precondition();
+    }
+    @mkdir(dirname($path), 0777, true);
+    copy($opt('body'), $path);
+    echo json_encode(['ETag' => $etag($path)]);
+    exit(0);
+}
+fwrite(STDERR, "unsupported\n");
+exit(2);
+PHP;
+
     protected function keys(): string
     {
         return $this->fixture->keyId.':'.$this->fixture->publicKey;
     }
 
     /**
-     * @param  array<string, string>  $options
+     * A CI key the nodes trust, and the options every publish passes.
+     *
+     * @return array{0: string, 1: SodiumSigner, 2: array<string, string>}
      */
-    protected function tool(string $command, array $options): Process
+    protected function ciKey(string $store): array
+    {
+        $secret = 'sodium:'.base64_encode(sodium_crypto_sign_secretkey(sodium_crypto_sign_keypair()));
+        $signer = SodiumSigner::fromSpec($secret, 'ci-key');
+
+        return [$secret, $signer, [
+            '--ref' => 'refs/heads/production', '--environment' => 'production', '--key' => $secret, '--key-id' => 'ci-key',
+            '--store' => str_contains($store, '://') ? $store : 'file://'.$store, '--by' => 'actions',
+            '--sha' => $this->fixture->sha, '--keys' => 'ci-key:'.base64_encode($signer->publicKey()),
+        ]];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    protected function built(): array
+    {
+        return ['--archive' => $this->fixture->dist.'/release.tar.gz', '--manifest' => $this->fixture->dist.'/manifest.json'];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    protected function releaseArguments(string $into): array
+    {
+        $release = $this->fixture->store.'/app/releases/'.$this->fixture->sha;
+
+        return [
+            '--sha' => $this->fixture->sha, '--ref' => 'refs/heads/production', '--environment' => 'production', '--keys' => $this->keys(),
+            '--manifest' => $release.'/manifest.json', '--signature' => $release.'/manifest.sig',
+            '--archive' => $release.'/release.tar.gz', '--extract-to' => $into,
+            '--manifest-sha256' => $this->fixture->pointer->manifestSha256,
+        ];
+    }
+
+    /**
+     * @param  array<string, string|bool>  $options
+     * @param  array<string, string>  $env
+     */
+    protected function tool(string $command, array $options, array $env = []): Process
     {
         $argv = [PHP_BINARY, $this->tool, $command];
         foreach ($options as $name => $value) {
-            $argv[] = $name.'='.$value;
+            $argv[] = $value === true ? $name : $name.'='.$value;
         }
 
-        $process = new Process($argv);
+        $process = new Process($argv, null, $env + ['GITHUB_SHA' => false]);
         $process->setTimeout(120);
         $process->run();
 

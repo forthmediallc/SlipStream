@@ -11,6 +11,7 @@ use Slipstream\Fleet\Heartbeat;
 use Slipstream\Fleet\LastGood;
 use Slipstream\Models\Deployment;
 use Slipstream\Models\Server;
+use Slipstream\Release\ArtifactSource;
 use Slipstream\Release\DeployRef;
 use Slipstream\Release\ReleaseHistory;
 use Slipstream\Release\ReleaseRef;
@@ -83,6 +84,11 @@ class BootstrapCommand extends Command
         }
         $this->components->twoColumnDetail('Deploy ref', $ref->describe().' → '.$release->name.' at '.$release->short());
 
+        // In artifact mode, the signed pointer that named the release: the
+        // deploy fetches the manifest it names, and its previous is the one
+        // release a fresh node may fall back to.
+        $pointer = $source instanceof ArtifactSource ? $source->pointer($ref) : null;
+
         // Only what current serves is live. The checkout this runs from is a
         // throwaway clone of the deploy ref, so its HEAD is usually the very
         // commit about to be deployed, and says nothing about this node.
@@ -91,6 +97,27 @@ class BootstrapCommand extends Command
 
         if ($running === $release->sha) {
             $this->components->twoColumnDetail('Release', 'already serving '.$release->short());
+        } elseif ($pointer !== null) {
+            if (! $this->deploy($runner, $release, $ref, true, ['sequence' => $pointer->sequence, 'manifest_sha256' => $pointer->manifestSha256])) {
+                if ($this->option('no-fallback') || $pointer->previous === null || $pointer->previous['sha'] === $release->sha) {
+                    Activity::log('bootstrap.failed', ['sha' => $release->sha, 'ref' => $release->ref()]);
+
+                    return $this->failWith('The deploy of '.$release->short().' failed'
+                        .($this->option('no-fallback') ? '.' : ', and the pointer names no previous release to fall back to.'));
+                }
+
+                $fallback = new ReleaseRef($pointer->previous['sha'], $release->name, $ref->isTag());
+                $this->components->warn('Falling back to the pointer\'s previous release '.$fallback->short().', which the signed pointer vouches for.');
+                Activity::log('bootstrap.fell_back', ['failed_sha' => $release->sha, 'sha' => $fallback->sha, 'ref' => $release->ref(), 'from' => 'pointer.previous']);
+
+                if (! $this->deploy($runner, $fallback, $ref, false, ['sequence' => $pointer->sequence, 'manifest_sha256' => $pointer->previous['manifest_sha256']])) {
+                    Activity::log('bootstrap.failed', ['sha' => $fallback->sha, 'ref' => $release->ref(), 'fallback' => true]);
+
+                    return $this->failWith('The fallback deploy of '.$fallback->short().' failed too.');
+                }
+
+                $fellBack = $fallback;
+            }
         } elseif (! $this->deploy($runner, $release, $ref, true)) {
             $good = $this->option('no-fallback') ? null : $lastGood->get($ref);
             $refused = null;
@@ -216,7 +243,10 @@ class BootstrapCommand extends Command
      * marked as the ref, so it counts towards the fleet's last good commit;
      * a fallback is not.
      */
-    protected function deploy(DeploymentRunner $runner, ReleaseRef $release, DeployRef $ref, bool $isRef): bool
+    /**
+     * @param  array{sequence: int, manifest_sha256: string}|null  $pointer  artifact mode: the pointer that vouches for this release, and the manifest it names
+     */
+    protected function deploy(DeploymentRunner $runner, ReleaseRef $release, DeployRef $ref, bool $isRef, ?array $pointer = null): bool
     {
         $deployment = Deployment::query()->create([
             'server_name' => Slipstream::serverName(),
@@ -227,6 +257,7 @@ class BootstrapCommand extends Command
             'meta' => array_filter([
                 'deploy_from' => $release->isTag ? 'tag' : null,
                 'poll_ref' => $isRef ? $ref->key() : null,
+                'pointer' => $pointer,
             ]),
         ]);
 

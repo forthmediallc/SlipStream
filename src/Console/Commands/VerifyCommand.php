@@ -43,16 +43,34 @@ class VerifyCommand extends Command
         $result = $verifier->verify($release);
 
         if (! $result['manifest']) {
-            if ($this->option('json')) {
-                $this->json($result);
-            } else {
-                $this->components->warn("Nothing to verify: {$release} carries no .slipstream/manifest.json".($result['signature_error'] ? ' ('.$result['signature_error'].')' : ' — a release deployed from git has none').'.');
+            $reason = $result['signature_error'] ?? 'it carries no .slipstream/manifest.json';
+
+            // In git mode a release has no manifest to compare. In artifact
+            // mode every release has one, so a missing or unreadable one is
+            // drift, never silence: deleting it must not stop the check.
+            if (! Slipstream::artifactMode()) {
+                if ($this->option('json')) {
+                    $this->json($result);
+                } else {
+                    $this->components->warn("Nothing to verify: {$release} carries no .slipstream/manifest.json — a release deployed from git has none.");
+                }
+
+                return self::NOTHING_TO_VERIFY;
             }
 
-            return self::NOTHING_TO_VERIFY;
+            if ($this->option('audit')) {
+                AuditLog::record('artifact.verify_drift', ['release' => $release, 'sha' => null, 'reason' => 'no usable manifest: '.$reason]);
+            }
+            if ($this->option('json')) {
+                $this->json($result + ['reason' => 'no usable manifest: '.$reason]);
+            } else {
+                $this->components->error("Cannot verify {$release}: {$reason}. In artifact mode every release carries its signed manifest; redeploy it (php artisan slipstream:deploy) and find out what removed it.");
+            }
+
+            return self::FAILURE;
         }
 
-        $drift = count($result['modified']) + count($result['missing']) + count($result['unlisted']) + count($result['links']);
+        $drift = count($result['modified']) + count($result['missing']) + count($result['unlisted']) + count($result['links']) + count($result['generated']);
 
         if ($this->option('audit')) {
             AuditLog::record($result['ok'] ? 'artifact.verify_ok' : 'artifact.verify_drift', [
@@ -65,7 +83,9 @@ class VerifyCommand extends Command
                 'missing' => count($result['missing']),
                 'unlisted' => count($result['unlisted']),
                 'links' => count($result['links']),
-                'paths' => array_slice(array_merge($result['modified'], $result['missing'], $result['unlisted'], $result['links']), 0, 20),
+                'generated' => count($result['generated']),
+                'baseline' => $result['baseline'],
+                'paths' => array_slice(array_merge($result['modified'], $result['missing'], $result['unlisted'], $result['links'], $result['generated']), 0, 20),
             ]);
         }
 
@@ -82,7 +102,11 @@ class VerifyCommand extends Command
             $this->components->twoColumnDetail('RELEASE_SHA', '<fg=red>'.$result['release_sha'].', not the manifest\'s</>');
         }
 
-        foreach (['modified' => 'Modified', 'missing' => 'Missing', 'unlisted' => 'Not in the manifest', 'links' => 'Symlinks'] as $kind => $label) {
+        $this->components->twoColumnDetail('Generated caches', $result['baseline']
+            ? ($result['generated'] === [] ? 'match the hashes recorded at deploy' : '<fg=red>changed since the deploy</>')
+            : 'no hashes recorded (deployed before 0.6.1)');
+
+        foreach (['modified' => 'Modified', 'missing' => 'Missing', 'unlisted' => 'Not in the manifest', 'links' => 'Symlinks', 'generated' => 'Generated since the deploy'] as $kind => $label) {
             if ($result[$kind] === []) {
                 continue;
             }

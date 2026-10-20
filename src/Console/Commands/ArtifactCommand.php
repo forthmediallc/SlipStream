@@ -29,7 +29,10 @@ class ArtifactCommand extends Command
                             {action : package | sign | publish | list | keygen}
                             {dir=dist : The dist directory: package writes it, sign and publish read it}
                             {--checkout= : package: the checkout to build (default: the current directory)}
-                            {--sha= : The commit: package builds it (default: git rev-parse HEAD); publish --rollback points at it}
+                            {--sha= : The commit. package: default git rev-parse HEAD; publish and sign: required, default GITHUB_SHA, and the build must agree; publish --rollback: the release to point at}
+                            {--generated= : publish, sign: paths a node writes itself, comma-separated (default bootstrap/cache,public/storage,public/hot)}
+                            {--allow= : publish, sign: paths outside vendor/ allowed to carry key material, comma-separated}
+                            {--keys= : publish, sign: the nodes\' public keys, to check they will accept what is signed (default: SLIPSTREAM_RELEASE_PUBLIC_KEYS)}
                             {--ref= : The ref CI publishes to, e.g. refs/heads/production (package: default GITHUB_REF or the checked-out branch; publish: the build\'s)}
                             {--environment= : The environment the release is signed for (default: SLIPSTREAM_RELEASE_ENVIRONMENT)}
                             {--no-install : package: skip composer install (already done)}
@@ -105,7 +108,7 @@ class ArtifactCommand extends Command
             return self::SUCCESS;
         }
 
-        $prepared = app(Publisher::class)->prepare((string) $this->argument('dir'), $signer, $this->environment(), fn (string $line) => $this->line('  '.$line));
+        $prepared = app(Publisher::class)->prepare((string) $this->argument('dir'), $this->publishSha(), $signer, $this->environment(), fn (string $line) => $this->line('  '.$line), $this->publishOptions());
 
         $this->components->twoColumnDetail('Commit', $prepared['manifest']->sha);
         $this->components->twoColumnDetail('Key', $signer->keyId());
@@ -128,13 +131,13 @@ class ArtifactCommand extends Command
             if ($sha === '' || $refOption === '') {
                 throw new \RuntimeException('A rollback names the release and the ref: --rollback --sha=<sha> --ref=refs/heads/production');
             }
-            $pointer = $publisher->rollback($sha, DeployRef::parse($refOption), $signer, $by, $environment, $say);
+            $pointer = $publisher->rollback($sha, DeployRef::parse($refOption), $signer, $by, $environment, $say, $this->publishOptions());
         } else {
             $dir = (string) $this->argument('dir');
             $ref = $this->option('ref')
                 ? DeployRef::parse((string) $this->option('ref'))
                 : DeployRef::parse(\Slipstream\Release\Core\Manifest::fromJson((string) @file_get_contents(rtrim($dir, '/\\').DIRECTORY_SEPARATOR.ArtifactStore::MANIFEST))->ref);
-            $pointer = $publisher->publish($dir, $ref, $signer, $by, $environment, $say);
+            $pointer = $publisher->publish($dir, $ref, $this->publishSha(), $signer, $by, $environment, $say, $this->publishOptions());
         }
 
         $this->components->twoColumnDetail('Ref', $pointer->ref);
@@ -154,7 +157,7 @@ class ArtifactCommand extends Command
         $state = ['ref' => $ref->full(), 'pointer' => null, 'error' => null, 'releases' => $store->releases()];
 
         try {
-            $pointer = (new ArtifactSource($store, app(\Slipstream\Release\ArtifactSequence::class)))->pointer($ref);
+            $pointer = (new ArtifactSource($store, app(\Slipstream\Release\ArtifactSequence::class)))->pointer($ref, accept: false);
             $state['pointer'] = $pointer->toPayload() + ['key_id' => $pointer->keyId];
         } catch (\Throwable $e) {
             $state['error'] = $e->getMessage();
@@ -202,6 +205,41 @@ class ArtifactCommand extends Command
         }
 
         return Signers::fromSpec($spec, $this->option('key-id') ?: null);
+    }
+
+    /**
+     * The commit being published, from the publish job — never the build's
+     * word. GitHub Actions sets GITHUB_SHA.
+     */
+    protected function publishSha(): string
+    {
+        $sha = trim((string) ($this->option('sha') ?: getenv('GITHUB_SHA') ?: ''));
+        if ($sha === '') {
+            throw new \RuntimeException('Name the commit being published: --sha=<40 hex> (GitHub Actions sets GITHUB_SHA). The build job does not get to say which commit it built.');
+        }
+
+        return $sha;
+    }
+
+    /**
+     * @return array{generated?: list<string>, allow?: list<string>, keys?: Keys}
+     */
+    protected function publishOptions(): array
+    {
+        $list = fn (string $name) => array_values(array_filter(array_map('trim', explode(',', (string) $this->option($name))), fn (string $item) => $item !== ''));
+        $options = [];
+
+        if ($this->option('generated') !== null) {
+            $options['generated'] = $list('generated');
+        }
+        if ($this->option('allow') !== null) {
+            $options['allow'] = $list('allow');
+        }
+        if ($this->option('keys') !== null) {
+            $options['keys'] = Keys::parse((string) $this->option('keys'));
+        }
+
+        return $options;
     }
 
     protected function environment(): string

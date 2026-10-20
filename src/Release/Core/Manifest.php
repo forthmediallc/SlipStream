@@ -14,6 +14,15 @@ final class Manifest
 
     public const MAX_PATH = 4096;
 
+    /** What a node writes into a release itself; publish lists these unless told otherwise. */
+    public const DEFAULT_GENERATED = ['bootstrap/cache', 'public/storage', 'public/hot'];
+
+    /** Files the deploy itself adds to every release. */
+    public const NODE_WRITTEN = ['RELEASE_SHA', '.slipstream'];
+
+    /** What the deploy replaces with links to the shared copies, besides the shared paths. */
+    public const NODE_LINKED = ['storage', '.env', 'auth.json'];
+
     /**
      * @param  array<string, array{0: string, 1: int}>  $files  path => [sha256, size], sorted by path
      * @param  list<string>  $generated
@@ -78,7 +87,9 @@ final class Manifest
         $seen = [];
         $clean = [];
         foreach ($files as $path => $entry) {
-            if (! is_string($path) || ! self::validPath($path)) {
+            // json_decode turns a digit-only name ("404") into an int key.
+            $path = (string) $path;
+            if (! self::validPath($path)) {
                 $refuse('file path '.json_encode($path, JSON_UNESCAPED_SLASHES));
             }
             if (! is_array($entry) || ! array_is_list($entry) || count($entry) !== 2
@@ -169,34 +180,33 @@ final class Manifest
     }
 
     /**
-     * Compare a tree on disk with the manifest. Paths under an ignored prefix
-     * are skipped entirely; symlinks are never followed, and one anywhere
-     * else is reported as such.
+     * Compare a tree on disk with the manifest. Symlinks are never followed.
      *
-     * @param  list<string>  $ignore  path prefixes
+     * Paths under $linked are what the deploy replaces with links to shared
+     * copies (storage, the .env, the shared paths): skipped entirely. Every
+     * other file the manifest lists is always checked, wherever it is. Paths
+     * under $generated only excuse what the manifest does not list — files
+     * and links the node writes itself (bootstrap/cache, public/storage) —
+     * so no ignore list can hide a change to a file CI signed.
+     *
+     * @param  list<string>  $linked  path prefixes
+     * @param  list<string>  $generated  path prefixes
      * @return array{modified: list<string>, missing: list<string>, unlisted: list<string>, links: list<string>}
      */
-    public function verifyTree(string $root, array $ignore = []): array
+    public function verifyTree(string $root, array $linked = [], array $generated = []): array
     {
-        $ignored = function (string $path) use ($ignore): bool {
-            foreach ($ignore as $prefix) {
-                $prefix = rtrim($prefix, '/');
-                if ($path === $prefix || str_starts_with($path, $prefix.'/')) {
-                    return true;
-                }
-            }
-
-            return false;
-        };
+        $isLinked = fn (string $path): bool => self::under($path, $linked);
+        $isGenerated = fn (string $path): bool => self::under($path, $generated);
 
         $found = [];
         $links = [];
-        $this->walk($root, '', $ignored, $found, $links);
+        $this->walk($root, '', $isLinked, $found, $links);
 
         $modified = [];
         $missing = [];
         foreach ($this->files as $path => [$sha, $size]) {
-            if ($ignored($path)) {
+            $path = (string) $path;
+            if ($isLinked($path)) {
                 continue;
             }
             if (! isset($found[$path])) {
@@ -209,10 +219,33 @@ final class Manifest
             }
         }
 
-        $unlisted = array_values(array_filter(array_keys($found), fn (string $path) => ! isset($this->files[$path])));
+        $unlisted = [];
+        foreach (array_keys($found) as $path) {
+            $path = (string) $path;
+            if (! isset($this->files[$path]) && ! $isGenerated($path)) {
+                $unlisted[] = $path;
+            }
+        }
         sort($unlisted, SORT_STRING);
 
+        $links = array_values(array_filter($links, fn (string $path) => ! $isGenerated($path)));
+
         return ['modified' => $modified, 'missing' => $missing, 'unlisted' => $unlisted, 'links' => $links];
+    }
+
+    /**
+     * @param  list<string>  $prefixes
+     */
+    public static function under(string $path, array $prefixes): bool
+    {
+        foreach ($prefixes as $prefix) {
+            $prefix = trim(str_replace('\\', '/', (string) $prefix), '/');
+            if ($prefix !== '' && ($path === $prefix || str_starts_with($path, $prefix.'/'))) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

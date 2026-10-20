@@ -89,8 +89,93 @@ class ArtifactSourceTest extends TestCase
         $release = app(ReleaseSource::class)->latest(DeployRef::fromConfig());
 
         $this->assertSame([self::SHA, 'production', false], [$release->sha, $release->name, $release->isTag]);
-        $this->assertSame('1000', app(SettingsRepository::class)->get('artifact_sequence:branch:production'), 'the node remembers what it accepted');
-        $this->assertSame(1000, app(ArtifactSequence::class)->highWater(DeployRef::fromConfig()));
+        $this->assertSame('1000:'.self::MANIFEST, app(SettingsRepository::class)->get('artifact_sequence:branch:production'), 'the node remembers what it accepted');
+        $this->assertSame(['sequence' => 1000, 'manifest' => self::MANIFEST], app(ArtifactSequence::class)->highWater(DeployRef::fromConfig()));
+    }
+
+    public function test_a_mark_from_before_0_6_1_still_counts_and_learns_its_manifest(): void
+    {
+        app(SettingsRepository::class)->set('artifact_sequence:branch:production', '1000');
+        $this->publish(['sequence' => 999]);
+        try {
+            app(ReleaseSource::class)->latest(DeployRef::fromConfig());
+            $this->fail('followed a pointer below the old mark');
+        } catch (ArtifactRefused $e) {
+            $this->assertStringContainsString('sequence 999 is below 1000', $e->reason);
+        }
+
+        $this->publish(['sequence' => 1000]);
+        $this->assertSame(self::SHA, app(ReleaseSource::class)->latest(DeployRef::fromConfig())->sha);
+        $this->assertSame('1000:'.self::MANIFEST, app(SettingsRepository::class)->get('artifact_sequence:branch:production'));
+    }
+
+    public function test_an_implausible_mark_is_ignored_audited_once_and_replaced(): void
+    {
+        config()->set('slipstream.audit.enabled', true);
+        Log::spy();
+        $huge = time() + 30 * 86400;
+        app(SettingsRepository::class)->set('artifact_sequence:branch:production', (string) $huge);
+        \Slipstream\Fleet\SharedStore::cache()->put('slipstream:artifact-seq:'.sha1('branch:production|'.\Slipstream\Fleet\SharedStore::scope()), '99999999999999999999999', 3600);
+        $this->publish(['sequence' => 1000]);
+
+        // One write to the store or the database must not stop every node deploying.
+        $this->assertSame(self::SHA, app(ReleaseSource::class)->latest(DeployRef::fromConfig())->sha);
+        $this->assertSame(self::SHA, app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), fresh: true)->sha);
+
+        Log::shouldHaveReceived('info')->with('slipstream.artifact.mark_ignored', \Mockery::on(fn (array $c) => $c['where'] === 'local' && $c['sequence'] === $huge))->once();
+        Log::shouldHaveReceived('info')->with('slipstream.artifact.mark_ignored', \Mockery::on(fn (array $c) => $c['where'] === 'shared'))->once();
+        $this->assertSame(['sequence' => 1000, 'manifest' => self::MANIFEST], app(ArtifactSequence::class)->highWater(DeployRef::fromConfig()), 'both marks were replaced by the accepted pointer');
+    }
+
+    public function test_an_equal_sequence_naming_another_release_is_refused(): void
+    {
+        $this->publish(['sequence' => 1000]);
+        app(ReleaseSource::class)->latest(DeployRef::fromConfig());
+
+        $this->publish(['sequence' => 1000, 'sha' => self::OLDER, 'manifest_sha256' => str_repeat('2', 64)]);
+        try {
+            app(ReleaseSource::class)->latest(DeployRef::fromConfig());
+            $this->fail('followed a second release under the same sequence');
+        } catch (ArtifactRefused $e) {
+            $this->assertStringContainsString('sequence 1000 already named another release', $e->reason);
+        }
+    }
+
+    public function test_a_refusal_is_audited_once_per_change(): void
+    {
+        config()->set('slipstream.audit.enabled', true);
+        Log::spy();
+        $other = SodiumSigner::fromSpec('sodium:'.SodiumSigner::generate()['secret'], 'prod-2026');
+        $read = function () {
+            try {
+                app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), fresh: true);
+            } catch (ArtifactRefused) {
+                // Expected.
+            }
+        };
+
+        $this->publish([], $other);
+        $read();
+        $read();
+        $read();
+        $this->publish(['environment' => 'staging']);
+        $read();
+        $this->publish();
+        $read(); // accepted: the memory is cleared
+        $this->publish([], $other);
+        $read();
+
+        Log::shouldHaveReceived('info')->with('slipstream.artifact.refused', \Mockery::on(fn (array $c) => $c['reason'] === 'signature does not verify'))->twice();
+        Log::shouldHaveReceived('info')->with('slipstream.artifact.refused', \Mockery::on(fn (array $c) => str_contains($c['reason'], 'staging')))->once();
+    }
+
+    public function test_listing_the_store_does_not_advance_the_mark(): void
+    {
+        $this->publish(['sequence' => 1000]);
+
+        $this->artisan('slipstream:artifact', ['action' => 'list'])->assertExitCode(0);
+
+        $this->assertNull(app(SettingsRepository::class)->get('artifact_sequence:branch:production'));
     }
 
     public function test_an_older_pointer_is_refused_once_a_newer_one_was_accepted_and_the_same_one_is_not(): void
@@ -197,6 +282,23 @@ class ArtifactSourceTest extends TestCase
         $this->publish();
         $this->assertSame(Poller::DEPLOYING, app(Poller::class)->tick(force: true)['result']);
         $this->assertCount(1, $detacher->calls);
+        $this->assertSame(['sequence' => 1000, 'manifest_sha256' => self::MANIFEST], Deployment::query()->sole()->meta['pointer'], 'the deploy carries the pointer it was started from');
+    }
+
+    public function test_a_deploy_refused_during_the_fetch_backs_off_only_for_the_build_it_was_started_for(): void
+    {
+        $this->app->instance(ProcessDetacher::class, new FakeProcessDetacher);
+        // Refused before meta.artifact was written: only meta.pointer says which build.
+        Deployment::query()->create([
+            'server_name' => 'test-node', 'sha' => self::SHA, 'branch' => 'production', 'trigger' => Deployment::TRIGGER_POLL,
+            'status' => Deployment::STATUS_FAILED, 'finished_at' => now(), 'meta' => ['pointer' => ['sequence' => 1000, 'manifest_sha256' => self::MANIFEST]],
+        ]);
+
+        $this->publish(['manifest_sha256' => self::MANIFEST]);
+        $this->assertSame(Poller::BACKOFF, app(Poller::class)->tick(force: true)['result']);
+
+        $this->publish(['manifest_sha256' => str_repeat('2', 64), 'sequence' => 1001]);
+        $this->assertSame(Poller::DEPLOYING, app(Poller::class)->tick(force: true)['result']);
     }
 
     public function test_back_off_belongs_to_the_release_that_failed_so_a_republished_build_is_tried_at_once(): void

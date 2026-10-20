@@ -103,6 +103,41 @@ class ManifestTest extends TestCase
         $this->assertSame([], $result['links']);
     }
 
+    /**
+     * A generated path excuses what the node writes there; it never hides a
+     * change to a file CI signed. A linked path (storage, the shared paths)
+     * is the node's to replace, and is skipped.
+     */
+    public function test_generated_paths_excuse_only_unlisted_files_and_linked_ones_are_skipped(): void
+    {
+        mkdir($this->root.'/app');
+        mkdir($this->root.'/storage/logs', 0777, true);
+        file_put_contents($this->root.'/app/Hello.php', 'hello');
+        file_put_contents($this->root.'/storage/logs/.gitignore', 'x');
+        $manifest = $this->manifest([
+            'app/Hello.php' => ['sha' => hash('sha256', 'hello'), 'size' => 5],
+            'storage/logs/.gitignore' => ['sha' => hash('sha256', 'shipped'), 'size' => 7],
+        ]);
+
+        file_put_contents($this->root.'/app/Added.php', 'the node wrote this');
+        file_put_contents($this->root.'/app/Hello.php', 'tampered');
+        $result = $manifest->verifyTree($this->root, ['storage'], ['app']);
+
+        $this->assertSame(['app/Hello.php'], $result['modified'], 'a generated path never excuses a signed file');
+        $this->assertSame([], $result['unlisted'], 'it excuses what the manifest does not list');
+        $this->assertSame([], $result['missing'], 'linked paths are skipped, listed files under them included');
+    }
+
+    public function test_a_root_file_named_with_digits_only_parses(): void
+    {
+        $json = $this->manifest(['404' => ['sha' => hash('sha256', 'x'), 'size' => 1], 'app/Hello.php' => ['sha' => hash('sha256', 'y'), 'size' => 1]])->toJson();
+
+        $parsed = Manifest::fromJson($json);
+
+        $this->assertSame([hash('sha256', 'x'), 1], $parsed->files['404']);
+        $this->assertSame($json, $parsed->toJson());
+    }
+
     public function test_verify_tree_never_follows_a_symlink_and_reports_one_outside_the_allowed_places(): void
     {
         if (DIRECTORY_SEPARATOR === '\\') {

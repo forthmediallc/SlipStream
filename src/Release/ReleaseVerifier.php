@@ -3,6 +3,7 @@
 namespace Slipstream\Release;
 
 use Slipstream\Release\Core\ArtifactRefused;
+use Slipstream\Release\Core\Baseline;
 use Slipstream\Release\Core\Envelope;
 use Slipstream\Release\Core\Keys;
 use Slipstream\Release\Core\Manifest;
@@ -19,13 +20,10 @@ use Slipstream\Slipstream;
  */
 class ReleaseVerifier
 {
-    /** @var list<string> */
-    public const ALWAYS_IGNORED = ['storage', '.env', 'auth.json', 'RELEASE_SHA', ArtifactFetcher::SIDECAR];
-
     public function __construct(protected SettingsRepository $settings) {}
 
     /**
-     * @return array{release: string, manifest: bool, sha: ?string, release_sha: ?string, signed: bool, key_id: ?string, signature_error: ?string, files: int, modified: list<string>, missing: list<string>, unlisted: list<string>, links: list<string>, ignored: list<string>, ok: bool}
+     * @return array{release: string, manifest: bool, sha: ?string, release_sha: ?string, signed: bool, key_id: ?string, signature_error: ?string, files: int, modified: list<string>, missing: list<string>, unlisted: list<string>, links: list<string>, generated: list<string>, baseline: bool, ignored: list<string>, linked: list<string>, ok: bool}
      */
     public function verify(string $release, ?string $manifestJson = null, ?string $signature = null): array
     {
@@ -34,7 +32,8 @@ class ReleaseVerifier
         $result = [
             'release' => $release, 'manifest' => false, 'sha' => null, 'release_sha' => null,
             'signed' => false, 'key_id' => null, 'signature_error' => null, 'files' => 0,
-            'modified' => [], 'missing' => [], 'unlisted' => [], 'links' => [], 'ignored' => [], 'ok' => false,
+            'modified' => [], 'missing' => [], 'unlisted' => [], 'links' => [], 'generated' => [], 'baseline' => false,
+            'ignored' => [], 'linked' => [], 'ok' => false,
         ];
 
         $manifestJson ??= is_file($sidecar.DIRECTORY_SEPARATOR.ArtifactStore::MANIFEST)
@@ -74,6 +73,8 @@ class ReleaseVerifier
                     $result['signature_error'] = 'the statement signs another manifest';
                 } elseif ($statement->sha !== $manifest->sha) {
                     $result['signature_error'] = 'the statement signs another commit';
+                } elseif ($environment === null && Slipstream::artifactMode()) {
+                    $result['signature_error'] = 'SLIPSTREAM_RELEASE_ENVIRONMENT is not set, so the environment it was signed for cannot be checked';
                 } elseif ($environment !== null && $statement->environment !== $environment) {
                     $result['signature_error'] = "signed for environment \"{$statement->environment}\"; this node is \"{$environment}\"";
                 } else {
@@ -85,21 +86,36 @@ class ReleaseVerifier
             }
         }
 
-        $ignored = array_values(array_unique(array_merge(
-            self::ALWAYS_IGNORED,
-            $manifest->generated,
-            array_values(array_filter((array) config('slipstream.artifacts.generated', []), 'is_string')),
+        // What the node links to shared copies is skipped; what it writes
+        // itself (the signed manifest's list, never the release's own
+        // config, which ships inside the archive) excuses only unlisted
+        // files. Every file CI signed is checked.
+        $linked = array_values(array_unique(array_merge(
+            Manifest::NODE_LINKED,
             array_map(fn (string $path) => trim(str_replace('\\', '/', $path), '/'), array_keys($this->sharedPaths())),
         )));
+        $ignored = array_values(array_unique(array_merge(Manifest::NODE_WRITTEN, $manifest->generated)));
+        $result['linked'] = $linked;
         $result['ignored'] = $ignored;
 
-        $tree = $manifest->verifyTree($release, $ignored);
+        $tree = $manifest->verifyTree($release, $linked, $ignored);
         $result['modified'] = $tree['modified'];
         $result['missing'] = $tree['missing'];
         $result['unlisted'] = $tree['unlisted'];
         $result['links'] = $tree['links'];
+
+        // The caches the node generated, against the hashes the deploy
+        // recorded just before the swap.
+        $baselineFile = $sidecar.DIRECTORY_SEPARATOR.Baseline::FILE;
+        if (is_file($baselineFile)) {
+            $baseline = Baseline::fromJson((string) file_get_contents($baselineFile));
+            $result['baseline'] = true;
+            $result['generated'] = $baseline === null ? [Baseline::DIRECTORY.' (the recorded hashes are unreadable)'] : Baseline::compare($release, $baseline);
+        }
+
         $result['ok'] = $result['signed']
             && $tree['modified'] === [] && $tree['missing'] === [] && $tree['unlisted'] === [] && $tree['links'] === []
+            && $result['generated'] === []
             && ($result['release_sha'] === null || $result['release_sha'] === $manifest->sha);
 
         return $result;
@@ -123,7 +139,7 @@ class ReleaseVerifier
         }
 
         $drift = [];
-        foreach (['modified', 'missing', 'unlisted', 'links'] as $kind) {
+        foreach (['modified', 'missing', 'unlisted', 'links', 'generated'] as $kind) {
             if ($result[$kind] !== []) {
                 $drift[] = count($result[$kind]).' '.$kind.' ('.implode(', ', array_slice($result[$kind], 0, 3)).(count($result[$kind]) > 3 ? ', …' : '').')';
             }

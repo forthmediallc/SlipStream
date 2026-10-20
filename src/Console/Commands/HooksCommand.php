@@ -126,7 +126,7 @@ class HooksCommand extends Command
                 $h->name.(($why = $skipped($h)) ? " ({$why})" : ''),
                 $h->server_names ? implode(', ', $h->server_names) : 'all',
                 $h->fleet_lock ? 'fleet' : '—',
-                $this->truncate(HookScript::firstCommand((string) $h->script), 48).(HookScript::isMultiLine((string) $h->script) ? ' …' : ''),
+                $this->truncate(HookScript::firstCommand(DefaultHooks::effectiveScript($h)), 48).(HookScript::isMultiLine(DefaultHooks::effectiveScript($h)) ? ' …' : ''),
             ])->all()
         );
         if ($fileHooks !== null) {
@@ -164,7 +164,7 @@ class HooksCommand extends Command
         $this->components->twoColumnDetail('Order', (string) $hook->sort_order);
         $this->newLine();
         $this->line('<options=bold>Script</>');
-        foreach (explode("\n", str_replace("\r\n", "\n", (string) $hook->script)) as $line) {
+        foreach (explode("\n", str_replace("\r\n", "\n", DefaultHooks::effectiveScript($hook))) as $line) {
             $this->line('  '.htmlspecialchars($line, ENT_NOQUOTES));
         }
 
@@ -377,7 +377,8 @@ class HooksCommand extends Command
             'servers' => $hook->server_names,
             'fleet_lock' => (bool) $hook->fleet_lock,
             'sort_order' => $hook->sort_order,
-            'script' => $hook->script,
+            // What runs: an untouched default runs its current text.
+            'script' => DefaultHooks::effectiveScript($hook),
         ];
     }
 

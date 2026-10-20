@@ -75,17 +75,26 @@ class ArtifactSource implements ReleaseHistory, ReleaseSource
             $this->refuse($ref, 'pointer', "it names {$pointer->ref}, not {$ref->full()}", ['key_id' => $pointer->keyId]);
         }
 
-        $highWater = $this->sequence->highWater($ref);
+        $mark = $this->sequence->highWater($ref);
+        $highWater = $mark['sequence'];
         if ($pointer->sequence < $highWater) {
             $this->refuse($ref, 'pointer', "sequence {$pointer->sequence} is below {$highWater}, which this node already accepted; publish a rollback rather than put an old pointer back", ['key_id' => $pointer->keyId, 'sha' => $pointer->sha]);
+        }
+        if ($pointer->sequence === $highWater && $mark['manifest'] !== null && $mark['manifest'] !== $pointer->manifestSha256) {
+            $this->refuse($ref, 'pointer', "sequence {$pointer->sequence} already named another release (manifest ".substr($mark['manifest'], 0, 12).'…); a publish must raise the sequence', ['key_id' => $pointer->keyId, 'sha' => $pointer->sha]);
         }
         if ($pointer->sequence > time() + Pointer::MAX_FUTURE_SECONDS) {
             $this->refuse($ref, 'pointer', "sequence {$pointer->sequence} is more than a day in the future", ['key_id' => $pointer->keyId, 'sha' => $pointer->sha]);
         }
 
-        // A read-only look (status, doctor) checks but records nothing.
+        // A read-only look (status, doctor, artifact list) checks but records nothing.
+        if ($accept) {
+            $this->sequence->forgetRefusal($ref);
+        }
+        if ($accept && ($pointer->sequence > $highWater || $mark['manifest'] === null)) {
+            $this->sequence->advance($ref, $pointer->sequence, $pointer->manifestSha256);
+        }
         if ($accept && $pointer->sequence > $highWater) {
-            $this->sequence->advance($ref, $pointer->sequence);
             AuditLog::record('artifact.accepted', [
                 'ref' => $pointer->ref,
                 'sha' => $pointer->sha,
@@ -136,11 +145,16 @@ class ArtifactSource implements ReleaseHistory, ReleaseSource
     }
 
     /**
+     * Audited once per change: the same bad pointer, read every minute, is
+     * one line, not 1,440 a day.
+     *
      * @param  array<string, scalar|null>  $context
      */
     protected function refuse(DeployRef $ref, string $stage, string $reason, array $context = []): never
     {
-        AuditLog::record('artifact.refused', ['stage' => $stage, 'reason' => $reason, 'ref' => $ref->full()] + $context);
+        if ($this->sequence->isNewRefusal($ref, sha1($stage.'|'.$reason.'|'.($context['sha'] ?? '')))) {
+            AuditLog::record('artifact.refused', ['stage' => $stage, 'reason' => $reason, 'ref' => $ref->full()] + $context);
+        }
 
         throw new ArtifactRefused($stage, $reason, $context['sha'] ?? null, $context);
     }

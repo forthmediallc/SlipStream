@@ -3,6 +3,7 @@
 namespace Slipstream\Livewire;
 
 use Livewire\Attributes\Locked;
+use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Deploy\DeploySteps;
 use Slipstream\Models\DeploymentHook;
 use Slipstream\Slipstream;
@@ -55,7 +56,8 @@ class DeployHooksPage extends SlipstreamComponent
         $this->hook_step = $hook->step;
         $this->hook_position = $hook->position;
         $this->hook_name = $hook->name;
-        $this->hook_script = $hook->script;
+        // What runs: an untouched default runs its current text.
+        $this->hook_script = DefaultHooks::effectiveScript($hook);
         $this->hook_fleet_lock = (bool) $hook->fleet_lock;
         $this->hook_all_servers = $hook->server_names === null || $hook->server_names === [];
         $this->hook_server_names = $hook->server_names ?? [];

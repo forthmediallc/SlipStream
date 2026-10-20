@@ -57,6 +57,108 @@ final class ArtifactRefused extends \RuntimeException
     }
 }
 
+// — Baseline.php
+
+/**
+ * The caches a node generates into a release (bootstrap/cache/*.php: config,
+ * routes, services, packages, events) are executable and loaded on every
+ * request, but no manifest can list them: they hold the node's own values.
+ * The deploy records their hashes just before the swap, and verification
+ * compares against that record, so a change after the deploy shows up.
+ */
+final class Baseline
+{
+    public const FORMAT = 1;
+
+    public const DIRECTORY = 'bootstrap/cache';
+
+    /** The record's name inside the release's .slipstream directory. */
+    public const FILE = 'generated.json';
+
+    /**
+     * @return array<string, array{0: string, 1: int}>  path => [sha256, size]; a symlink is ['symlink', 0]
+     */
+    public static function record(string $release): array
+    {
+        $files = [];
+        $dir = rtrim($release, '/\\').'/'.self::DIRECTORY;
+
+        foreach (@scandir($dir, SCANDIR_SORT_ASCENDING) ?: [] as $name) {
+            if (! str_ends_with($name, '.php')) {
+                continue;
+            }
+            $file = $dir.'/'.$name;
+            if (is_link($file)) {
+                $files[self::DIRECTORY.'/'.$name] = ['symlink', 0];
+            } elseif (is_file($file)) {
+                $files[self::DIRECTORY.'/'.$name] = [(string) hash_file('sha256', $file), (int) filesize($file)];
+            }
+        }
+
+        return $files;
+    }
+
+    /**
+     * The paths that changed, appeared or went missing since the record.
+     *
+     * @param  array<string, array{0: string, 1: int}>  $baseline
+     * @return list<string>
+     */
+    public static function compare(string $release, array $baseline): array
+    {
+        $now = self::record($release);
+        $changed = [];
+
+        foreach ($baseline as $path => $entry) {
+            if (($now[$path] ?? null) !== $entry) {
+                $changed[] = (string) $path;
+            }
+        }
+        foreach (array_keys($now) as $path) {
+            if (! isset($baseline[$path])) {
+                $changed[] = (string) $path;
+            }
+        }
+
+        sort($changed, SORT_STRING);
+
+        return array_values(array_unique($changed));
+    }
+
+    /**
+     * @param  array<string, array{0: string, 1: int}>  $files
+     */
+    public static function toJson(array $files): string
+    {
+        ksort($files, SORT_STRING);
+
+        return json_encode(['format' => self::FORMAT, 'files' => $files === [] ? new \stdClass : $files], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n";
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: int}>|null  null when the JSON is not a baseline
+     */
+    public static function fromJson(string $json): ?array
+    {
+        $data = json_decode($json, true);
+        if (! is_array($data) || ($data['format'] ?? null) !== self::FORMAT || ! is_array($data['files'] ?? null)) {
+            return null;
+        }
+
+        $files = [];
+        foreach ($data['files'] as $path => $entry) {
+            $path = (string) $path;
+            if (! str_starts_with($path, self::DIRECTORY.'/') || ! is_array($entry) || count($entry) !== 2
+                || ! is_string($entry[0] ?? null) || ! is_int($entry[1] ?? null)) {
+                return null;
+            }
+            $files[$path] = [$entry[0], $entry[1]];
+        }
+
+        return $files;
+    }
+}
+
 // — Envelope.php
 
 /**
@@ -212,6 +314,12 @@ final class Keys
             $entries = trim($entries);
             if (str_starts_with($entries, 'file:')) {
                 $path = substr($entries, 5);
+                // A relative path resolves against the working directory,
+                // which for artisan is the release: the trust anchors would
+                // come from the archive they are meant to check.
+                if (! self::isAbsolute($path)) {
+                    throw new \InvalidArgumentException("SLIPSTREAM_RELEASE_PUBLIC_KEYS=file:{$path} is a relative path; name the key file by an absolute path outside the release, e.g. file:/etc/slipstream/release-keys.");
+                }
                 $contents = is_file($path) ? @file_get_contents($path) : false;
                 if ($contents === false) {
                     throw new \InvalidArgumentException("SLIPSTREAM_RELEASE_PUBLIC_KEYS names {$path}, which cannot be read.");
@@ -255,6 +363,13 @@ final class Keys
     public static function none(): self
     {
         return new self([]);
+    }
+
+    public static function isAbsolute(string $path): bool
+    {
+        return str_starts_with($path, '/')
+            || str_starts_with($path, '\\\\')
+            || preg_match('#^[A-Za-z]:[\\\\/]#', $path) === 1;
     }
 
     /**
@@ -455,6 +570,15 @@ final class Manifest
 
     public const MAX_PATH = 4096;
 
+    /** What a node writes into a release itself; publish lists these unless told otherwise. */
+    public const DEFAULT_GENERATED = ['bootstrap/cache', 'public/storage', 'public/hot'];
+
+    /** Files the deploy itself adds to every release. */
+    public const NODE_WRITTEN = ['RELEASE_SHA', '.slipstream'];
+
+    /** What the deploy replaces with links to the shared copies, besides the shared paths. */
+    public const NODE_LINKED = ['storage', '.env', 'auth.json'];
+
     /**
      * @param  array<string, array{0: string, 1: int}>  $files  path => [sha256, size], sorted by path
      * @param  list<string>  $generated
@@ -519,7 +643,9 @@ final class Manifest
         $seen = [];
         $clean = [];
         foreach ($files as $path => $entry) {
-            if (! is_string($path) || ! self::validPath($path)) {
+            // json_decode turns a digit-only name ("404") into an int key.
+            $path = (string) $path;
+            if (! self::validPath($path)) {
                 $refuse('file path '.json_encode($path, JSON_UNESCAPED_SLASHES));
             }
             if (! is_array($entry) || ! array_is_list($entry) || count($entry) !== 2
@@ -610,34 +736,33 @@ final class Manifest
     }
 
     /**
-     * Compare a tree on disk with the manifest. Paths under an ignored prefix
-     * are skipped entirely; symlinks are never followed, and one anywhere
-     * else is reported as such.
+     * Compare a tree on disk with the manifest. Symlinks are never followed.
      *
-     * @param  list<string>  $ignore  path prefixes
+     * Paths under $linked are what the deploy replaces with links to shared
+     * copies (storage, the .env, the shared paths): skipped entirely. Every
+     * other file the manifest lists is always checked, wherever it is. Paths
+     * under $generated only excuse what the manifest does not list — files
+     * and links the node writes itself (bootstrap/cache, public/storage) —
+     * so no ignore list can hide a change to a file CI signed.
+     *
+     * @param  list<string>  $linked  path prefixes
+     * @param  list<string>  $generated  path prefixes
      * @return array{modified: list<string>, missing: list<string>, unlisted: list<string>, links: list<string>}
      */
-    public function verifyTree(string $root, array $ignore = []): array
+    public function verifyTree(string $root, array $linked = [], array $generated = []): array
     {
-        $ignored = function (string $path) use ($ignore): bool {
-            foreach ($ignore as $prefix) {
-                $prefix = rtrim($prefix, '/');
-                if ($path === $prefix || str_starts_with($path, $prefix.'/')) {
-                    return true;
-                }
-            }
-
-            return false;
-        };
+        $isLinked = fn (string $path): bool => self::under($path, $linked);
+        $isGenerated = fn (string $path): bool => self::under($path, $generated);
 
         $found = [];
         $links = [];
-        $this->walk($root, '', $ignored, $found, $links);
+        $this->walk($root, '', $isLinked, $found, $links);
 
         $modified = [];
         $missing = [];
         foreach ($this->files as $path => [$sha, $size]) {
-            if ($ignored($path)) {
+            $path = (string) $path;
+            if ($isLinked($path)) {
                 continue;
             }
             if (! isset($found[$path])) {
@@ -650,10 +775,33 @@ final class Manifest
             }
         }
 
-        $unlisted = array_values(array_filter(array_keys($found), fn (string $path) => ! isset($this->files[$path])));
+        $unlisted = [];
+        foreach (array_keys($found) as $path) {
+            $path = (string) $path;
+            if (! isset($this->files[$path]) && ! $isGenerated($path)) {
+                $unlisted[] = $path;
+            }
+        }
         sort($unlisted, SORT_STRING);
 
+        $links = array_values(array_filter($links, fn (string $path) => ! $isGenerated($path)));
+
         return ['modified' => $modified, 'missing' => $missing, 'unlisted' => $unlisted, 'links' => $links];
+    }
+
+    /**
+     * @param  list<string>  $prefixes
+     */
+    public static function under(string $path, array $prefixes): bool
+    {
+        foreach ($prefixes as $prefix) {
+            $prefix = trim(str_replace('\\', '/', (string) $prefix), '/');
+            if ($prefix !== '' && ($path === $prefix || str_starts_with($path, $prefix.'/'))) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -810,13 +958,17 @@ final class ReleaseBuilder
     /**
      * @param  array{slipstream: string, environment: string, sha: string, ref: string, built_at: string, php: string, generated: list<string>}  $meta
      * @param  array{max_unpacked_bytes?: int, max_entries?: int}  $limits
+     * @param  (\Closure(string, array<string, array{0: string, 1: int}>): void)|null  $inspect  sees the unpacked tree before it is removed; throws to refuse
      */
-    public static function manifestFromArchive(string $tarGz, array $meta, array $limits = []): Manifest
+    public static function manifestFromArchive(string $tarGz, array $meta, array $limits = [], ?\Closure $inspect = null): Manifest
     {
         $scratch = self::scratchDirectory();
 
         try {
             $files = TarReader::extract($tarGz, $scratch, $limits);
+            if ($inspect !== null) {
+                $inspect($scratch, $files);
+            }
         } finally {
             self::removeTree($scratch);
         }
@@ -842,6 +994,60 @@ final class ReleaseBuilder
             $files,
             array_values($meta['generated']),
         );
+    }
+
+    /**
+     * What publish runs on the archive it is about to sign: the same rules
+     * the packager applies, now on bytes the build job cannot talk its way
+     * around.
+     *
+     * @param  list<string>  $allow  paths allowed to carry key material
+     * @return \Closure(string, array<string, array{0: string, 1: int}>): void
+     */
+    public static function inspector(array $allow = []): \Closure
+    {
+        return function (string $root, array $files) use ($allow): void {
+            $problems = ReleaseRules::problems($root, array_map('strval', array_keys($files)), $allow);
+            if ($problems !== []) {
+                throw new \RuntimeException('Refusing to publish: '.implode('; ', array_slice($problems, 0, 10))
+                    .(count($problems) > 10 ? '; and '.(count($problems) - 10).' more' : '')
+                    .'. Leave them out of the build (or name a path that may carry a key with --allow).');
+            }
+        };
+    }
+
+    /**
+     * Everything a node will check about these bytes, checked before they
+     * leave CI: the manifest parses as a node parses it, and both envelopes
+     * verify under the keys the nodes hold. A KMS alias pointing at a key no
+     * node trusts is found here, not by every node refusing the pointer.
+     *
+     * @throws \RuntimeException
+     */
+    public static function selfCheck(?string $manifestJson, ?string $statementEnvelope, ?string $pointerEnvelope, Keys $nodeKeys): void
+    {
+        if ($nodeKeys->count() === 0) {
+            throw new \RuntimeException('No node keys to check against: pass --keys with the nodes\' SLIPSTREAM_RELEASE_PUBLIC_KEYS.');
+        }
+
+        if ($manifestJson !== null) {
+            try {
+                Manifest::fromJson($manifestJson);
+            } catch (ArtifactRefused $e) {
+                throw new \RuntimeException('Nodes would refuse this manifest: '.$e->reason);
+            }
+        }
+
+        foreach ([[Envelope::DOMAIN_MANIFEST, $statementEnvelope, 'statement'], [Envelope::DOMAIN_POINTER, $pointerEnvelope, 'pointer']] as [$domain, $envelope, $what]) {
+            if ($envelope === null) {
+                continue;
+            }
+            try {
+                Envelope::verify($envelope, $domain, $nodeKeys);
+            } catch (SignatureException|ArtifactRefused $e) {
+                throw new \RuntimeException("Nodes would refuse the {$what}: ".$e->getMessage().'. Is the signing key in the nodes\' SLIPSTREAM_RELEASE_PUBLIC_KEYS?');
+            }
+        }
     }
 
     /**
@@ -905,6 +1111,127 @@ final class ReleaseBuilder
             }
         }
         @rmdir($path);
+    }
+}
+
+// — ReleaseRules.php
+
+/**
+ * What a release must never carry, wherever it sits in the tree: VCS and
+ * dependency directories, environment and credential files, local
+ * databases, private keys. The packager leaves the names out; publish
+ * applies the same rules to the archive itself, because the build job that
+ * produced it is the untrusted side and Object Lock makes whatever reaches
+ * the bucket permanent.
+ */
+final class ReleaseRules
+{
+    /** Directory names never shipped, at any depth. */
+    public const NEVER_SHIP_DIRECTORIES = ['.git', 'node_modules'];
+
+    /** File names never shipped, at any depth. */
+    public const NEVER_SHIP_FILES = ['auth.json', '.envrc', '.npmrc', '.sentryclirc'];
+
+    /** Key-store extensions refused outside vendor/. */
+    public const KEY_STORES = ['p12', 'pfx', 'jks', 'keystore'];
+
+    /** Files larger than this are not read for key material. */
+    public const SCAN_LIMIT = 1048576;
+
+    /**
+     * Whether a path, or any directory on the way to it, must never ship.
+     */
+    public static function neverShips(string $path): bool
+    {
+        $segments = explode('/', trim(str_replace('\\', '/', $path), '/'));
+        $last = count($segments) - 1;
+
+        foreach ($segments as $i => $segment) {
+            if (in_array($segment, self::NEVER_SHIP_DIRECTORIES, true)) {
+                return true;
+            }
+            if ($i === $last && self::neverShipsName($segment, $path)) {
+                return true;
+            }
+            // Name rules apply to directories on the way too (.env.d, …).
+            if ($i < $last && (str_starts_with($segment, '.env') && $segment !== '.env.example')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Why a file must not ship, judged by what it holds: a private key, or
+     * a key store. Null when it may. Vendor code and allowed paths pass;
+     * public certificates (a CA bundle) are fine.
+     *
+     * @param  list<string>  $allow  paths or path prefixes allowed to carry key material
+     */
+    public static function secretProblem(string $path, ?string $contents, array $allow = []): ?string
+    {
+        $path = trim(str_replace('\\', '/', $path), '/');
+        if (str_starts_with($path, 'vendor/') || Manifest::under($path, $allow)) {
+            return null;
+        }
+
+        if (in_array(strtolower(pathinfo($path, PATHINFO_EXTENSION)), self::KEY_STORES, true)) {
+            return "{$path} is a key store";
+        }
+        if ($contents !== null && preg_match('/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/', $contents) === 1) {
+            return "{$path} holds a private key";
+        }
+
+        return null;
+    }
+
+    /**
+     * Every problem with a tree on disk, for the files given: names that
+     * never ship and key material.
+     *
+     * @param  list<string>  $paths  release-relative files
+     * @param  list<string>  $allow
+     * @return list<string>
+     */
+    public static function problems(string $root, array $paths, array $allow = []): array
+    {
+        $problems = [];
+
+        foreach ($paths as $path) {
+            $path = (string) $path;
+            if (self::neverShips($path)) {
+                $problems[] = "{$path} must never ship";
+
+                continue;
+            }
+
+            $file = $root.'/'.$path;
+            $contents = null;
+            if (! str_starts_with($path, 'vendor/') && is_file($file) && (int) filesize($file) <= self::SCAN_LIMIT) {
+                $contents = (string) @file_get_contents($file);
+            }
+            if (($problem = self::secretProblem($path, $contents, $allow)) !== null) {
+                $problems[] = $problem;
+            }
+        }
+
+        return $problems;
+    }
+
+    private static function neverShipsName(string $name, string $path): bool
+    {
+        if (in_array($name, self::NEVER_SHIP_FILES, true)) {
+            return true;
+        }
+        if (str_starts_with($name, '.env') && $name !== '.env.example') {
+            return true;
+        }
+        if (str_starts_with($name, '.yarnrc')) {
+            return true;
+        }
+
+        return ! str_starts_with(ltrim($path, '/'), 'vendor/') && preg_match('/\.sqlite3?$/i', $name) === 1;
     }
 }
 
@@ -1086,17 +1413,30 @@ final class Statement
  * budget enforced as it goes, nothing written through a symlink, nothing
  * overwritten, and every file hashed while it is written and compared with
  * the manifest. Anything else refuses the archive.
+ *
+ * It reads exactly what TarWriter writes and nothing looser: POSIX ustar
+ * headers, size-0 directory entries, GNU long names, two zero blocks at the
+ * end. Where other tar readers disagree with each other (a directory with a
+ * size, a file named like a directory, a GNU header's prefix field), the
+ * archive is refused rather than read one way here and another in review.
  */
 final class TarReader
 {
     public const BLOCK = 512;
+
+    /** What a long name and a header may add to an entry, at most. */
+    public const ENTRY_OVERHEAD = 6144;
+
+    /** The end marker, plus the zero padding a record may carry after it. */
+    public const TAIL = 11264;
 
     /**
      * @param  array{max_unpacked_bytes?: int, max_entries?: int}  $limits
      * @param  array<string, array{0: string, 1: int}>|null  $expected  the manifest's files; when given, every file must be in it and match, and all of them must be present
      * @return array<string, array{0: string, 1: int}>  the files extracted, release-relative, each with its SHA-256 and size, in archive order
      *
-     * @throws ArtifactRefused
+     * @throws ArtifactRefused  for an archive the node will not take
+     * @throws \RuntimeException  when the disk is the problem (a write that does not complete)
      */
     public static function extract(string $tarGz, string $into, array $limits = [], ?array $expected = null): array
     {
@@ -1107,6 +1447,7 @@ final class TarReader
         if ($gz === false) {
             throw new ArtifactRefused('archive', 'the archive cannot be opened');
         }
+        $stream = new TarStream($gz, self::readCap($maxBytes, $maxEntries));
 
         $extracted = [];
         $bytes = 0;
@@ -1116,26 +1457,38 @@ final class TarReader
 
         try {
             while (true) {
-                $header = self::readBlock($gz);
-                if ($header === null) {
-                    throw new ArtifactRefused('archive', 'the archive ends without an end-of-archive marker');
+                $header = $stream->read(self::BLOCK);
+                if (strlen($header) !== self::BLOCK) {
+                    throw new ArtifactRefused('archive', $header === '' ? 'the archive ends without an end-of-archive marker' : 'the archive is truncated');
                 }
                 if ($header === str_repeat("\0", self::BLOCK)) {
-                    $second = self::readBlock($gz);
-                    if ($second !== str_repeat("\0", self::BLOCK)) {
+                    if ($longName !== null) {
+                        throw new ArtifactRefused('archive', 'a long-name entry is not followed by the entry it names');
+                    }
+                    if ($stream->readExactly(self::BLOCK) !== str_repeat("\0", self::BLOCK)) {
                         throw new ArtifactRefused('archive', 'the archive ends without an end-of-archive marker');
                     }
-                    while (($rest = gzread($gz, 65536)) !== false && $rest !== '') {
-                        if (trim($rest, "\0") !== '') {
-                            throw new ArtifactRefused('archive', 'data follows the end-of-archive marker');
-                        }
-                    }
+                    self::checkTail($stream);
                     break;
                 }
 
                 $fields = self::parseHeader($header);
                 $type = $fields['type'];
                 $size = $fields['size'];
+
+                if ($type === 'L') {
+                    if ($longName !== null) {
+                        throw new ArtifactRefused('archive', 'two long-name entries in a row');
+                    }
+                    if ($size < 1 || $size > Manifest::MAX_PATH + 1) {
+                        throw new ArtifactRefused('archive', 'a long-name entry of an impossible size');
+                    }
+                    $longName = rtrim($stream->readExactly($size), "\0");
+                    $stream->skip(self::padding($size));
+
+                    continue;
+                }
+
                 $name = $longName ?? $fields['name'];
                 $longName = null;
 
@@ -1143,17 +1496,14 @@ final class TarReader
                     throw new ArtifactRefused('archive', "more than {$maxEntries} entries");
                 }
 
-                if ($type === 'L') {
-                    if ($size < 1 || $size > Manifest::MAX_PATH + 1) {
-                        throw new ArtifactRefused('archive', 'a long-name entry of an impossible size');
-                    }
-                    $longName = rtrim(self::readData($gz, $size), "\0");
-
-                    continue;
-                }
-
                 if ($type !== '0' && $type !== "\0" && $type !== '5') {
                     throw new ArtifactRefused('archive', 'refusing '.self::describeType($type).' entry "'.self::printable($name).'"');
+                }
+                if ($type === '5' && $size !== 0) {
+                    throw new ArtifactRefused('archive', 'refusing the directory entry "'.self::printable($name).'", which claims '.$size.' bytes of data');
+                }
+                if ($type !== '5' && str_ends_with($name, '/')) {
+                    throw new ArtifactRefused('archive', 'refusing the file entry "'.self::printable($name).'", which is named like a directory');
                 }
 
                 $name = rtrim($name, '/');
@@ -1163,7 +1513,6 @@ final class TarReader
 
                 if ($type === '5') {
                     self::ensureDirectory($into, $name, $created);
-                    self::skipData($gz, $size);
 
                     continue;
                 }
@@ -1188,28 +1537,11 @@ final class TarReader
                 if (is_link($target) || file_exists($target)) {
                     throw new ArtifactRefused('archive', 'the archive lists '.self::printable($name).' twice');
                 }
-                $out = @fopen($target, 'xb');
-                if ($out === false) {
-                    throw new ArtifactRefused('archive', 'cannot write '.self::printable($name));
-                }
 
-                $hash = hash_init('sha256');
-                $remaining = $size;
-                while ($remaining > 0) {
-                    $chunk = gzread($gz, min(65536, $remaining));
-                    if ($chunk === false || $chunk === '') {
-                        fclose($out);
-                        throw new ArtifactRefused('archive', 'the archive is truncated inside '.self::printable($name));
-                    }
-                    hash_update($hash, $chunk);
-                    fwrite($out, $chunk);
-                    $remaining -= strlen($chunk);
-                }
-                fclose($out);
-                self::skipData($gz, ($size % self::BLOCK === 0) ? 0 : self::BLOCK - ($size % self::BLOCK));
+                $digest = self::writeFile($stream, $target, $name, $size);
+                $stream->skip(self::padding($size));
                 @chmod($target, ($fields['mode'] & 0100) ? 0755 : 0644);
 
-                $digest = hash_final($hash);
                 if ($expected !== null && $expected[$name][0] !== $digest) {
                     throw new ArtifactRefused('files', self::printable($name).' does not match the manifest', null, ['expected' => $expected[$name][0], 'actual' => $digest]);
                 }
@@ -1221,7 +1553,7 @@ final class TarReader
         }
 
         if ($expected !== null) {
-            $missing = array_diff(array_keys($expected), array_keys($extracted));
+            $missing = array_diff(array_map('strval', array_keys($expected)), array_map('strval', array_keys($extracted)));
             if ($missing !== []) {
                 throw new ArtifactRefused('files', count($missing).' file(s) the manifest lists are not in the archive: '.implode(', ', array_slice(array_values($missing), 0, 5)));
             }
@@ -1231,55 +1563,91 @@ final class TarReader
     }
 
     /**
-     * @param  resource  $gz
+     * How many decompressed bytes an archive within these limits can need.
      */
-    private static function readBlock($gz): ?string
+    public static function readCap(int $maxBytes, int $maxEntries): int
     {
-        $block = self::readData($gz, self::BLOCK, false);
+        $cap = (float) $maxBytes + (float) $maxEntries * self::ENTRY_OVERHEAD + self::TAIL;
 
-        return $block === '' ? null : $block;
+        return $cap >= PHP_INT_MAX ? PHP_INT_MAX : (int) $cap;
     }
 
     /**
-     * @param  resource  $gz
+     * Write one entry's data, hashing what goes to disk. A write that does
+     * not complete (a full disk, a quota, a file-size limit) stops the
+     * extract: the hash would otherwise vouch for bytes that never landed.
      */
-    private static function readData($gz, int $size, bool $strict = true): string
+    private static function writeFile(TarStream $stream, string $target, string $name, int $size): string
     {
-        $data = '';
-        while (strlen($data) < $size) {
-            $chunk = gzread($gz, $size - strlen($data));
-            if ($chunk === false || $chunk === '') {
-                break;
+        $out = @fopen($target, 'xb');
+        if ($out === false) {
+            throw new ArtifactRefused('archive', 'cannot write '.self::printable($name));
+        }
+
+        $hash = hash_init('sha256');
+        $remaining = $size;
+        try {
+            while ($remaining > 0) {
+                $chunk = $stream->read(min(65536, $remaining));
+                if ($chunk === '') {
+                    throw new ArtifactRefused('archive', 'the archive is truncated inside '.self::printable($name));
+                }
+                hash_update($hash, $chunk);
+                self::writeAll($out, $chunk, $name);
+                $remaining -= strlen($chunk);
             }
-            $data .= $chunk;
+        } catch (\Throwable $e) {
+            @fclose($out);
+
+            throw $e;
         }
 
-        if ($strict && strlen($data) !== $size) {
-            throw new ArtifactRefused('archive', 'the archive is truncated');
+        if (! fclose($out)) {
+            throw new \RuntimeException('Cannot finish writing '.self::printable($name).'; the disk may be full.');
         }
-        if (! $strict && $data !== '' && strlen($data) !== $size) {
-            throw new ArtifactRefused('archive', 'the archive is truncated');
-        }
-
-        if ($size % self::BLOCK !== 0 && $strict) {
-            self::skipData($gz, self::BLOCK - ($size % self::BLOCK));
+        clearstatcache(true, $target);
+        $onDisk = @filesize($target);
+        if ($onDisk !== $size) {
+            throw new \RuntimeException(self::printable($name).' is '.var_export($onDisk, true)." bytes on disk, not {$size}: the write did not complete (is the disk full?).");
         }
 
-        return $data;
+        return hash_final($hash);
     }
 
     /**
-     * @param  resource  $gz
+     * @param  resource  $out
      */
-    private static function skipData($gz, int $size): void
+    private static function writeAll($out, string $data, string $name): void
     {
-        while ($size > 0) {
-            $chunk = gzread($gz, min(65536, $size));
-            if ($chunk === false || $chunk === '') {
-                throw new ArtifactRefused('archive', 'the archive is truncated');
+        $offset = 0;
+        $length = strlen($data);
+        while ($offset < $length) {
+            $written = @fwrite($out, $offset === 0 ? $data : substr($data, $offset));
+            if ($written === false || $written === 0) {
+                throw new \RuntimeException('Cannot write '.self::printable($name).'; the disk may be full.');
             }
-            $size -= strlen($chunk);
+            $offset += $written;
         }
+    }
+
+    /**
+     * After the end marker: zero padding up to a record, then nothing. The
+     * rest is never inflated to look for more.
+     */
+    private static function checkTail(TarStream $stream): void
+    {
+        $padding = $stream->read(self::TAIL - 2 * self::BLOCK);
+        if (trim($padding, "\0") !== '') {
+            throw new ArtifactRefused('archive', 'data follows the end-of-archive marker');
+        }
+        if (strlen($padding) === self::TAIL - 2 * self::BLOCK && ! $stream->atEnd()) {
+            throw new ArtifactRefused('archive', 'data follows the end-of-archive marker');
+        }
+    }
+
+    private static function padding(int $size): int
+    {
+        return $size % self::BLOCK === 0 ? 0 : self::BLOCK - ($size % self::BLOCK);
     }
 
     /**
@@ -1287,8 +1655,10 @@ final class TarReader
      */
     private static function parseHeader(string $header): array
     {
-        if (substr($header, 257, 5) !== 'ustar') {
-            throw new ArtifactRefused('archive', 'not a ustar archive');
+        // POSIX ustar only, as TarWriter writes it. A GNU header ("ustar  ")
+        // uses the prefix field for other things, and readers disagree.
+        if (substr($header, 257, 6) !== "ustar\0" || substr($header, 263, 2) !== '00') {
+            throw new ArtifactRefused('archive', 'not a POSIX ustar header');
         }
 
         $sum = 0;
@@ -1368,7 +1738,82 @@ final class TarReader
 
     private static function printable(string $name): string
     {
-        return mb_strimwidth(preg_replace('/[^\x20-\x7e]/', '?', $name) ?? '', 0, 200, '…');
+        $clean = preg_replace('/[^\x20-\x7e]/', '?', $name) ?? '';
+
+        return strlen($clean) > 200 ? substr($clean, 0, 199).'...' : $clean;
+    }
+}
+
+// — TarStream.php
+
+/**
+ * The decompressed bytes of a release tarball, counted. Every byte the
+ * reader takes — headers, file data, padding, long names, what follows the
+ * end marker — goes through here, so a small archive cannot be made to
+ * inflate past what the release and its framing need.
+ */
+final class TarStream
+{
+    private int $read = 0;
+
+    /**
+     * @param  resource  $gz
+     */
+    public function __construct(private $gz, private int $cap) {}
+
+    /**
+     * Up to $size bytes; fewer only at the end of the stream.
+     */
+    public function read(int $size): string
+    {
+        $data = '';
+        while (strlen($data) < $size) {
+            $chunk = gzread($this->gz, min(65536, $size - strlen($data)));
+            if ($chunk === false || $chunk === '') {
+                break;
+            }
+            $this->count(strlen($chunk));
+            $data .= $chunk;
+        }
+
+        return $data;
+    }
+
+    /**
+     * Exactly $size bytes, or the archive is truncated.
+     */
+    public function readExactly(int $size): string
+    {
+        $data = $this->read($size);
+        if (strlen($data) !== $size) {
+            throw new ArtifactRefused('archive', 'the archive is truncated');
+        }
+
+        return $data;
+    }
+
+    public function skip(int $size): void
+    {
+        while ($size > 0) {
+            $chunk = $this->read(min(65536, $size));
+            if ($chunk === '') {
+                throw new ArtifactRefused('archive', 'the archive is truncated');
+            }
+            $size -= strlen($chunk);
+        }
+    }
+
+    public function atEnd(): bool
+    {
+        return $this->read(1) === '';
+    }
+
+    private function count(int $bytes): void
+    {
+        $this->read += $bytes;
+        if ($this->read > $this->cap) {
+            throw new ArtifactRefused('archive', "the archive inflates past {$this->cap} bytes, more than the release and its headers need");
+        }
     }
 }
 
@@ -1565,16 +2010,19 @@ namespace {
 // The main program of stubs/slipstream-release.php: the Core classes above,
 // driven from the command line, with no framework and no Composer. CI signs
 // and publishes with it (the job that holds the signing key runs nothing
-// else), and slipstream-bootstrap.sh verifies the first release with it on a
-// node that has no Slipstream code yet.
+// else), slipstream-bootstrap.sh verifies the first release with it on a node
+// that has no Slipstream code yet, and a root timer checks the live release
+// with it from outside the tree the deploy user can write.
 
 use Slipstream\Release\Core\ArtifactRefused;
+use Slipstream\Release\Core\Baseline;
 use Slipstream\Release\Core\Envelope;
 use Slipstream\Release\Core\Keys;
 use Slipstream\Release\Core\KmsSigner;
 use Slipstream\Release\Core\Manifest;
 use Slipstream\Release\Core\Pointer;
 use Slipstream\Release\Core\ReleaseBuilder;
+use Slipstream\Release\Core\Signer;
 use Slipstream\Release\Core\Signers;
 use Slipstream\Release\Core\Statement;
 use Slipstream\Release\Core\TarReader;
@@ -1582,24 +2030,31 @@ use Slipstream\Release\Core\TarReader;
 const SLIPSTREAM_RELEASE_USAGE = <<<'TXT'
 slipstream-release.php — artifact releases without the framework
 
-  verify-pointer  --ref=refs/heads/production --environment=production --keys=id:base64[,id:base64]
+  verify-pointer  --ref=refs/heads/production --environment=production --keys=id:base64[,id:base64]|file:/abs/path
                   --pointer=<file> [--min-sequence=N]
-                  Prints sha=, manifest_sha256=, sequence=, previous_sha= on success.
+                  Prints sha=, manifest_sha256=, sequence=, previous_sha=, previous_manifest_sha256=.
 
-  verify-release  --sha=<40 hex> --environment=… --keys=… --manifest=<file> --signature=<file>
+  verify-release  --sha=<40 hex> --ref=… --environment=… --keys=… --manifest=<file> --signature=<file>
                   --archive=<file> --extract-to=<empty dir> [--manifest-sha256=<hex>]
-                  [--max-unpacked-bytes=N] [--max-entries=N]
                   Verifies, unpacks, writes RELEASE_SHA and .slipstream/. Prints files=N.
+                  On a refusal, removes what it unpacked.
+
+  verify-tree     --release=<dir> --keys=… --environment=… [--shared=a,b] [--state-dir=<dir>] [--json]
+                  The live release against its signed manifest and the cache hashes recorded at
+                  deploy, from outside it: run it as root from a copy the deploy user cannot
+                  write, with keys from a root-owned file. Exit 0 clean, 1 drift.
 
   publish         --archive=<file> --manifest=<build manifest> --ref=… --environment=…
+                  --sha=<40 hex> (default GITHUB_SHA) --keys=<the nodes' keys>
                   --key=sodium:…|file:…|kms:… [--key-id=…] --store=s3://bucket/prefix|file:///dir
-                  [--by=…] [--keys=…] [--generated=a,b]
-                  Regenerates the manifest from the archive, signs, uploads, then writes the pointer.
+                  [--by=…] [--generated=a,b] [--allow=a,b] [--max-unpacked-bytes=N] [--max-entries=N]
+                  Regenerates the manifest from the archive, checks it as a node would, signs,
+                  uploads write-once, then moves the pointer only if no other publish did.
 
-  rollback        --sha=… --ref=… --environment=… --key=… --store=… [--by=…] [--keys=…]
+  rollback        --sha=… --ref=… --environment=… --keys=… --key=… [--key-id=…] --store=… [--by=…]
                   Points the ref at a release already in the store.
 
-Exit 0 on success, 1 on a refusal or an error (the reason on stderr), 2 on usage.
+Exit 0 on success, 1 on a refusal, drift or error (the reason on stderr), 2 on usage.
 TXT;
 
 /**
@@ -1631,6 +2086,28 @@ function slipstream_release_need(array $options, string $name): string
     return (string) $options[$name];
 }
 
+/**
+ * @param  array<string, string|true>  $options
+ */
+function slipstream_release_option(array $options, string $name): ?string
+{
+    return isset($options[$name]) && $options[$name] !== true && $options[$name] !== '' ? (string) $options[$name] : null;
+}
+
+/**
+ * @param  array<string, string|true>  $options
+ * @param  list<string>  $default
+ * @return list<string>
+ */
+function slipstream_release_list(array $options, string $name, array $default): array
+{
+    if (! isset($options[$name]) || $options[$name] === true) {
+        return $default;
+    }
+
+    return array_values(array_filter(array_map(fn (string $item) => trim($item, " \t/"), explode(',', (string) $options[$name])), fn (string $item) => $item !== ''));
+}
+
 function slipstream_release_fail(string $message, int $code = 1): never
 {
     fwrite(STDERR, "slipstream-release: {$message}\n");
@@ -1652,6 +2129,24 @@ function slipstream_release_read(string $file, int $max): string
     }
 
     return (string) file_get_contents($file);
+}
+
+function slipstream_release_remove_tree(string $path): void
+{
+    if (is_link($path) || is_file($path)) {
+        @unlink($path);
+
+        return;
+    }
+    if (! is_dir($path)) {
+        return;
+    }
+    foreach (scandir($path) ?: [] as $name) {
+        if ($name !== '.' && $name !== '..') {
+            slipstream_release_remove_tree($path.'/'.$name);
+        }
+    }
+    @rmdir($path);
 }
 
 /**
@@ -1679,22 +2174,56 @@ function slipstream_release_pointer(string $envelope, string $ref, string $envir
 }
 
 /**
- * Read an object from the store: a file under file:///dir, or an S3 object
- * through the AWS CLI. Null when it is not there.
+ * @return array{0: string, 1: string}  bucket, key prefix ('' or 'prefix/')
  */
-function slipstream_release_store_get(string $store, string $key): ?string
+function slipstream_release_s3(string $store): array
+{
+    [$bucket, $prefix] = array_pad(explode('/', substr($store, 5), 2), 2, '');
+    $prefix = trim($prefix, '/');
+    if ($bucket === '') {
+        slipstream_release_fail('--store must be s3://bucket/prefix or file:///dir', 2);
+    }
+
+    return [$bucket, $prefix === '' ? '' : $prefix.'/'];
+}
+
+function slipstream_release_file_path(string $store, string $key): string
+{
+    return rtrim(substr($store, 7), '/').'/'.$key;
+}
+
+function slipstream_release_is_conflict(\Throwable $e): bool
+{
+    return preg_match('/PreconditionFailed|ConditionalRequestConflict|\(412\)|\(409\)/i', $e->getMessage()) === 1;
+}
+
+/**
+ * Download an object to a file. False when it is not there.
+ *
+ * @return string|false  the object's ETag (for file://, its content's SHA-1)
+ */
+function slipstream_release_store_fetch(string $store, string $key, string $to): string|false
 {
     if (str_starts_with($store, 'file://')) {
-        $path = rtrim(substr($store, 7), '/').'/'.$key;
+        $path = slipstream_release_file_path($store, $key);
+        if (! is_file($path)) {
+            return false;
+        }
+        if (! copy($path, $to)) {
+            throw new \RuntimeException("Cannot read {$path}.");
+        }
 
-        return is_file($path) ? (string) file_get_contents($path) : null;
+        return (string) sha1_file($to);
     }
     if (str_starts_with($store, 's3://')) {
+        [$bucket, $prefix] = slipstream_release_s3($store);
         try {
-            return KmsSigner::cli(['aws', 's3', 'cp', rtrim($store, '/').'/'.$key, '-', '--quiet']);
+            $meta = json_decode(KmsSigner::cli(['aws', 's3api', 'get-object', '--bucket', $bucket, '--key', $prefix.$key, $to, '--output', 'json']), true);
+
+            return is_array($meta) ? (string) ($meta['ETag'] ?? '') : '';
         } catch (\RuntimeException $e) {
-            if (preg_match('/404|NoSuchKey|does not exist|Not Found/i', $e->getMessage()) === 1) {
-                return null;
+            if (preg_match('/NoSuchKey|Not Found|\(404\)/i', $e->getMessage()) === 1) {
+                return false;
             }
             throw $e;
         }
@@ -1703,21 +2232,126 @@ function slipstream_release_store_get(string $store, string $key): ?string
     slipstream_release_fail('--store must be s3://bucket/prefix or file:///dir', 2);
 }
 
-function slipstream_release_store_put(string $store, string $key, string $file): void
+/**
+ * An object's contents and ETag, or [null, null] when it is not there.
+ *
+ * @return array{0: ?string, 1: ?string}
+ */
+function slipstream_release_store_get(string $store, string $key): array
 {
+    $tmp = (string) tempnam(sys_get_temp_dir(), 'ss-get-');
+    try {
+        $etag = slipstream_release_store_fetch($store, $key, $tmp);
+
+        return $etag === false ? [null, null] : [(string) file_get_contents($tmp), $etag];
+    } finally {
+        @unlink($tmp);
+    }
+}
+
+/**
+ * Write-once. True when written; false when the very same bytes were
+ * already there (a re-run of the publish job). Different bytes are refused:
+ * a published release is never replaced.
+ */
+function slipstream_release_store_put_once(string $store, string $key, string $file): bool
+{
+    $refuse = fn () => new \RuntimeException("{$key} is already in the store with different content. A published release is never replaced: publish a new commit. (If an earlier publish of this commit stopped half-way, remove its releases/<sha>/ objects with the break-glass role first.)");
+
     if (str_starts_with($store, 'file://')) {
-        $path = rtrim(substr($store, 7), '/').'/'.$key;
+        $path = slipstream_release_file_path($store, $key);
         if (! is_dir(dirname($path)) && ! @mkdir(dirname($path), 0755, true)) {
-            slipstream_release_fail('cannot create '.dirname($path));
+            throw new \RuntimeException('Cannot create '.dirname($path).'.');
         }
-        if (! copy($file, $path)) {
-            slipstream_release_fail("cannot write {$path}");
+        $out = @fopen($path, 'xb');
+        if ($out === false) {
+            if (is_file($path) && hash_file('sha256', $path) === hash_file('sha256', $file)) {
+                return false;
+            }
+            throw is_file($path) ? $refuse() : new \RuntimeException("Cannot write {$path}.");
+        }
+        $in = fopen($file, 'rb');
+        $copied = $in !== false ? stream_copy_to_stream($in, $out) : false;
+        if ($in !== false) {
+            fclose($in);
+        }
+        if (! fclose($out) || $copied !== filesize($file)) {
+            @unlink($path);
+            throw new \RuntimeException("Cannot write {$path}.");
+        }
+
+        return true;
+    }
+    if (str_starts_with($store, 's3://')) {
+        [$bucket, $prefix] = slipstream_release_s3($store);
+        try {
+            KmsSigner::cli(['aws', 's3api', 'put-object', '--bucket', $bucket, '--key', $prefix.$key, '--body', $file, '--if-none-match', '*', '--output', 'json']);
+
+            return true;
+        } catch (\RuntimeException $e) {
+            if (! slipstream_release_is_conflict($e)) {
+                throw $e;
+            }
+        }
+
+        $tmp = (string) tempnam(sys_get_temp_dir(), 'ss-cmp-');
+        try {
+            if (slipstream_release_store_fetch($store, $key, $tmp) !== false && hash_file('sha256', $tmp) === hash_file('sha256', $file)) {
+                return false;
+            }
+        } finally {
+            @unlink($tmp);
+        }
+        throw $refuse();
+    }
+
+    slipstream_release_fail('--store must be s3://bucket/prefix or file:///dir', 2);
+}
+
+/**
+ * Write the pointer only if it is still what this publish read: If-Match on
+ * the ETag it read, If-None-Match when there was none. Two publishes can
+ * never both win, so two pointers never share a sequence.
+ */
+function slipstream_release_store_put_pointer(string $store, string $key, string $file, ?string $etag): void
+{
+    $moved = fn () => new \RuntimeException("Another publish moved {$key} while this one ran; nothing was pointed. Run the publish again.");
+
+    if (str_starts_with($store, 'file://')) {
+        $path = slipstream_release_file_path($store, $key);
+        if (! is_dir(dirname($path)) && ! @mkdir(dirname($path), 0755, true)) {
+            throw new \RuntimeException('Cannot create '.dirname($path).'.');
+        }
+        $lock = fopen($path.'.lock', 'c');
+        if ($lock === false || ! flock($lock, LOCK_EX)) {
+            throw new \RuntimeException("Cannot lock {$path}.");
+        }
+        try {
+            $now = is_file($path) ? (string) sha1_file($path) : null;
+            if ($now !== $etag) {
+                throw $moved();
+            }
+            $tmp = $path.'.tmp-'.bin2hex(random_bytes(4));
+            if (! copy($file, $tmp) || ! rename($tmp, $path)) {
+                @unlink($tmp);
+                throw new \RuntimeException("Cannot write {$path}.");
+            }
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
         }
 
         return;
     }
     if (str_starts_with($store, 's3://')) {
-        KmsSigner::cli(['aws', 's3', 'cp', $file, rtrim($store, '/').'/'.$key, '--quiet']);
+        [$bucket, $prefix] = slipstream_release_s3($store);
+        $argv = ['aws', 's3api', 'put-object', '--bucket', $bucket, '--key', $prefix.$key, '--body', $file, '--output', 'json'];
+        $argv = array_merge($argv, $etag === null ? ['--if-none-match', '*'] : ['--if-match', $etag]);
+        try {
+            KmsSigner::cli($argv);
+        } catch (\RuntimeException $e) {
+            throw slipstream_release_is_conflict($e) ? $moved() : $e;
+        }
 
         return;
     }
@@ -1727,24 +2361,23 @@ function slipstream_release_store_put(string $store, string $key, string $file):
 
 /**
  * Write the pointer for a ref: the sequence rises past the current one (or
- * now), a publish remembers the pointer it replaces, a rollback does not.
+ * now), a publish remembers the pointer it replaces, a rollback does not;
+ * checked under the nodes' keys before it is written.
+ *
+ * @param  array<string, string|true>  $options
  */
-function slipstream_release_point(array $options, string $sha, string $manifestSha256, bool $rollback): Pointer
+function slipstream_release_point(array $options, string $sha, string $manifestSha256, bool $rollback, Keys $nodeKeys, Signer $signer): Pointer
 {
     $ref = slipstream_release_need($options, 'ref');
     $environment = slipstream_release_need($options, 'environment');
     $store = slipstream_release_need($options, 'store');
-    $signer = Signers::fromSpec(slipstream_release_need($options, 'key'), isset($options['key-id']) ? (string) $options['key-id'] : null);
-    $by = isset($options['by']) && $options['by'] !== true ? (string) $options['by'] : (getenv('GITHUB_ACTOR') ?: get_current_user() ?: 'unknown');
+    $by = slipstream_release_option($options, 'by') ?? (getenv('GITHUB_ACTOR') ?: get_current_user() ?: 'unknown');
 
-    $trusted = (isset($options['keys']) && $options['keys'] !== true ? Keys::parse((string) $options['keys'], 64) : Keys::none())
-        ->with($signer->keyId(), $signer->publicKey());
-
+    [$envelope, $etag] = slipstream_release_store_get($store, $ref.'.json');
     $current = null;
-    $envelope = slipstream_release_store_get($store, $ref.'.json');
     if ($envelope !== null) {
         try {
-            $current = slipstream_release_pointer($envelope, $ref, $environment, $trusted);
+            $current = slipstream_release_pointer($envelope, $ref, $environment, $nodeKeys->with($signer->keyId(), $signer->publicKey()));
         } catch (\Throwable $e) {
             slipstream_release_say('The current pointer does not verify ('.$e->getMessage().'); publishing without a previous.');
         }
@@ -1756,16 +2389,115 @@ function slipstream_release_point(array $options, string $sha, string $manifestS
         : null;
 
     $pointer = new Pointer($ref, $sha, $manifestSha256, $sequence, gmdate('Y-m-d\TH:i:s\Z'), $previous, $by, $environment, 'slipstream-release', $signer->keyId());
+    $signed = Envelope::encode($pointer->toPayload(), Envelope::DOMAIN_POINTER, $signer);
+    ReleaseBuilder::selfCheck(null, null, $signed, $nodeKeys);
 
-    $file = tempnam(sys_get_temp_dir(), 'ss-pointer-');
-    file_put_contents($file, Envelope::encode($pointer->toPayload(), Envelope::DOMAIN_POINTER, $signer));
+    $file = (string) tempnam(sys_get_temp_dir(), 'ss-pointer-');
+    file_put_contents($file, $signed);
     try {
-        slipstream_release_store_put($store, $ref.'.json', $file);
+        slipstream_release_store_put_pointer($store, $ref.'.json', $file, $envelope === null ? null : $etag);
     } finally {
         @unlink($file);
     }
 
     return $pointer;
+}
+
+/**
+ * The live release against its signed manifest, and the caches the node
+ * generated against the hashes the deploy recorded. With a state directory,
+ * each release's manifest and recorded hashes are pinned the first time it
+ * is seen, so rewriting the copies inside the tree is caught too.
+ *
+ * @param  list<string>  $shared
+ * @return array<string, mixed>
+ */
+function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir): array
+{
+    $result = [
+        'release' => $release, 'sha' => null, 'ok' => false, 'reason' => null, 'files' => 0,
+        'modified' => [], 'missing' => [], 'unlisted' => [], 'links' => [], 'generated' => [], 'baseline' => 'none',
+    ];
+    $sidecar = $release.'/.slipstream';
+
+    $json = @file_get_contents($sidecar.'/manifest.json');
+    $signature = @file_get_contents($sidecar.'/manifest.sig');
+    if ($json === false || $signature === false) {
+        $result['reason'] = 'no signed manifest in .slipstream/';
+
+        return $result;
+    }
+
+    try {
+        $manifest = Manifest::fromJson($json);
+        $verified = Envelope::verify($signature, Envelope::DOMAIN_MANIFEST, $keys);
+        $statement = Statement::fromPayload($verified['payload'], $verified['key_id']);
+    } catch (\Throwable $e) {
+        $result['reason'] = 'the manifest does not verify: '.$e->getMessage();
+
+        return $result;
+    }
+
+    $result['sha'] = $manifest->sha;
+    $result['files'] = count($manifest->files);
+    $releaseSha = is_file($release.'/RELEASE_SHA') ? strtolower(trim((string) file_get_contents($release.'/RELEASE_SHA'))) : null;
+    $result['reason'] = match (true) {
+        $statement->manifestSha256 !== hash('sha256', $json) || $statement->manifestSize !== strlen($json) => 'the statement signs another manifest',
+        $statement->sha !== $manifest->sha => 'the statement signs another commit',
+        $statement->environment !== $environment => "it is signed for environment \"{$statement->environment}\", not \"{$environment}\"",
+        $releaseSha !== $manifest->sha => 'RELEASE_SHA is not the manifest\'s commit',
+        default => null,
+    };
+
+    $tree = $manifest->verifyTree($release, array_merge(Manifest::NODE_LINKED, $shared), array_merge(Manifest::NODE_WRITTEN, $manifest->generated));
+    foreach (['modified', 'missing', 'unlisted', 'links'] as $kind) {
+        $result[$kind] = $tree[$kind];
+    }
+
+    $recorded = is_file($sidecar.'/'.Baseline::FILE) ? Baseline::fromJson((string) file_get_contents($sidecar.'/'.Baseline::FILE)) : null;
+    if (is_file($sidecar.'/'.Baseline::FILE) && $recorded === null) {
+        $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes are unreadable)';
+    }
+    $baseline = $recorded;
+    $result['baseline'] = $recorded !== null ? 'recorded' : 'none';
+
+    if ($stateDir !== null) {
+        if (! is_dir($stateDir) && ! @mkdir($stateDir, 0700, true)) {
+            throw new \RuntimeException("Cannot create {$stateDir}.");
+        }
+        foreach (glob(rtrim($stateDir, '/').'/*.json') ?: [] as $old) {
+            $pinned = json_decode((string) file_get_contents($old), true);
+            if (is_array($pinned) && is_string($pinned['release'] ?? null) && ! is_dir($pinned['release'])) {
+                @unlink($old); // that release is gone
+            }
+        }
+
+        $pinFile = rtrim($stateDir, '/').'/'.sha1($release).'.json';
+        $pin = is_file($pinFile) ? json_decode((string) file_get_contents($pinFile), true) : null;
+        if (! is_array($pin)) {
+            file_put_contents($pinFile, json_encode(['release' => $release, 'manifest_sha256' => hash('sha256', $json), 'generated' => $recorded, 'pinned_at' => gmdate('c')], JSON_UNESCAPED_SLASHES));
+            @chmod($pinFile, 0600);
+        } else {
+            if (($pin['manifest_sha256'] ?? null) !== hash('sha256', $json)) {
+                $result['reason'] ??= 'the release carries another manifest than when it was first checked';
+            }
+            if (($pin['generated'] ?? null) !== $recorded) {
+                $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes changed since the release was first checked)';
+            }
+            $baseline = is_array($pin['generated'] ?? null) ? $pin['generated'] : null;
+        }
+        $result['baseline'] = $baseline !== null ? 'pinned' : 'none';
+    }
+
+    if ($baseline !== null) {
+        $result['generated'] = array_values(array_unique(array_merge($result['generated'], Baseline::compare($release, $baseline))));
+    }
+
+    $result['ok'] = $result['reason'] === null
+        && $result['modified'] === [] && $result['missing'] === [] && $result['unlisted'] === []
+        && $result['links'] === [] && $result['generated'] === [];
+
+    return $result;
 }
 
 $command = $argv[1] ?? null;
@@ -1787,16 +2519,18 @@ try {
                 $ref,
                 slipstream_release_need($options, 'environment'),
                 Keys::parse(slipstream_release_need($options, 'keys')),
-                isset($options['min-sequence']) && $options['min-sequence'] !== true ? (int) $options['min-sequence'] : 0,
+                (int) (slipstream_release_option($options, 'min-sequence') ?? 0),
             );
             slipstream_release_say('sha='.$pointer->sha);
             slipstream_release_say('manifest_sha256='.$pointer->manifestSha256);
             slipstream_release_say('sequence='.$pointer->sequence);
             slipstream_release_say('previous_sha='.($pointer->previous['sha'] ?? ''));
+            slipstream_release_say('previous_manifest_sha256='.($pointer->previous['manifest_sha256'] ?? ''));
             break;
 
         case 'verify-release':
             $sha = strtolower(slipstream_release_need($options, 'sha'));
+            $ref = slipstream_release_need($options, 'ref');
             $environment = slipstream_release_need($options, 'environment');
             $keys = Keys::parse(slipstream_release_need($options, 'keys'));
             $into = rtrim(slipstream_release_need($options, 'extract-to'), '/\\');
@@ -1805,7 +2539,8 @@ try {
             $archive = slipstream_release_need($options, 'archive');
 
             $manifestSha256 = hash('sha256', $json);
-            if (isset($options['manifest-sha256']) && $options['manifest-sha256'] !== true && $options['manifest-sha256'] !== $manifestSha256) {
+            $expected = slipstream_release_option($options, 'manifest-sha256');
+            if ($expected !== null && $expected !== $manifestSha256) {
                 throw new ArtifactRefused('manifest', "the manifest's hash is not the one the pointer names");
             }
             $verified = Envelope::verify($signature, Envelope::DOMAIN_MANIFEST, $keys);
@@ -1818,6 +2553,9 @@ try {
             }
             if ($statement->environment !== $environment) {
                 throw new ArtifactRefused('statement', "it is signed for environment \"{$statement->environment}\"; this node is \"{$environment}\"");
+            }
+            if ($statement->ref !== $ref) {
+                throw new ArtifactRefused('statement', "it was built for {$statement->ref}; this node deploys {$ref}");
             }
             $manifest = Manifest::fromJson($json);
             if ($manifest->sha !== $sha) {
@@ -1842,61 +2580,124 @@ try {
             if (is_dir($into) && count(scandir($into) ?: []) > 2) {
                 slipstream_release_fail("{$into} is not empty");
             }
-            if (! is_dir($into) && ! @mkdir($into, 0755, true)) {
+            $created = ! is_dir($into);
+            if ($created && ! @mkdir($into, 0755, true)) {
                 slipstream_release_fail("cannot create {$into}");
             }
-            $files = TarReader::extract($archive, $into, [
-                'max_unpacked_bytes' => isset($options['max-unpacked-bytes']) && $options['max-unpacked-bytes'] !== true ? (int) $options['max-unpacked-bytes'] : $manifest->unpackedBytes,
-                'max_entries' => isset($options['max-entries']) && $options['max-entries'] !== true ? (int) $options['max-entries'] : 250000,
-            ], $manifest->files);
-            @mkdir($into.'/.slipstream', 0755);
-            file_put_contents($into.'/.slipstream/manifest.json', $json);
-            file_put_contents($into.'/.slipstream/manifest.sig', $signature);
-            file_put_contents($into.'/RELEASE_SHA', $sha."\n");
+
+            try {
+                $files = TarReader::extract($archive, $into, [
+                    'max_unpacked_bytes' => min((int) (slipstream_release_option($options, 'max-unpacked-bytes') ?? PHP_INT_MAX), $manifest->unpackedBytes),
+                    'max_entries' => min((int) (slipstream_release_option($options, 'max-entries') ?? 250000), $manifest->entries),
+                ], $manifest->files);
+                @mkdir($into.'/.slipstream', 0755);
+                if (file_put_contents($into.'/.slipstream/manifest.json', $json) === false
+                    || file_put_contents($into.'/.slipstream/manifest.sig', $signature) === false
+                    || file_put_contents($into.'/RELEASE_SHA', $sha."\n") === false) {
+                    throw new \RuntimeException("Cannot write the release's sidecar in {$into}.");
+                }
+            } catch (\Throwable $e) {
+                // Nothing unverified stays behind.
+                foreach (scandir($into) ?: [] as $name) {
+                    if ($name !== '.' && $name !== '..') {
+                        slipstream_release_remove_tree($into.'/'.$name);
+                    }
+                }
+                if ($created) {
+                    @rmdir($into);
+                }
+                throw $e;
+            }
             slipstream_release_say('files='.count($files));
             break;
+
+        case 'verify-tree':
+            $release = slipstream_release_need($options, 'release');
+            $real = realpath($release);
+            if ($real === false || ! is_dir($real)) {
+                slipstream_release_fail("no release at {$release}");
+            }
+            $result = slipstream_release_verify_tree(
+                str_replace('\\', '/', $real),
+                Keys::parse(slipstream_release_need($options, 'keys')),
+                slipstream_release_need($options, 'environment'),
+                slipstream_release_list($options, 'shared', []),
+                slipstream_release_option($options, 'state-dir'),
+            );
+
+            if (isset($options['json'])) {
+                $line = ['event' => $result['ok'] ? 'artifact.verify_ok' : 'artifact.verify_drift'] + $result;
+                foreach (['modified', 'missing', 'unlisted', 'links', 'generated'] as $kind) {
+                    $line[$kind.'_count'] = count($result[$kind]);
+                    $line[$kind] = array_slice($result[$kind], 0, 20);
+                }
+                slipstream_release_say((string) json_encode($line, JSON_UNESCAPED_SLASHES));
+            } elseif ($result['ok']) {
+                slipstream_release_say("ok: {$result['release']} ({$result['sha']}) matches its signed manifest: {$result['files']} files; generated caches ".($result['baseline'] === 'none' ? 'not recorded' : 'match the '.$result['baseline'].' hashes'));
+            } else {
+                slipstream_release_say("DRIFT: {$result['release']}".($result['sha'] ? " ({$result['sha']})" : '').($result['reason'] ? ": {$result['reason']}" : ''));
+                foreach (['modified' => 'modified', 'missing' => 'missing', 'unlisted' => 'not in the manifest', 'links' => 'symlinks', 'generated' => 'generated since the deploy'] as $kind => $label) {
+                    if ($result[$kind] !== []) {
+                        slipstream_release_say('  '.$label.' ('.count($result[$kind]).'): '.implode(', ', array_slice($result[$kind], 0, 20)).(count($result[$kind]) > 20 ? ', …' : ''));
+                    }
+                }
+            }
+            exit($result['ok'] ? 0 : 1);
 
         case 'publish':
             $archive = slipstream_release_need($options, 'archive');
             $built = Manifest::fromJson(slipstream_release_read(slipstream_release_need($options, 'manifest'), 67108864));
             $ref = slipstream_release_need($options, 'ref');
             $environment = slipstream_release_need($options, 'environment');
+            $store = slipstream_release_need($options, 'store');
+            $sha = strtolower(slipstream_release_option($options, 'sha') ?? (getenv('GITHUB_SHA') ?: ''));
+            if (preg_match('/^[0-9a-f]{40}$/', $sha) !== 1) {
+                slipstream_release_fail('--sha is required: the commit being published, by its full id (GitHub Actions sets GITHUB_SHA). The build job does not get to say which commit it built.', 2);
+            }
+            if ($built->sha !== $sha) {
+                slipstream_release_fail("the build says it is {$built->sha}; this publish is for {$sha}");
+            }
             if ($built->ref !== $ref) {
                 slipstream_release_fail("the build is for {$built->ref}; the pointer is {$ref}");
             }
-            if (isset($options['sha']) && $options['sha'] !== true && strtolower((string) $options['sha']) !== $built->sha) {
-                slipstream_release_fail("the build is of {$built->sha}, not {$options['sha']}");
+            $nodeKeys = Keys::parse(slipstream_release_need($options, 'keys'));
+            $signer = Signers::fromSpec(slipstream_release_need($options, 'key'), slipstream_release_option($options, 'key-id'));
+
+            $generated = slipstream_release_list($options, 'generated', Manifest::DEFAULT_GENERATED);
+            foreach ($generated as $path) {
+                if (! Manifest::validPath($path)) {
+                    slipstream_release_fail('not a release path for --generated: '.$path, 2);
+                }
             }
-            $signer = Signers::fromSpec(slipstream_release_need($options, 'key'), isset($options['key-id']) ? (string) $options['key-id'] : null);
-            $generated = isset($options['generated']) && $options['generated'] !== true
-                ? array_values(array_filter(array_map('trim', explode(',', (string) $options['generated']))))
-                : $built->generated;
 
             slipstream_release_say('Reading the archive back to build the manifest to sign…');
             $manifest = ReleaseBuilder::manifestFromArchive($archive, [
-                'slipstream' => $built->slipstream, 'environment' => $environment, 'sha' => $built->sha, 'ref' => $built->ref,
+                'slipstream' => $built->slipstream, 'environment' => $environment, 'sha' => $sha, 'ref' => $built->ref,
                 'built_at' => $built->builtAt, 'php' => $built->php, 'generated' => $generated,
-            ]);
+            ], [
+                'max_unpacked_bytes' => (int) (slipstream_release_option($options, 'max-unpacked-bytes') ?? 4294967296),
+                'max_entries' => (int) (slipstream_release_option($options, 'max-entries') ?? 250000),
+            ], ReleaseBuilder::inspector(slipstream_release_list($options, 'allow', [])));
             $json = $manifest->toJson();
-            $statement = ReleaseBuilder::statementFor($manifest, $json, $environment);
+            $statement = Envelope::encode(ReleaseBuilder::statementFor($manifest, $json, $environment)->toPayload(), Envelope::DOMAIN_MANIFEST, $signer);
+            ReleaseBuilder::selfCheck($json, $statement, null, $nodeKeys);
 
             $dir = sys_get_temp_dir().'/ss-publish-'.bin2hex(random_bytes(4));
             mkdir($dir, 0700);
             try {
                 file_put_contents($dir.'/manifest.json', $json);
-                file_put_contents($dir.'/manifest.sig', Envelope::encode($statement->toPayload(), Envelope::DOMAIN_MANIFEST, $signer));
-                $store = slipstream_release_need($options, 'store');
-                slipstream_release_store_put($store, 'releases/'.$manifest->sha.'/release.tar.gz', $archive);
-                slipstream_release_store_put($store, 'releases/'.$manifest->sha.'/manifest.json', $dir.'/manifest.json');
-                slipstream_release_store_put($store, 'releases/'.$manifest->sha.'/manifest.sig', $dir.'/manifest.sig');
-                slipstream_release_say('Uploaded release '.substr($manifest->sha, 0, 7).' ('.count($manifest->files).' files, signed by key '.$signer->keyId().')');
+                file_put_contents($dir.'/manifest.sig', $statement);
+                foreach (['release.tar.gz' => $archive, 'manifest.json' => $dir.'/manifest.json', 'manifest.sig' => $dir.'/manifest.sig'] as $name => $file) {
+                    slipstream_release_say((slipstream_release_store_put_once($store, 'releases/'.$sha.'/'.$name, $file) ? 'Uploaded ' : 'Already in the store: ').$name);
+                }
             } finally {
                 @unlink($dir.'/manifest.json');
                 @unlink($dir.'/manifest.sig');
                 @rmdir($dir);
             }
+            slipstream_release_say('Release '.substr($sha, 0, 7).': '.count($manifest->files).' files, signed by key '.$signer->keyId());
 
-            $pointer = slipstream_release_point($options, $manifest->sha, hash('sha256', $json), false);
+            $pointer = slipstream_release_point($options, $sha, hash('sha256', $json), false, $nodeKeys, $signer);
             slipstream_release_say(sprintf('%s → %s (sequence %d%s)', $pointer->ref, $pointer->short(), $pointer->sequence, $pointer->previous ? ', previous '.substr($pointer->previous['sha'], 0, 7) : ''));
             break;
 
@@ -1905,23 +2706,26 @@ try {
             if (preg_match('/^[0-9a-f]{40}$/', $sha) !== 1) {
                 slipstream_release_fail('--sha must be the full 40-character commit id', 2);
             }
+            $ref = slipstream_release_need($options, 'ref');
             $store = slipstream_release_need($options, 'store');
             $environment = slipstream_release_need($options, 'environment');
-            $signer = Signers::fromSpec(slipstream_release_need($options, 'key'), isset($options['key-id']) ? (string) $options['key-id'] : null);
-            $trusted = (isset($options['keys']) && $options['keys'] !== true ? Keys::parse((string) $options['keys'], 64) : Keys::none())
-                ->with($signer->keyId(), $signer->publicKey());
+            $nodeKeys = Keys::parse(slipstream_release_need($options, 'keys'));
+            $signer = Signers::fromSpec(slipstream_release_need($options, 'key'), slipstream_release_option($options, 'key-id'));
 
-            $signature = slipstream_release_store_get($store, 'releases/'.$sha.'/manifest.sig');
+            [$signature] = slipstream_release_store_get($store, 'releases/'.$sha.'/manifest.sig');
             if ($signature === null) {
                 slipstream_release_fail('no release '.substr($sha, 0, 7).' in the store');
             }
-            $verified = Envelope::verify($signature, Envelope::DOMAIN_MANIFEST, $trusted);
+            $verified = Envelope::verify($signature, Envelope::DOMAIN_MANIFEST, $nodeKeys->with($signer->keyId(), $signer->publicKey()));
             $statement = Statement::fromPayload($verified['payload'], $verified['key_id']);
             if ($statement->sha !== $sha || $statement->environment !== $environment) {
                 slipstream_release_fail('the release '.substr($sha, 0, 7).' carries a statement for another commit or environment');
             }
+            if ($statement->ref !== $ref) {
+                slipstream_release_fail('the release '.substr($sha, 0, 7)." was built for {$statement->ref}; nodes deploying {$ref} would refuse it");
+            }
 
-            $pointer = slipstream_release_point($options, $sha, $statement->manifestSha256, true);
+            $pointer = slipstream_release_point($options, $sha, $statement->manifestSha256, true, $nodeKeys, $signer);
             slipstream_release_say(sprintf('%s → %s (sequence %d, rollback)', $pointer->ref, $pointer->short(), $pointer->sequence));
             break;
 

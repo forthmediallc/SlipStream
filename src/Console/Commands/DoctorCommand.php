@@ -1255,7 +1255,17 @@ class DoctorCommand extends Command
         $result = $verifier->verify(realpath($current) ?: $current);
 
         if (! $result['manifest']) {
-            return CheckResult::warn('live release', 'carries no manifest (deployed from git)', 'The next artifact deploy brings one; until then slipstream:verify has nothing to compare.');
+            // A release an artifact deploy wrote has a .slipstream directory;
+            // one built from git before the switch has none.
+            if (is_dir((realpath($current) ?: $current).DIRECTORY_SEPARATOR.\Slipstream\Release\ArtifactFetcher::SIDECAR)) {
+                return CheckResult::fail(
+                    'live release',
+                    'its signed manifest is gone or unreadable'.($result['signature_error'] ? ' ('.$result['signature_error'].')' : ''),
+                    'slipstream:verify reports this as drift. Redeploy (php artisan slipstream:deploy) and find out what removed it.'
+                );
+            }
+
+            return CheckResult::warn('live release', 'carries no manifest (deployed from git)', 'The next artifact deploy brings one; until then slipstream:verify reports the release as unverifiable.');
         }
         if ($result['ok']) {
             return CheckResult::pass('live release', "matches its signed manifest ({$result['files']} files, key {$result['key_id']})");
@@ -1336,8 +1346,10 @@ class DoctorCommand extends Command
             return CheckResult::skip('hook scripts', 'no stored hooks');
         }
 
-        $lax = $hooks->filter(fn (DeploymentHook $hook) => HookScript::isMultiLine((string) $hook->script)
-            && ! HookScript::failsFast((string) $hook->script));
+        // An untouched default runs its current text, which fails fast,
+        // whatever earlier text its row still holds.
+        $lax = $hooks->filter(fn (DeploymentHook $hook) => HookScript::isMultiLine(DefaultHooks::effectiveScript($hook))
+            && ! HookScript::failsFast(DefaultHooks::effectiveScript($hook)));
 
         if ($lax->isEmpty()) {
             return CheckResult::pass('hook scripts', 'every stored hook of several lines fails fast');

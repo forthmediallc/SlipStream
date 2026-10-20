@@ -16,7 +16,8 @@
 # checkout is the release CI built, fetched from ARTIFACTS and verified with
 # slipstream-release.php — the signed pointer, the signed manifest, the
 # archive's hash and every file's — before anything in it runs. No git, no
-# composer, no deploy key.
+# composer, no deploy key. If the pointer's release does not verify, the
+# pointer's previous release is used instead, unless --no-fallback is given.
 #
 # Run it as the deploy user — the PHP-FPM pool user — never as root, or the
 # releases and the mirror it creates belong to the wrong user:
@@ -95,30 +96,84 @@ if [ "$(env_value SLIPSTREAM_RELEASE_SOURCE)" = "artifact" ]; then
         exit 1
     fi
 
-    # One object from the store to a local file.
+    max_archive=$(env_value SLIPSTREAM_ARTIFACTS_MAX_ARCHIVE_BYTES)
+
+    # One object from the store to a local file, refused before the download
+    # when it is larger than it can honestly be ($3 bytes).
     fetch() {
+        case "$ARTIFACTS" in
+            s3://*)
+                location=${ARTIFACTS#s3://}
+                bucket=${location%%/*}
+                prefix=${location#"$bucket"}
+                prefix=${prefix#/}
+                prefix=${prefix%/}
+                size=$(aws s3api head-object --bucket "$bucket" --key "${prefix:+$prefix/}$1" --query ContentLength --output text) || return 1
+                ;;
+            file://*)
+                size=$(wc -c < "${ARTIFACTS#file://}/$1") || return 1
+                ;;
+            *)
+                echo "slipstream-bootstrap: ARTIFACTS must be s3://bucket/prefix or file:///dir" >&2
+                return 1
+                ;;
+        esac
+        size=$(echo "$size" | tr -d '[:space:]')
+        case "$size" in
+            ''|*[!0-9]*) echo "slipstream-bootstrap: cannot tell the size of $1" >&2; return 1 ;;
+        esac
+        if [ "$size" -gt "$3" ]; then
+            echo "slipstream-bootstrap: $1 is $size bytes, more than the $3 it may be" >&2
+            return 1
+        fi
         case "$ARTIFACTS" in
             s3://*) aws s3 cp "${ARTIFACTS%/}/$1" "$2" --quiet ;;
             file://*) cp "${ARTIFACTS#file://}/$1" "$2" ;;
-            *) echo "slipstream-bootstrap: ARTIFACTS must be s3://bucket/prefix or file:///dir" >&2; exit 1 ;;
         esac
     }
 
+    # A release's three objects, checked — the manifest against the hash the
+    # pointer names, its statement, the archive, every file — and unpacked
+    # into $work/app. Non-zero, with nothing unpacked, when any check fails.
+    release() {
+        rm -rf "$work/rel" "$work/app"
+        mkdir "$work/rel"
+        fetch "releases/$1/manifest.json" "$work/rel/manifest.json" 67108864 \
+            && fetch "releases/$1/manifest.sig" "$work/rel/manifest.sig" 65536 \
+            && fetch "releases/$1/release.tar.gz" "$work/rel/release.tar.gz" "${max_archive:-1073741824}" \
+            && "$PHP" "$RELEASE_TOOL" verify-release --sha="$1" --ref="$ref" --manifest-sha256="$2" --environment="$environment" --keys="$keys" \
+                --manifest="$work/rel/manifest.json" --signature="$work/rel/manifest.sig" --archive="$work/rel/release.tar.gz" --extract-to="$work/app"
+    }
+
     echo "slipstream-bootstrap: reading the pointer for $ref"
-    fetch "$ref.json" "$work/pointer.json"
-    # Prints sha=, manifest_sha256=, sequence=, previous_sha= — hex and digits
-    # only. The assignment carries the tool's exit status, so a refusal stops
-    # the script here with that status.
+    fetch "$ref.json" "$work/pointer.json" 65536
+    # Prints sha=, manifest_sha256=, sequence=, previous_sha=,
+    # previous_manifest_sha256= — hex and digits only. The assignment carries
+    # the tool's exit status, so a refusal stops the script here.
     facts=$("$PHP" "$RELEASE_TOOL" verify-pointer --ref="$ref" --environment="$environment" --keys="$keys" --pointer="$work/pointer.json")
     eval "$facts"
 
+    no_fallback=
+    set -f
+    # shellcheck disable=SC2086
+    for arg in $BOOTSTRAP_ARGS "$@"; do
+        if [ "$arg" = "--no-fallback" ]; then no_fallback=1; fi
+    done
+    set +f
+
     echo "slipstream-bootstrap: fetching release $sha"
-    fetch "releases/$sha/manifest.json" "$work/manifest.json"
-    fetch "releases/$sha/manifest.sig" "$work/manifest.sig"
-    fetch "releases/$sha/release.tar.gz" "$work/release.tar.gz"
-    "$PHP" "$RELEASE_TOOL" verify-release --sha="$sha" --manifest-sha256="$manifest_sha256" --environment="$environment" --keys="$keys" \
-        --manifest="$work/manifest.json" --signature="$work/manifest.sig" --archive="$work/release.tar.gz" --extract-to="$work/app"
-    rm -f "$work/release.tar.gz"
+    if ! release "$sha" "$manifest_sha256"; then
+        if [ -n "$no_fallback" ] || [ -z "$previous_sha" ]; then
+            echo "slipstream-bootstrap: release $sha did not verify; stopping${no_fallback:+ (--no-fallback)}" >&2
+            exit 1
+        fi
+        # The one other release the signed pointer vouches for, bound to the
+        # manifest it names. slipstream:bootstrap, run from it, retries the
+        # head and falls back the same way.
+        echo "slipstream-bootstrap: release $sha did not verify; falling back to the pointer's previous release $previous_sha" >&2
+        release "$previous_sha" "$previous_manifest_sha256"
+    fi
+    rm -rf "$work/rel"
 else
     : "${REPO:?set REPO to the repository, e.g. git@github.com:org/app.git}"
 

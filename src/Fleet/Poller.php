@@ -134,7 +134,9 @@ class Poller
 
         if ($manifestSha256 !== null) {
             $failures = $failures->filter(function (Deployment $failed) use ($manifestSha256) {
-                $failedManifest = $failed->meta['artifact']['manifest_sha256'] ?? null;
+                // A deploy refused during the fetch never got meta.artifact;
+                // the pointer it was started from says which build it was.
+                $failedManifest = $failed->meta['artifact']['manifest_sha256'] ?? $failed->meta['pointer']['manifest_sha256'] ?? null;
 
                 return $failedManifest === null || $failedManifest === $manifestSha256;
             })->values();
@@ -165,6 +167,9 @@ class Poller
             'meta' => array_filter([
                 'deploy_from' => $release->isTag ? 'tag' : null,
                 'poll_ref' => $ref->key(),
+                // The pointer this check followed: the deploy fetches the
+                // manifest it named even if the pointer moves meanwhile.
+                'pointer' => $this->pointerOf($ref),
             ]),
         ]);
 
@@ -245,12 +250,22 @@ class Poller
      */
     protected function manifestOf(DeployRef $ref): ?string
     {
+        return $this->pointerOf($ref)['manifest_sha256'] ?? null;
+    }
+
+    /**
+     * @return array{sequence: int, manifest_sha256: string}|null
+     */
+    protected function pointerOf(DeployRef $ref): ?array
+    {
         if (! $this->source instanceof ArtifactSource) {
             return null;
         }
 
         try {
-            return $this->source->pointer($ref)->manifestSha256;
+            $pointer = $this->source->pointer($ref);
+
+            return ['sequence' => $pointer->sequence, 'manifest_sha256' => $pointer->manifestSha256];
         } catch (\Throwable) {
             return null;
         }

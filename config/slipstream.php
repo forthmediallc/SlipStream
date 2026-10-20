@@ -177,10 +177,16 @@ return [
         // (.git, node_modules, tests, .env*, auth.json, vendor/bin, …).
         'exclude' => [],
 
-        // Paths a node writes into a release after unpacking it, which the
-        // live-release verification must not count as drift. storage/, the
-        // .env and auth.json links, RELEASE_SHA and .slipstream/ are always
-        // left out, as are the configured shared paths.
+        // Paths (or directories) outside vendor/ allowed to carry key
+        // material. package refuses a private key or key store anywhere
+        // else; publish takes its own list (--allow).
+        'allow' => [],
+
+        // Paths a node writes into a release after unpacking it, as package
+        // describes them in the build's manifest. Informational only: this
+        // file ships inside the release, so it is the build's word. publish
+        // signs its own list (--generated, the same three by default), and
+        // that list excuses only files the manifest does not list.
         'generated' => ['bootstrap/cache', 'public/storage', 'public/hot'],
 
         // What a node will download and unpack, at most.
@@ -405,12 +411,15 @@ return [
         // lock at least the hour a hook may run + 120s) whatever this says.
         'migration_lock_ttl' => (int) env('SLIPSTREAM_MIGRATION_LOCK_TTL', 900),
         'migrate_timeout' => (int) env('SLIPSTREAM_MIGRATE_TIMEOUT', 600),
-        // What hooks and the detached deploy see in their environment.
-        // inherit: this process's whole environment, every .env value
-        // included (the default in git mode, as it always was). minimal:
-        // PATH, HOME, COMPOSER_HOME, LANG, LC_ALL, TZ and SLIPSTREAM_* only —
-        // artisan loads the .env itself (the default in artifact mode).
+        // What hooks see in their environment. inherit: this process's whole
+        // environment, every .env value included (the default in git mode,
+        // as it always was). minimal: PATH, HOME, the locale, proxy and CA
+        // settings and SLIPSTREAM_* (the default in artifact mode) — artisan
+        // loads the .env itself. It keeps secrets out of hook output; it is
+        // not isolation. The detached deploy always inherits.
         'hook_env' => env('SLIPSTREAM_HOOK_ENV'),
+        // Extra variable names minimal mode passes to hooks, comma-separated.
+        'hook_env_pass' => env('SLIPSTREAM_HOOK_ENV_PASS'),
         // A deploy still "building" past this many minutes is treated as dead by
         // the watchdog (heartbeat, every minute) and marked failed. 0 disables.
         'stuck_minutes' => (int) env('SLIPSTREAM_STUCK_MINUTES', 120),

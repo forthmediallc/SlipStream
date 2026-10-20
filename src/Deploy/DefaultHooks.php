@@ -3,8 +3,6 @@
 namespace Slipstream\Deploy;
 
 use Slipstream\Models\DeploymentHook;
-use Slipstream\Settings\SettingsRepository;
-use Slipstream\Support\Activity;
 
 /**
  * The hooks Slipstream ships with out of the box. These are the tasks Envoyer
@@ -79,17 +77,13 @@ class DefaultHooks
     ];
 
     /**
-     * Bumped whenever a default's text changes, so an existing install
-     * upgrades its untouched copies once (upgradeOnce).
-     */
-    public const VERSION = 2;
-
-    /**
      * Every text a default shipped with before the current one, oldest
      * first. A stored copy of any of these is still an untouched default: it
-     * steps aside for a hooks file and the migrate step like the current text,
-     * and is brought up to date in place. Add the outgoing text here and bump
-     * VERSION whenever a default changes.
+     * steps aside for a hooks file and the migrate step like the current
+     * text, and it runs the current text (effectiveScript). Stored rows are
+     * never rewritten: during an upgrade, a node still on older code would
+     * take a rewritten text for an edited hook and run it beside the hooks
+     * file. Add the outgoing text here whenever a default changes.
      *
      * @var array<string, list<string>>
      */
@@ -112,19 +106,14 @@ class DefaultHooks
 
     public const MIGRATE_HOOK = 'Run migrations';
 
-    public const VERSION_SETTING = 'default_hooks_version';
-
     /**
      * Seed any default hook that isn't already present (matched on step +
-     * position + name, so a hook the user renamed or deleted stays that way),
-     * after bringing untouched copies of earlier defaults up to date.
+     * position + name, so a hook the user renamed or deleted stays that way).
      *
      * @param  list<string>  $except  names of defaults not to seed
      */
     public static function seed(array $except = []): void
     {
-        self::upgradeUntouched('seed');
-
         foreach (self::DEFAULTS as $hook) {
             if (in_array($hook['name'], $except, true)) {
                 continue;
@@ -190,8 +179,6 @@ class DefaultHooks
      */
     public static function seedFor(string $releaseRoot): string
     {
-        self::upgradeUntouched('install');
-
         if (HookFile::exists($releaseRoot)) {
             return 'from '.basename(HookFile::path($releaseRoot)).' (defaults not seeded)';
         }
@@ -208,62 +195,21 @@ class DefaultHooks
     }
 
     /**
-     * Rewrite stored copies of an earlier default's text to the current text.
-     * Only the script changes; enabled, order, servers and the fleet lock
-     * stay as they are. Edited copies are the operator's own and are left
-     * alone. Returns how many rows changed.
+     * The script a hook runs: an untouched default runs the current text of
+     * its default, whichever earlier text its row still holds; every other
+     * hook runs its own script.
      */
-    public static function upgradeUntouched(string $via = 'seed'): int
+    public static function effectiveScript(DeploymentHook $hook): string
     {
-        $upgraded = [];
-
-        foreach (self::DEFAULTS as $default) {
-            $previous = array_map(HookScript::normalize(...), self::PREVIOUS[$default['name']] ?? []);
-            if ($previous === []) {
-                continue;
-            }
-
-            $rows = DeploymentHook::query()
-                ->where('step', $default['step'])
-                ->where('position', $default['position'])
-                ->where('name', $default['name'])
-                ->get();
-
-            foreach ($rows as $row) {
-                if (in_array(HookScript::normalize($row->script), $previous, true)) {
-                    $row->update(['script' => $default['script']]);
-                    $upgraded[] = $default['name'];
+        if ($hook->source === 'database') {
+            foreach (self::DEFAULTS as $default) {
+                if (self::isUntouchedDefault($hook, $default['name'])) {
+                    return $default['script'];
                 }
             }
         }
 
-        if ($upgraded !== []) {
-            Activity::log('hook.defaults_upgraded', [
-                'hooks' => array_values(array_unique($upgraded)),
-                'version' => self::VERSION,
-                'via' => $via,
-            ]);
-        }
-
-        return count($upgraded);
-    }
-
-    /**
-     * upgradeUntouched() once per database: a release that changes a seeded
-     * hook's text reaches existing installs from the minute heartbeat, since
-     * install seeds only what is missing and nobody re-runs it. One settings
-     * read per heartbeat; null when nothing was due.
-     */
-    public static function upgradeOnce(SettingsRepository $settings): ?int
-    {
-        if ((int) $settings->get(self::VERSION_SETTING, 0) >= self::VERSION) {
-            return null;
-        }
-
-        $count = self::upgradeUntouched('heartbeat');
-        $settings->set(self::VERSION_SETTING, (string) self::VERSION);
-
-        return $count;
+        return (string) $hook->script;
     }
 
     /**

@@ -153,6 +153,15 @@ class EnvelopeTest extends TestCase
             @unlink($file);
         }
 
+        // Relative resolves against the working directory — for artisan, the
+        // release: trust anchors from the archive they are meant to check.
+        try {
+            Keys::parse('file:release-keys');
+            $this->fail('read the keys from a relative path');
+        } catch (InvalidArgumentException $e) {
+            $this->assertStringContainsString('is a relative path', $e->getMessage());
+        }
+
         $this->assertSame(substr(hash('sha256', base64_decode($a['public'])), 0, 8), $a['key_id']);
         $this->assertSame('x:'.$a['public'], Keys::format('x', base64_decode($a['public'])));
     }

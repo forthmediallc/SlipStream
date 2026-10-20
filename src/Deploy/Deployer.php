@@ -18,7 +18,9 @@ use Slipstream\Release\ArtifactFetcher;
 use Slipstream\Release\ArtifactSource;
 use Slipstream\Release\ArtifactStore;
 use Slipstream\Release\Core\ArtifactRefused;
+use Slipstream\Release\Core\Baseline;
 use Slipstream\Release\Core\Keys;
+use Slipstream\Release\Core\Pointer;
 use Slipstream\Release\DeployRef;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Slipstream;
@@ -174,6 +176,8 @@ class Deployer
 
             $succeeded = true;
             $this->notifyFinished();
+        } catch (DeploymentSuperseded $e) {
+            $this->supersede($e);
         } catch (\Throwable $e) {
             $this->fail($e);
             throw $e;
@@ -273,34 +277,60 @@ class Deployer
     }
 
     /**
-     * Artifact mode: the release CI built, from the store. Named by the
-     * pointer the poll followed (which binds the manifest it saw), or by a
-     * commit alone (`slipstream:deploy --sha=`, a bootstrap fallback), which
-     * the release's own signed statement vouches for. Unpacked into a
-     * dot-prefixed directory that prune and rollback never see, and renamed
-     * into place only once every check has passed.
+     * Artifact mode: the release CI built, from the store, bound to the
+     * manifest a signed pointer named wherever one does:
+     *
+     * - a poll or bootstrap deploy carries the pointer it was started from
+     *   (meta.pointer) and fetches exactly that manifest, even if the pointer
+     *   has moved since; if it moved on to another commit the deploy is
+     *   superseded rather than finished;
+     * - a deploy by commit (`slipstream:deploy --sha=`, the dashboard) binds
+     *   to the current pointer when its head or its previous names that
+     *   commit, and otherwise rests on the release's own signed statement,
+     *   audited as unbound.
+     *
+     * Unpacked into a dot-prefixed directory that prune and rollback never
+     * see, and renamed into place only once every check has passed.
      */
     protected function fetchArtifact(string $step): void
     {
         $source = app(ArtifactSource::class);
         $store = $source->store();
-        $pointer = null;
+        $ref = DeployRef::fromConfig();
+        $recorded = $this->recordedPointer();
+        $sha = strtolower((string) $this->deployment->sha);
 
-        $pollRef = $this->deployment->meta['poll_ref'] ?? null;
-        if (is_string($pollRef)) {
-            try {
-                $current = $source->pointer(DeployRef::parse(($this->deployment->deployFrom() === 'tag' ? 'refs/tags/' : 'refs/heads/').$this->branch));
-                if (! $this->deployment->sha || strtolower((string) $this->deployment->sha) === $current->sha) {
-                    $pointer = $current;
-                }
-            } catch (ArtifactRefused $e) {
+        $current = null;
+        try {
+            $current = $source->pointer($ref, fresh: true, accept: false);
+        } catch (ArtifactRefused $e) {
+            if ($recorded !== null) {
                 throw $e;
-            } catch (\Throwable $e) {
-                $this->log->warning('Could not re-read the pointer ('.$e->getMessage().'); deploying the commit by its own signature.', $step);
+            }
+            $this->log->warning('The pointer in the store is refused ('.$e->reason.'); deploying the commit by its own signature.', $step);
+        } catch (\Throwable $e) {
+            $this->log->warning('Could not read the pointer ('.$e->getMessage().'); '.($recorded !== null ? 'fetching the release it named.' : 'deploying the commit by its own signature.'), $step);
+        }
+
+        $bound = null;     // the manifest hash the release must have
+        $vouching = null;  // the pointer whose head is this release
+        if ($recorded !== null) {
+            $this->abortIfSuperseded($current, $recorded, $sha);
+            $bound = $recorded['manifest_sha256'];
+            $vouching = $current !== null && $current->sha === $sha ? $current : null;
+        } elseif ($current !== null && $sha !== '') {
+            $resolved = strlen($sha) === 40 ? $sha : null;
+            if ($resolved === $current->sha || str_starts_with($current->sha, $sha)) {
+                $sha = $current->sha;
+                $bound = $current->manifestSha256;
+                $vouching = $current;
+            } elseif ($current->previous !== null && ($resolved === $current->previous['sha'] || str_starts_with($current->previous['sha'], $sha))) {
+                $sha = $current->previous['sha'];
+                $bound = $current->previous['manifest_sha256'];
             }
         }
 
-        $this->sha = $pointer?->sha ?? $store->resolveSha((string) $this->deployment->sha);
+        $this->sha = strlen($sha) === 40 ? $sha : $store->resolveSha($sha);
         $this->assertValidSha($this->sha);
         if (strlen($this->sha) !== 40) {
             throw new RuntimeException('An artifact release is named by a full 40-character commit id.');
@@ -308,20 +338,27 @@ class Deployer
 
         $short = substr($this->sha, 0, 7);
         $ts = gmdate('Ymd_His');
-        $this->log->stepStart($step, "Fetching release {$short} from disk ".$store->diskName().($pointer ? " (pointer sequence {$pointer->sequence})" : ' (by commit)').'…');
+        $how = match (true) {
+            $recorded !== null => " (pointer sequence {$recorded['sequence']})",
+            $bound !== null => ' (by commit, vouched for by the pointer)',
+            default => ' (by commit, on its own signature)',
+        };
+        $this->log->stepStart($step, "Fetching release {$short} from disk ".$store->diskName().$how.'…');
 
-        $this->incomingPath = $this->releases.DIRECTORY_SEPARATOR.".incoming-{$ts}_{$short}";
-        if (! @mkdir($this->incomingPath, 0755, true)) {
-            throw new RuntimeException("Cannot create {$this->incomingPath}.");
+        $incoming = $this->releases.DIRECTORY_SEPARATOR.".incoming-{$ts}_{$short}";
+        if (! @mkdir($incoming, 0755, true)) {
+            throw new RuntimeException("Cannot create {$incoming}.");
         }
-        @chmod($this->incomingPath, 0755);
+        $this->incomingPath = $incoming;
+        @chmod($incoming, 0755);
 
         try {
             $result = app(ArtifactFetcher::class)->fetchInto(
                 $this->sha,
-                $pointer?->manifestSha256,
-                $this->incomingPath,
+                $bound,
+                $incoming,
                 (string) Slipstream::releaseEnvironment(),
+                $ref->full(),
                 $source->keys(),
                 fn (string $line) => $this->log->info($line, $step),
             );
@@ -331,44 +368,135 @@ class Deployer
                 'stage' => $e->stage,
                 'reason' => $e->reason,
                 'sha' => $this->sha,
-                'ref' => $pointer?->ref,
+                'ref' => $ref->full(),
             ] + $e->context);
 
             throw $e;
         }
 
-        if ($pointer !== null) {
+        if ($vouching !== null) {
             file_put_contents(
-                $this->incomingPath.DIRECTORY_SEPARATOR.ArtifactFetcher::SIDECAR.DIRECTORY_SEPARATOR.'pointer.json',
-                json_encode($pointer->toPayload() + ['key_id' => $pointer->keyId], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n"
+                $incoming.DIRECTORY_SEPARATOR.ArtifactFetcher::SIDECAR.DIRECTORY_SEPARATOR.'pointer.json',
+                json_encode($vouching->toPayload() + ['key_id' => $vouching->keyId], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n"
             );
         }
 
         $final = $this->releases.DIRECTORY_SEPARATOR."{$ts}_{$short}";
-        if (! @rename($this->incomingPath, $final)) {
+        if (! @rename($incoming, $final)) {
             throw new RuntimeException("Cannot move the verified release into place at {$final}.");
         }
         @chmod($final, 0755);
         $this->releasePath = $final;
         $this->incomingPath = null;
 
+        if ($bound === null) {
+            $this->log->warning("No pointer names {$short}: it was deployed on its own signed statement.", $step);
+        }
+
         $manifestSha256 = hash('sha256', $result['manifest_json']);
+        $sequence = $recorded['sequence'] ?? $vouching?->sequence;
         $this->deployment->update(['meta' => array_merge((array) $this->deployment->meta, ['artifact' => [
-            'sequence' => $pointer?->sequence,
+            'sequence' => $sequence,
             'manifest_sha256' => $manifestSha256,
             'key_id' => $result['key_id'],
+            'bound' => $bound !== null,
         ]])]);
 
         AuditLog::record('artifact.verified', [
             'deployment' => $this->deployment->id,
             'sha' => $this->sha,
-            'ref' => $pointer?->ref,
-            'sequence' => $pointer?->sequence,
+            'ref' => $ref->full(),
+            'sequence' => $sequence,
+            'bound' => $bound !== null,
             'manifest_sha256' => $manifestSha256,
             'archive_sha256' => $result['manifest']->archiveSha256,
             'key_id' => $result['key_id'],
             'files' => $result['files'],
             'bytes' => $result['manifest']->unpackedBytes,
+        ]);
+    }
+
+    /**
+     * The pointer a poll or bootstrap started this deploy from.
+     *
+     * @return array{sequence: int, manifest_sha256: string}|null
+     */
+    protected function recordedPointer(): ?array
+    {
+        $pointer = $this->deployment->meta['pointer'] ?? null;
+
+        return is_array($pointer) && is_int($pointer['sequence'] ?? null) && is_string($pointer['manifest_sha256'] ?? null)
+            ? ['sequence' => $pointer['sequence'], 'manifest_sha256' => $pointer['manifest_sha256']]
+            : null;
+    }
+
+    /**
+     * A newer pointer that names another commit — a rollback, or the next
+     * release — means this deploy would put live what the ref no longer
+     * names.
+     *
+     * @param  array{sequence: int, manifest_sha256: string}  $recorded
+     */
+    protected function abortIfSuperseded(?Pointer $current, array $recorded, string $sha): void
+    {
+        if ($current !== null && $current->sequence > $recorded['sequence'] && $current->sha !== strtolower($sha)) {
+            throw new DeploymentSuperseded(sprintf(
+                'Superseded: the pointer for %s moved to %s (sequence %d) while this deploy of %s ran; the next check deploys what it names now.',
+                $current->ref, $current->short(), $current->sequence, substr($sha, 0, 7)
+            ));
+        }
+    }
+
+    /**
+     * Just before the flip, the pointer again: a rollback published while
+     * this deploy built must win.
+     */
+    protected function checkPointerBeforeSwap(string $step): void
+    {
+        $recorded = $this->recordedPointer();
+        if (! Slipstream::artifactMode() || $recorded === null) {
+            return;
+        }
+
+        try {
+            $current = app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), fresh: true, accept: false);
+        } catch (ArtifactRefused $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            $this->log->warning('Could not re-read the pointer before the swap ('.$e->getMessage().'); going on with the release it named.', $step);
+
+            return;
+        }
+
+        $this->abortIfSuperseded($current, $recorded, (string) $this->sha);
+    }
+
+    /**
+     * The hashes of what the node generated into the release (config,
+     * route and service caches), recorded just before it goes live.
+     */
+    protected function recordBaseline(string $step): void
+    {
+        if (! Slipstream::artifactMode() || ! $this->releasePath) {
+            return;
+        }
+
+        $files = Baseline::record($this->releasePath);
+        $sidecar = $this->releasePath.DIRECTORY_SEPARATOR.ArtifactFetcher::SIDECAR;
+        if (! is_dir($sidecar)) {
+            @mkdir($sidecar, 0755);
+        }
+        if (@file_put_contents($sidecar.DIRECTORY_SEPARATOR.Baseline::FILE, Baseline::toJson($files)) === false) {
+            $this->addWarning('Could not record the generated files\' hashes; verification will report bootstrap/cache as unchecked.');
+
+            return;
+        }
+
+        $this->log->info('Recorded the hashes of '.count($files).' generated file(s) in bootstrap/cache.', $step);
+        AuditLog::record('artifact.baseline', [
+            'deployment' => $this->deployment->id,
+            'sha' => $this->sha,
+            'files' => array_map(fn (array $entry) => $entry[0], $files),
         ]);
     }
 
@@ -724,6 +852,8 @@ class Deployer
     {
         $step = 'swap';
         $this->runHooks($step, 'before');
+        $this->checkPointerBeforeSwap($step);
+        $this->recordBaseline($step);
         $this->log->stepStart($step, "Swapping current -> {$this->releasePath}");
 
         $tmp = $this->appRoot.DIRECTORY_SEPARATOR.'current.tmp.'.bin2hex(random_bytes(4));
@@ -815,9 +945,10 @@ class Deployer
             $this->log->info("Pruning old failed release: {$old}", $step);
         }
 
-        // A staging directory an artifact deploy left behind when it was
-        // killed outright (glob('*') never lists dot-prefixed entries).
-        foreach (glob($this->releases.DIRECTORY_SEPARATOR.'.incoming-*', GLOB_ONLYDIR) ?: [] as $stale) {
+        // A staging directory, or the download beside it, that an artifact
+        // deploy left behind when it was killed outright (glob('*') never
+        // lists dot-prefixed entries).
+        foreach (glob($this->releases.DIRECTORY_SEPARATOR.'.incoming-*') ?: [] as $stale) {
             if (filemtime($stale) < time() - 7200) {
                 $this->log->info("Removing an abandoned download: {$stale}", $step);
                 $this->removePath($stale);
@@ -895,6 +1026,37 @@ class Deployer
             $next = new self($catchUp, $this->settings, $logger);
             $next->run();
         }
+    }
+
+    /**
+     * The pointer moved on mid-deploy. Not a failure (back-off counts only
+     * those): the release never went live, so it is removed, not kept.
+     */
+    protected function supersede(DeploymentSuperseded $e): void
+    {
+        $this->log->info($e->getMessage());
+
+        $live = realpath($this->current) ?: '';
+        foreach ([$this->incomingPath, $this->releasePath] as $path) {
+            if ($path === null || ! is_dir($path) || (realpath($path) ?: $path) === $live) {
+                continue;
+            }
+            try {
+                $this->removePath($path);
+            } catch (\Throwable $cleanup) {
+                $this->log->warning('Could not remove the superseded release: '.$cleanup->getMessage());
+            }
+        }
+        $this->incomingPath = null;
+        $this->releasePath = null;
+
+        $this->deployment->update([
+            'status' => Deployment::STATUS_SUPERSEDED,
+            'failure_reason' => $e->getMessage(),
+            'duration_ms' => (int) round((microtime(true) - $this->startedAt) * 1000),
+            'finished_at' => now(),
+            'sha' => $this->sha ?? $this->deployment->sha,
+        ]);
     }
 
     protected function fail(\Throwable $e): void
@@ -1086,7 +1248,7 @@ class Deployer
             }
 
             $this->log->info("Hook [{$position} {$step}] {$hook->name}", $step);
-            $this->shell($cwd)->run($this->renderHookScript($hook->script), $cwd, $step, timeout: self::HOOK_TIMEOUT);
+            $this->shell($cwd)->run($this->renderHookScript(DefaultHooks::effectiveScript($hook)), $cwd, $step, timeout: self::HOOK_TIMEOUT);
         }
     }
 
@@ -1119,7 +1281,7 @@ class Deployer
         if ($lock->get()) {
             try {
                 $this->log->info("Hook [{$position} {$step}] {$hook->name} (fleet lock — this server runs it)", $step);
-                $this->shell($cwd)->run($this->renderHookScript($hook->script), $cwd, $step, timeout: self::HOOK_TIMEOUT);
+                $this->shell($cwd)->run($this->renderHookScript(DefaultHooks::effectiveScript($hook)), $cwd, $step, timeout: self::HOOK_TIMEOUT);
             } finally {
                 optional($lock)->release();
             }

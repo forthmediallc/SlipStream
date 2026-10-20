@@ -117,8 +117,8 @@ Published as `config/slipstream.php`:
 | `trigger.*` | `webhook` (default) or `poll`, the deploy ref, the repository, poll interval, jitter and back-off (`SLIPSTREAM_TRIGGER`, `SLIPSTREAM_DEPLOY_REF`, …). See [Poll mode](#poll-mode-and-auto-scaling-groups) |
 | `release.source` | `git` (default) or `artifact`: releases CI built and signed, read from a filesystem disk (`SLIPSTREAM_RELEASE_SOURCE`). See [Artifact releases](#artifact-releases-build-once-in-ci) |
 | `release.environment` | The environment releases are signed for, bound into every signature; required in artifact mode (`SLIPSTREAM_RELEASE_ENVIRONMENT`) |
-| `artifacts.*` | The store (`SLIPSTREAM_ARTIFACTS_DISK`, `SLIPSTREAM_ARTIFACTS_PREFIX`), the public keys nodes verify with (`SLIPSTREAM_RELEASE_PUBLIC_KEYS`), packaging excludes and node-written paths (`exclude`, `generated`), download limits (`SLIPSTREAM_ARTIFACTS_MAX_*`), the weekly verify (`SLIPSTREAM_ARTIFACTS_VERIFY_WEEKLY`) and, in CI only, the signing key (`SLIPSTREAM_SIGNING_KEY`) |
-| `deploy.hook_env` | What hooks and the detached deploy see in their environment: `inherit` (everything, the default in git mode) or `minimal` (PATH, HOME, the locale and `SLIPSTREAM_*`; the default in artifact mode) (`SLIPSTREAM_HOOK_ENV`) |
+| `artifacts.*` | The store (`SLIPSTREAM_ARTIFACTS_DISK`, `SLIPSTREAM_ARTIFACTS_PREFIX`), the public keys nodes verify with (`SLIPSTREAM_RELEASE_PUBLIC_KEYS`), packaging excludes and the paths allowed to carry key material (`exclude`, `allow`), download limits (`SLIPSTREAM_ARTIFACTS_MAX_*`), the weekly verify (`SLIPSTREAM_ARTIFACTS_VERIFY_WEEKLY`) and, in CI only, the signing key (`SLIPSTREAM_SIGNING_KEY`) |
+| `deploy.hook_env` / `deploy.hook_env_pass` | What hooks see in their environment: `inherit` (everything, the default in git mode) or `minimal` (PATH, HOME, the locale, proxy and CA variables and `SLIPSTREAM_*`; the default in artifact mode), plus the names the pass list adds (`SLIPSTREAM_HOOK_ENV`, `SLIPSTREAM_HOOK_ENV_PASS`). The detached deploy always inherits |
 | `migrations.*` | The migrate step: a command run once per commit across the fleet, whether this node runs it, how long others wait (`SLIPSTREAM_MIGRATE_COMMAND`, `SLIPSTREAM_RUN_MIGRATIONS`, `SLIPSTREAM_MIGRATE_WAIT`) |
 | `node.paused` | Hold every node that reads this `.env`: no deploy starts (`SLIPSTREAM_PAUSED`) |
 | `hooks.file` | Deploy hooks file the app repository carries, read from each release (`SLIPSTREAM_HOOKS_FILE`, default `slipstream-hooks.php`) |
@@ -283,10 +283,10 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 | `slipstream:doctor` | Diagnose layout, ownership, PHP binary, sudo, git access, webhook reachability and source, hook scripts, the PCI-mode checks and, in artifact mode, the source, the pointer, the live release and where hooks come from — with the fix for each |
 | `slipstream:deploy` | Run a deploy here (or `--deployment=`); `--sha=` pins a commit, `--tag=` deploys a tag, `--skip-hooks=1,2` skips hooks once, `--fleet` is the dashboard's fleet-wide Deploy. In poll mode, with nothing named, it deploys the deploy ref's commit now |
 | `slipstream:rollback` | Point `current` at the previous release; `--fleet` rolls every eligible server back to its own previous release. In poll mode it also pins the node; in artifact mode it re-verifies the previous release first |
-| `slipstream:artifact` | The CI side of [artifact releases](#artifact-releases-build-once-in-ci): `package` a checkout into `dist/`, `sign` it, `publish` it (or `--rollback --sha=` to repoint), `list` what the store holds, `keygen` a local key pair |
-| `slipstream:verify` | Compare a release (default: the live one) with its signed manifest; exit 1 on drift, 2 with nothing to compare (`--release=`, `--json`, `--audit`). Scheduled weekly in artifact mode |
+| `slipstream:artifact` | The CI side of [artifact releases](#artifact-releases-build-once-in-ci): `package` a checkout into `dist/`, `sign` it, `publish` it (or `--rollback --sha=` to repoint), `list` what the store holds, `keygen` a local key pair. `sign` and `publish` take the commit from `--sha` (default `GITHUB_SHA`) and `--generated`, `--allow`, `--keys` |
+| `slipstream:verify` | Compare a release (default: the live one) with its signed manifest and its recorded cache hashes; exit 1 on drift (in artifact mode a missing manifest is drift), 2 with nothing to compare in git mode (`--release=`, `--json`, `--audit`). Scheduled weekly in artifact mode; the standalone tool's `verify-tree` is the check to run from outside the release |
 | `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom); prints the release it ran in |
-| `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, fail deploys orphaned by a killed process, bring untouched seeded hooks current after an upgrade, download due provider hook ranges; in poll mode, check the deploy ref and start a deploy when it moved (scheduled every minute) |
+| `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, fail deploys orphaned by a killed process, download due provider hook ranges; in poll mode, check the deploy ref and start a deploy when it moved (scheduled every minute) |
 | `slipstream:prune` | Trim old deploy events + webhook deliveries + terminal env pushes; fail stuck deploys/applies; forget long-silent servers when `SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS` is set (scheduled daily) |
 | `slipstream:relay` | Fan a stored relay payload out to peers (spawned detached; not run by hand) |
 | `slipstream:env-apply` | Apply this node’s queued shared `.env` push (spawned detached by a nudge; also the manual escape hatch) |
@@ -1033,9 +1033,10 @@ for the [artifact checks](#doctor-in-artifact-mode).
 
 ### Not in this release
 
-Rollout caps (a limit on how many nodes build or swap at once) are not part of 0.6. Releases
-are found through an interface, `Slipstream\Release\ReleaseSource`, with two sources bound
-to it: git, and the artifact store below.
+Rollout caps (a limit on how many nodes build or swap at once) and a signed expiry on artifact
+pointers (see [Replay protection](#replay-protection)) are not part of 0.6. Releases are found
+through an interface, `Slipstream\Release\ReleaseSource`, with two sources bound to it: git,
+and the artifact store below.
 
 ## Artifact releases: build once in CI
 
@@ -1086,13 +1087,16 @@ Any disk works; a `local` disk makes a one-machine trial, and the tests run on o
 | `SLIPSTREAM_ARTIFACTS_PREFIX` | empty | A key prefix inside the disk — one per environment, say |
 | `SLIPSTREAM_ARTIFACTS_MAX_ARCHIVE_BYTES`, `…_MAX_UNPACKED_BYTES`, `…_MAX_ENTRIES` | 1 GiB, 4 GiB, 250 000 | What a node will download and unpack, at most |
 | `SLIPSTREAM_ARTIFACTS_VERIFY_WEEKLY` | `true` | Schedule `slipstream:verify --audit` weekly |
-| `SLIPSTREAM_HOOK_ENV` | `minimal` in artifact mode, `inherit` in git mode | What hooks and the detached deploy see: `minimal` is PATH, HOME, COMPOSER_HOME, the locale and timezone variables and `SLIPSTREAM_*` — artisan reads the `.env` itself; `inherit` is this process's whole environment, every `.env` value included |
+| `SLIPSTREAM_HOOK_ENV` | `minimal` in artifact mode, `inherit` in git mode | What hooks see: `minimal` is PATH, HOME, COMPOSER_HOME, the locale and timezone variables, the proxy and CA variables (`HTTP(S)_PROXY`, `NO_PROXY`, `ALL_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) and `SLIPSTREAM_*`; `inherit` is this process's whole environment, every `.env` value included. The detached deploy always inherits. See [the hook environment](#hooks-build-time-and-node-time) for what this does and does not protect |
+| `SLIPSTREAM_HOOK_ENV_PASS` | unset | More variable names minimal mode passes to hooks, comma-separated |
 | `SLIPSTREAM_SIGNING_KEY` | unset | CI only: `sodium:<base64 secret>`, `file:<path>` holding that, or `kms:<key id, ARN or alias>` |
 
-`artifacts.exclude` (paths `package` leaves out, beyond its own list) and `artifacts.generated`
-(paths a node writes into a release after unpacking it, which verification must not count as
-drift: `bootstrap/cache`, `public/storage` and `public/hot` by default) live in the published
-config, which the repository carries.
+The paths a node may write into a release after unpacking it (`bootstrap/cache`,
+`public/storage` and `public/hot` unless the publish job says otherwise) are signed into the
+manifest by `publish`. They excuse only files the manifest does not list: a file CI signed is
+always checked, wherever it is. `artifacts.exclude` (paths `package` leaves out, beyond its
+own list) and `artifacts.allow` (paths outside `vendor/` allowed to carry key material) live
+in the published config, which the repository carries.
 
 ### What is in the store
 
@@ -1128,7 +1132,7 @@ passes and names a new commit starts the deploy, which then:
 
 1. reads the manifest and checks its sha256 is the one the pointer names;
 2. reads the statement, verifies its signature, and checks it signs that manifest, that
-   commit and this environment;
+   commit, this environment and the deploy ref;
 3. refuses a release built for a newer PHP major.minor than the node's (an older one deploys,
    with a warning in the log);
 4. streams the archive into `releases/.incoming-<timestamp>_<sha>`, hashing as it goes, and
@@ -1148,8 +1152,20 @@ release (there is nothing to re-run, and the bytes are not trusted), the deploym
 `Refusing artifact (<stage>): <reason>`, and `slipstream.artifact.refused` is audited. A
 failure after that — a hook, the health check — keeps the release as `.failed` for
 inspection, as always. A verified deploy audits `slipstream.artifact.verified` with the
-commit, the manifest hash, the archive hash and the file count. The back-off after a failed
-artifact deploy is keyed on the manifest's hash, so a republished fix is tried at once.
+commit, the manifest hash, the archive hash, the file count and whether a pointer named it
+(`bound`). Just before the swap the deploy records the hashes of the caches the node
+generated (`bootstrap/cache/*.php`) in `.slipstream/generated.json` and audits them as
+`slipstream.artifact.baseline`.
+
+**Every deploy is tied to the pointer that named it.** A poll or bootstrap deploy carries the
+pointer it started from and fetches exactly the manifest that pointer named, even if the
+pointer has moved since. If the pointer moves on to another commit while the deploy runs — a
+rollback, or the next release — the deploy stops before the swap, as `superseded` rather than
+failed, removes its release, and the next check deploys what the pointer names now. A deploy
+by commit (`slipstream:deploy --sha=`, the dashboard) is bound to the pointer when the
+pointer's head or its previous names that commit; otherwise it rests on the release's own
+signed statement (ref and environment checked) and says so in the log and the audit line.
+The back-off after a failed deploy is keyed on the manifest the deploy was started for.
 
 ### Publishing from GitHub Actions
 
@@ -1166,6 +1182,11 @@ name: release
 on:
   push:
     branches: [production]
+
+# One publish at a time per ref, never cancelled half-way.
+concurrency:
+  group: slipstream-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -1210,21 +1231,46 @@ jobs:
       - run: |
           php deploy/slipstream-release.php publish \
             --archive=dist/release.tar.gz --manifest=dist/manifest.json \
-            --ref="$GITHUB_REF" --environment=production \
+            --sha="$GITHUB_SHA" --ref="$GITHUB_REF" --environment=production \
+            --keys="${{ vars.SLIPSTREAM_RELEASE_PUBLIC_KEYS }}" \
             --key=kms:alias/app-release --store=s3://app-releases/production
 ```
 
 `package` runs the hooks marked `where => build` ([below](#hooks-build-time-and-node-time)),
-checks the build carries `vendor/slipstream/slipstream`, leaves out `.git`, `node_modules`,
-`tests`, `.env`, `auth.json`, `vendor/bin` (Composer's symlinks; artisan never needs them)
-and the paths in `artifacts.exclude`, and writes `dist/release.tar.gz` and
-`dist/manifest.json`. The archive is deterministic — sorted entries, zero timestamps, fixed
-ownership and modes — so the same tree gives the same hash. `publish` reads the archive back
-and builds the manifest it signs from what is in it (the build job's manifest is a
-description; the signed one is what the tarball holds), uploads the archive, the manifest and
-the statement, then writes the pointer last. `php artisan slipstream:artifact sign` and
-`publish` do the same from a job that has the application installed, for a local-key setup;
-`slipstream:artifact list` shows what the store holds.
+checks the build carries `vendor/slipstream/slipstream`, and writes `dist/release.tar.gz` and
+`dist/manifest.json`. It leaves out, at any depth, `.git`, `node_modules`, `.env*` (but
+`.env.example`), `auth.json`, `.envrc`, `.npmrc`, `.yarnrc*`, `.sentryclirc` and SQLite files
+outside `vendor/`, and prints what those rules dropped; at the root also `tests`, `.github`,
+`vendor/bin` (Composer's symlinks; artisan never needs them) and the paths in
+`artifacts.exclude`. It refuses a private key or a key store outside `vendor/` — found by
+content (`-----BEGIN … PRIVATE KEY-----`), so a public CA bundle such as RDS's
+`global-bundle.pem` still ships — unless the path is in `artifacts.allow`. The archive is
+deterministic — sorted entries, zero timestamps, fixed ownership and modes — so the same
+tree gives the same hash.
+
+The build job is the untrusted side, so `publish` takes nothing on its word:
+
+- the commit is `--sha` (GitHub Actions sets `GITHUB_SHA`), and a build manifest that names
+  another one is refused;
+- the manifest it signs is rebuilt from the archive's own bytes, and the paths a node may
+  write are publish's own (`--generated`, defaulting to `bootstrap/cache`, `public/storage`,
+  `public/hot`), never the build's;
+- the archive is read with the node's reader and limits, and refused if it carries anything
+  `package` would have left out or refused (`--allow` names paths that may carry keys);
+- both signatures are checked under the nodes' keys (`--keys`) before anything uploads, so a
+  KMS alias pointing at a key no node trusts is found in CI, not by every node refusing;
+- releases are **write-once**: the same bytes again (a re-run of the publish job) are
+  skipped, different bytes for a published commit are refused — a build can never overwrite
+  an older, approved release and poison rollbacks. To publish a commit again, push a new one;
+- the pointer goes last, and only if no other publish moved it since it was read (S3
+  `If-Match` on its ETag, `If-None-Match` for the first).
+
+`php artisan slipstream:artifact sign` and `publish` (with `--sha`, `--generated`, `--allow`
+and `--keys`, defaulting to `GITHUB_SHA` and `SLIPSTREAM_RELEASE_PUBLIC_KEYS`) do the same from
+a job that has the application installed, for a local-key setup; through a filesystem disk
+they check before they write, which leaves a small race the conditional S3 writes of the
+standalone tool do not, so use the tool for S3. `slipstream:artifact list` shows what the
+store holds.
 
 **The trust policy.** The publish role's trust condition is the environment, not the branch:
 `token.actions.githubusercontent.com:sub` equals `repo:ORG/REPO:environment:production`. A
@@ -1233,8 +1279,10 @@ deployment-branch rule (production only) and its required reviewers are what gat
 and the reviewed approval is the change record (PCI DSS 6.5.1). GitHub is moving the `sub`
 claim from names to repository and environment IDs for newer repositories, so read the claim
 from a test run before writing the condition. The role needs `kms:Sign` and
-`kms:GetPublicKey` on the key and `s3:PutObject` under `releases/*` and `refs/*` of the
-bucket, and nothing else.
+`kms:GetPublicKey` on the key; `s3:PutObject` and `s3:GetObject` under `releases/*` and
+`refs/*` of the prefix (it reads the current pointer and its ETag, and compares a re-run with
+what is there); and `s3:ListBucket` on the prefix, so a key that does not exist yet reads as
+missing rather than forbidden. Nothing else.
 
 **The key.** Ed25519 only. A KMS asymmetric key (`ECC_NIST_EDWARDS25519`, `SIGN_VERIFY`)
 signs with `ED25519_SHA_512` over the raw message, never leaves AWS, and gives every
@@ -1248,13 +1296,44 @@ prints both lines: the secret for CI's environment secrets, the public key for t
 `.env`.
 
 **The bucket.** Versioning on, Block Public Access on, insecure transport denied. The publish
-role may `PutObject` under `releases/*` and `refs/*` and nothing else; the node role may
+role may write under `releases/*` and `refs/*` and nothing else; the node role may
 `GetObject` and `ListBucket`, and only through the VPC gateway endpoint (`aws:SourceVpce`).
-Object Lock in compliance mode with a default retention makes every pointer and release
-version immutable for its retention period, so nothing can roll the store back to an older
-pointer by overwriting: the history of what the fleet was told to run stays. Deny
-`DeleteObject` and `DeleteObjectVersion` to all but a break-glass role. Turn on CloudTrail
-S3 data events for the bucket, with an alarm on any `PutObject` under `refs/*` by a principal
+Make the write-once rule the bucket's, not only the tool's, by denying writes that do not
+carry the conditional headers:
+
+```json
+{
+  "Sid": "ReleasesAreWriteOnce",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::app-releases/production/releases/*",
+  "Condition": {
+    "Null": { "s3:if-none-match": "true" },
+    "Bool": { "s3:ObjectCreationOperation": "true" }
+  }
+},
+{
+  "Sid": "PointersMoveOnlyFromWhatWasRead",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::app-releases/production/refs/*",
+  "Condition": {
+    "Null": { "s3:if-match": "true", "s3:if-none-match": "true" },
+    "Bool": { "s3:ObjectCreationOperation": "true" }
+  }
+}
+```
+
+(With these in place `CopyObject` into those prefixes fails too, which nothing here uses.)
+Object Lock in compliance mode with a default retention keeps every pointer and release
+version for its retention period, so the history of what the fleet was told to run stays —
+but it does not stop a new version becoming current: anyone who may write `refs/*` can make
+an old signed pointer current again. What stops that is who may write `refs/*` (the publish
+role only), the alarm below, and each node's [high-water mark](#replay-protection). Deny
+`DeleteObject` and `DeleteObjectVersion` to all but a break-glass role. Turn on CloudTrail S3
+data events for the bucket, with an alarm on any `PutObject` under `refs/*` by a principal
 other than the publish role. The gateway endpoint's policy allows `GetObject` and
 `ListBucket` on this bucket, plus whatever else the node needs S3 for — package mirrors and
 SSM use it too; decide that explicitly.
@@ -1281,9 +1360,18 @@ return [
 On an artifact node `{{ npm }}` and `{{ composer }}` are shell functions that fail with
 "npm does not run on an artifact node; mark the hook where => build", so a hook that should
 have been build-time fails the deploy instead of quietly needing a tool the node should not
-have. The hooks file must be the release's own: an absolute `SLIPSTREAM_HOOKS_FILE` is refused
-in artifact mode. Hooks see a minimal environment (`SLIPSTREAM_HOOK_ENV`); `artisan` reads
-the `.env` itself, so a hook that runs `php artisan` loses nothing.
+have. The hooks file must be the release's own: in artifact mode `SLIPSTREAM_HOOKS_FILE` may
+not be absolute, contain `..`, or resolve (through a link such as `storage/`) outside the
+release.
+
+**The hook environment.** Hooks see a minimal environment (`SLIPSTREAM_HOOK_ENV`): PATH,
+HOME, the locale, the proxy and CA variables, `SLIPSTREAM_*` and what
+`SLIPSTREAM_HOOK_ENV_PASS` names. `artisan` reads the `.env` itself, so a hook that runs `php
+artisan` loses nothing. Be clear about what this buys: it keeps secrets out of hook output,
+which the deploy log stores raw. It is not isolation — a hook runs as the deploy user, who
+can read the shared `.env` — so do not record it as a compensating control. The detached
+deploy process itself always inherits its environment: it is Slipstream's own, and the one
+that downloads from the store, so it keeps its proxy and AWS settings.
 
 Build-time values such as `VITE_*` come from CI's environment, not the shared `.env`; lint
 them for secrets, since a built asset is public. `composer.lock` and `package-lock.json` ship
@@ -1292,22 +1380,63 @@ release's inventory of components.
 
 ### Verifying the live release
 
+Both checks compare the release with its signed manifest: the statement under trusted keys,
+every file the manifest lists re-hashed, nothing added, symlinks only where the node makes
+them (`storage`, the `.env` and `auth.json`, the shared paths), and the generated caches
+(`bootstrap/cache/*.php`) against the hashes the deploy recorded just before the swap. Paths
+the signed manifest marks as node-written excuse only files it does not list. In artifact
+mode a release without a usable manifest is drift, not "nothing to verify": deleting it must
+not silence the check.
+
+**The PCI DSS 11.5.2 control is `verify-tree`, run from outside the release.** The release
+tree belongs to the deploy user, who is also the PHP-FPM pool user, and `slipstream:verify`
+runs inside the app, from the very release it checks — anything that can write the tree
+(code execution in the app) can patch the verifier. So run the standalone tool from the
+image's root-owned copy, as root, with keys from a root-owned file (never the shared `.env`,
+which the pool user can write):
+
+```ini
+# /etc/systemd/system/slipstream-verify.service
+[Unit]
+Description=Check the live release against its signed manifest
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/php /opt/slipstream/slipstream-release.php verify-tree \
+    --release=/var/www/app/current --environment=production \
+    --keys=file:/etc/slipstream/release-keys --shared=public/uploads \
+    --state-dir=/var/lib/slipstream-verify --json
+
+# /etc/systemd/system/slipstream-verify.timer
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+It prints one line per run (`artifact.verify_ok` or `artifact.verify_drift`, as JSON with
+`--json`) to the journal; ship it with the rest of the logs and alarm on `verify_drift`, and
+on a day without a `verify_ok`. Exit 0 clean, 1 drift. `--shared` names the shared paths the
+deploy links (they are not in the shared `.env`, and the release's own config is the build's
+word). `--state-dir` pins each release's manifest hash and recorded cache hashes the first
+time it sees it, so rewriting the copies inside the tree is caught too; running it hourly
+keeps the window before the first look short.
+
+The in-app check stays for convenience, and `slipstream:doctor` runs it (**live release**):
+
 ```bash
-php artisan slipstream:verify              # the live release against its signed manifest
-php artisan slipstream:verify --json       # modified, missing, unlisted, links
+php artisan slipstream:verify              # the live release
+php artisan slipstream:verify --json       # modified, missing, unlisted, links, generated
 php artisan slipstream:verify --release=/var/www/app/releases/20261019_120000_ab12cd3
 ```
 
-It re-verifies the statement under the node's current keys and re-hashes every file the
-manifest lists, and reports files modified, missing or added, and any symlink not at a shared
-path. `storage`, the `.env` and `auth.json` links, `RELEASE_SHA`, `.slipstream/`, the
-configured shared paths and `artifacts.generated` are left out. Exit 0 clean, 1 on drift, 2
-with nothing to compare (a release deployed from git). In artifact mode it is scheduled
-weekly with `--audit`, which writes `slipstream.artifact.verify_ok` or
-`slipstream.artifact.verify_drift` (with the counts and the first paths) to the audit log —
-the change-detection mechanism PCI DSS 11.5.2 asks for on the code a CDE node serves. Alarm
-on `verify_drift`, and on a week without a `verify_ok`. `slipstream:doctor` runs the same
-comparison (**live release**).
+Exit 0 clean, 1 on drift (in artifact mode, including a missing or unreadable manifest), 2
+with nothing to compare in git mode. In artifact mode it runs weekly with `--audit`, writing
+`slipstream.artifact.verify_ok` or `slipstream.artifact.verify_drift` to the audit log. Keep
+`optimize` before the swap (the default hooks do): caches regenerated later are reported as
+changed since the deploy.
 
 ### Bootstrapping from an artifact
 
@@ -1324,18 +1453,27 @@ sudo -u deploy -H APP_ROOT="$APP_ROOT" ARTIFACTS=s3://app-releases/production \
 
 It fetches the pointer and checks it with `slipstream-release.php verify-pointer` (the same
 checks a node applies), fetches the release and checks and unpacks it with `verify-release`
-— the statement, the archive's hash, every file's — and only then runs `php artisan
-slipstream:bootstrap` from it. Nothing from the store runs before it verifies. Bootstrap
-skips the mirror step, deploys the pointer's release, and falls back to its `previous` if
-that fails: a release the store holds a verified statement for. `RELEASE_TOOL` names the
-tool when it is not beside the stub.
+— the statement and its ref, the archive's hash, every file's — and only then runs `php
+artisan slipstream:bootstrap` from it. Nothing from the store runs before it verifies, and no
+object is downloaded that is larger than it can honestly be (the pointer and statement 64 KiB,
+the manifest 64 MiB, the archive `SLIPSTREAM_ARTIFACTS_MAX_ARCHIVE_BYTES`). Bootstrap skips
+the mirror step and deploys the pointer's release.
+
+If that release does not verify (in the stub) or its deploy fails (in `slipstream:bootstrap`),
+they fall back to the pointer's `previous`, bound to the manifest the signed pointer names for
+it. That is the only fallback in artifact mode: the shared store's last-good record plays no
+part.
+`--no-fallback` (after the script name or in `BOOTSTRAP_ARGS`) stops at the head instead, in
+both. A pointer written by a rollback has no previous. `RELEASE_TOOL` names the tool when it is
+not beside the stub.
 
 ### Rolling back
 
 Move the pointer: `php artisan slipstream:artifact publish --rollback --sha=<sha>
---ref=refs/heads/production` (or `slipstream-release.php rollback …` from CI) writes a new,
-higher pointer naming a release already in the store, after checking that its statement
-verifies for this environment, and uploads nothing. Every node converges on its next check,
+--ref=refs/heads/production` (or `slipstream-release.php rollback --sha=… --ref=… --keys=… …`
+from CI) writes a new, higher pointer naming a release already in the store, after checking
+that its statement verifies for this environment and was built for this ref, and uploads
+nothing. A deploy still building the release you rolled away from stops before its swap. Every node converges on its next check,
 and the move is a signed, logged change like a release. On one node, `php artisan
 slipstream:rollback` re-verifies the previous release against its own
 `.slipstream/manifest.sig` before the flip, and pins the node as in poll mode.
@@ -1344,14 +1482,22 @@ slipstream:rollback` re-verifies the previous release against its own
 
 A publish sets the pointer's `sequence` to the current one plus one, or the time, whichever
 is higher. A node accepts a pointer whose sequence is at least the highest it has accepted
-for that ref (equal is the same pointer read again each minute) and refuses a lower one
-("sequence N is below M, which this node already accepted; publish a rollback rather than
-put an old pointer back") or one more than a day in the future. The high-water mark is
-recorded on acceptance in the node's settings (`artifact_sequence:<ref>`) and in the shared
-store, so a pointer replaced with an older copy is refused by every node that saw the newer
-one. A fresh instance has no mark and accepts the current pointer — which is why the bucket
-policy and Object Lock are the control and the mark is the signal: alarm on
-`slipstream.artifact.refused`.
+for that ref and refuses a lower one ("sequence N is below M, which this node already
+accepted; publish a rollback rather than put an old pointer back"), one more than a day in
+the future, and one whose sequence equals its mark but names another release (the
+conditional pointer write means two publishes can never share a sequence). The high-water
+mark — the sequence and the manifest it named — is recorded on acceptance in the node's
+settings (`artifact_sequence:<ref>`) and in the shared store, under the store's lock, so a
+pointer replaced with an older copy is refused by every node that saw the newer one. A mark
+more than a day ahead of the clock cannot have come from an accepted pointer: it is ignored
+and audited (`slipstream.artifact.mark_ignored`), so one write to the shared store cannot stop
+the fleet deploying. Refusals are audited once per change, not once a minute.
+
+What remains: a fresh instance has no mark, and accepts whatever signed pointer the store
+holds — and the stub runs that release's artisan before the app-level mark is consulted. So
+the control is who may write `refs/*` (the publish role, alarmed in CloudTrail), and the
+mark is the signal: alarm on `slipstream.artifact.refused`. A signed pointer expiry, re-signed
+on a schedule, would close the gap and is planned for 0.7.
 
 ### Rotating the key
 
@@ -1367,13 +1513,56 @@ statement verifies only while its key is listed, and `slipstream:verify` says so
 - **artifact pointer** — reads and checks the pointer without accepting it; fails with the
   reason, or with the store's error and the IAM hint; warns when it was published in the
   future.
-- **live release** — the `slipstream:verify` comparison.
+- **live release** — the `slipstream:verify` comparison; fails when a release an artifact
+  deploy wrote has lost its manifest, warns when the release was built from git.
 - **hook sources** — warns about stored hooks (unsigned) and, in PCI mode, about `git`,
   `composer` or `npm` on the PATH.
 - **git mirror** and **package committed** are skipped; **deploy trigger** reports the pointer
   in place of `ls-remote`; `slipstream:provision` does not look for build tools.
 
 ## Upgrading
+
+### To 0.6.1
+
+Fixes from a review of artifact mode. Git mode changes in one place only: stored default
+hooks are no longer rewritten (last point).
+
+- **Publishing names its commit.** `publish` and `sign` need `--sha` (GitHub Actions sets
+  `GITHUB_SHA`, which is the default) and refuse a build that names another commit. The
+  standalone tool also needs `--keys`, the nodes' `SLIPSTREAM_RELEASE_PUBLIC_KEYS`: it checks
+  every signature against them before anything uploads. Add both to the workflow's publish
+  step.
+- **Releases are write-once.** A commit already published with different bytes is refused;
+  to publish again, push a new commit. A re-run of the publish job alone is fine. Add the two
+  `Deny` statements from [the bucket](#publishing-from-github-actions) to the bucket policy,
+  and `s3:GetObject` and `s3:ListBucket` to the publish role. The standalone tool now writes
+  with `aws s3api put-object`, so the CI image needs a current AWS CLI v2.
+- **The paths a node may write come from publish** (`--generated`, defaulting to
+  `bootstrap/cache`, `public/storage`, `public/hot`), never from the build's manifest or the
+  release's config; and every file the manifest lists is checked, wherever it is.
+- **Verification.** `slipstream:verify` exits 1 for a release without a usable manifest in
+  artifact mode, so a `current` built from git reports drift until its first artifact deploy.
+  It also compares `bootstrap/cache/*.php` with the hashes recorded at deploy (releases
+  deployed by 0.6.0 have none). Set up `slipstream-release.php verify-tree` from a root timer
+  — [Verifying the live release](#verifying-the-live-release) — as the 11.5.2 control.
+- **Packaging** drops `.env*`, `auth.json`, `.npmrc` and the rest at any depth and refuses a
+  private key outside `vendor/`; list a deliberate one in `artifacts.allow`.
+- **Hooks** on an artifact node now really get the minimal environment (0.6.0 passed
+  everything); a hook that needs another variable names it in `SLIPSTREAM_HOOK_ENV_PASS`. The
+  detached deploy inherits its environment again, so proxies and AWS settings reach the
+  download.
+- **Deploys bind to the pointer**: a poll deploy stops as `superseded` if the pointer moves to
+  another commit before its swap; the statement's ref must be the deploy ref; bootstrap falls
+  back to the pointer's previous (stub included), not the shared last-good record.
+- `SLIPSTREAM_RELEASE_PUBLIC_KEYS=file:` must be an absolute path; `SLIPSTREAM_HOOKS_FILE`
+  may not leave the release in artifact mode.
+- Copy the new `slipstream-release.php` and `slipstream-bootstrap.sh` into the image and the
+  repository; `verify-release` now needs `--ref`, which the new bootstrap stub passes.
+- **Stored default hooks are no longer rewritten** (0.5.2 rewrote untouched ones in place, so
+  a node still on older code during an upgrade took the new text for an edited hook and ran
+  it beside the hooks file). An untouched copy of any earlier default runs the current text;
+  `slipstream:hooks` shows the text that runs.
+- No migration.
 
 ### To 0.6.0
 

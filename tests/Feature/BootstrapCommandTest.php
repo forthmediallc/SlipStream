@@ -285,6 +285,37 @@ class BootstrapCommandTest extends TestCase
         $this->assertSame(self::TAGGED, $this->running());
     }
 
+    /**
+     * In artifact mode the fallback is the signed pointer's previous, bound
+     * to the manifest it names — no shared-store suggestion needed.
+     */
+    public function test_in_artifact_mode_the_fallback_is_the_pointers_previous_bound_to_its_manifest(): void
+    {
+        $this->artifactPointer();
+        $this->runner->failing = [self::TAGGED];
+
+        $this->artisan('slipstream:bootstrap')
+            ->expectsOutputToContain("Falling back to the pointer's previous release 1111111")
+            ->assertExitCode(0);
+
+        $this->assertSame(self::GOOD, $this->running());
+        $this->assertNull(app(LastGood::class)->get(DeployRef::fromConfig()), 'no last-good record was needed');
+        $this->assertSame(['sequence' => 1000, 'manifest_sha256' => str_repeat('8', 64)], Deployment::query()->where('sha', self::TAGGED)->sole()->meta['pointer']);
+        $this->assertSame(['sequence' => 1000, 'manifest_sha256' => str_repeat('9', 64)], Deployment::query()->where('sha', self::GOOD)->sole()->meta['pointer']);
+    }
+
+    public function test_in_artifact_mode_no_fallback_stops_at_the_head(): void
+    {
+        $this->artifactPointer();
+        $this->runner->failing = [self::TAGGED];
+
+        $this->artisan('slipstream:bootstrap', ['--no-fallback' => true])
+            ->expectsOutputToContain('The deploy of 2222222 failed.')
+            ->assertExitCode(1);
+
+        $this->assertSame(0, Deployment::query()->where('sha', self::GOOD)->count());
+    }
+
     public function test_a_failing_health_check_keeps_the_instance_out(): void
     {
         $this->health->ok = false;
@@ -308,6 +339,33 @@ class BootstrapCommandTest extends TestCase
             ->assertExitCode(1);
 
         $this->assertSame([], $this->runner->ran);
+    }
+
+    /**
+     * Artifact mode against a pointer on a local disk: the head is TAGGED,
+     * its previous GOOD.
+     */
+    protected function artifactPointer(): void
+    {
+        rmdir($this->root.DIRECTORY_SEPARATOR.'repo.git');
+        config()->set('slipstream.release.source', 'artifact');
+        config()->set('slipstream.release.environment', 'production');
+        config()->set('slipstream.trigger.ref', 'refs/heads/production');
+        config()->set('filesystems.disks.artifacts', ['driver' => 'local', 'root' => $this->root.DIRECTORY_SEPARATOR.'store']);
+        config()->set('slipstream.artifacts.disk', 'artifacts');
+        config()->set('slipstream.artifacts.prefix', '');
+
+        $pair = \Slipstream\Release\Core\SodiumSigner::generate();
+        $signer = \Slipstream\Release\Core\SodiumSigner::fromSpec('sodium:'.$pair['secret'], 'k');
+        config()->set('slipstream.artifacts.public_keys', 'k:'.$pair['public']);
+
+        \Illuminate\Support\Facades\Storage::disk('artifacts')->put('refs/heads/production.json', \Slipstream\Release\Core\Envelope::encode([
+            'ref' => 'refs/heads/production', 'sha' => self::TAGGED, 'manifest_sha256' => str_repeat('8', 64), 'sequence' => 1000,
+            'published_at' => '2026-10-20T00:00:00Z', 'previous' => ['sha' => self::GOOD, 'manifest_sha256' => str_repeat('9', 64)],
+            'by' => 'ci', 'environment' => 'production', 'slipstream' => 'v0.6.1',
+        ], \Slipstream\Release\Core\Envelope::DOMAIN_POINTER, $signer));
+
+        $this->app->instance(ReleaseSource::class, app(\Slipstream\Release\ArtifactSource::class));
     }
 
     protected function running(): ?string

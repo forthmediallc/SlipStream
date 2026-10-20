@@ -3,6 +3,7 @@
 namespace Slipstream\Tests\Feature;
 
 use Illuminate\Support\Facades\Http;
+use Slipstream\Deploy\DefaultHooks;
 use Slipstream\Models\DeploymentHook;
 use Slipstream\Settings\SettingsRepository;
 use Slipstream\Tests\TestCase;
@@ -249,6 +250,17 @@ class DoctorCommandTest extends TestCase
 
         $this->artisan('slipstream:doctor')
             ->expectsOutputToContain('without set -e: "Build docs" (#')
+            ->assertExitCode(1); // the bare layout fails elsewhere
+    }
+
+    public function test_an_untouched_earlier_default_does_not_warn_because_it_runs_the_current_text(): void
+    {
+        Http::fake(['*' => Http::response('invalid signature', 401)]);
+        DefaultHooks::seed();
+        DeploymentHook::query()->where('name', 'Build assets')->update(['script' => DefaultHooks::PREVIOUS['Build assets'][0]]);
+
+        $this->artisan('slipstream:doctor')
+            ->doesntExpectOutputToContain('without set -e')
             ->assertExitCode(1); // the bare layout fails elsewhere
     }
 
