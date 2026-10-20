@@ -185,9 +185,9 @@ return [
         // Paths a node writes into a release after unpacking it, as package
         // describes them in the build's manifest. Informational only: this
         // file ships inside the release, so it is the build's word. publish
-        // signs its own list (--generated, the same three by default), and
+        // signs its own list (--generated, bootstrap/cache by default), and
         // that list excuses only files the manifest does not list.
-        'generated' => ['bootstrap/cache', 'public/storage', 'public/hot'],
+        'generated' => ['bootstrap/cache'],
 
         // What a node will download and unpack, at most.
         'max_archive_bytes' => (int) env('SLIPSTREAM_ARTIFACTS_MAX_ARCHIVE_BYTES', 1073741824),

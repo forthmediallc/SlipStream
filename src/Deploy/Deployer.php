@@ -300,14 +300,17 @@ class Deployer
         $recorded = $this->recordedPointer();
         $sha = strtolower((string) $this->deployment->sha);
 
+        // A download a deploy that died left behind, cleared before this one
+        // stages its own: failing deploys must not fill the disk.
+        $this->sweepIncoming($step);
+
         $current = null;
         try {
             $current = $source->pointer($ref, fresh: true, accept: false);
         } catch (ArtifactRefused $e) {
-            if ($recorded !== null) {
-                throw $e;
-            }
-            $this->log->warning('The pointer in the store is refused ('.$e->reason.'); deploying the commit by its own signature.', $step);
+            // What is in the store now proves nothing about the pointer this
+            // deploy was started from, which was checked when it was read.
+            $this->log->warning('The pointer in the store is refused ('.$e->reason.'); '.($recorded !== null ? 'fetching the release the pointer this deploy started from named.' : 'deploying the commit by its own signature.'), $step);
         } catch (\Throwable $e) {
             $this->log->warning('Could not read the pointer ('.$e->getMessage().'); '.($recorded !== null ? 'fetching the release it named.' : 'deploying the commit by its own signature.'), $step);
         }
@@ -449,7 +452,9 @@ class Deployer
 
     /**
      * Just before the flip, the pointer again: a rollback published while
-     * this deploy built must win.
+     * this deploy built must win. Only a pointer that verifies can stop it —
+     * garbage written to the store after the migrations ran must not leave
+     * the node half-deployed — so a refusal counts like an unreadable store.
      */
     protected function checkPointerBeforeSwap(string $step): void
     {
@@ -460,10 +465,8 @@ class Deployer
 
         try {
             $current = app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), fresh: true, accept: false);
-        } catch (ArtifactRefused $e) {
-            throw $e;
         } catch (\Throwable $e) {
-            $this->log->warning('Could not re-read the pointer before the swap ('.$e->getMessage().'); going on with the release it named.', $step);
+            $this->log->warning('Could not re-read the pointer before the swap ('.($e instanceof ArtifactRefused ? 'refused: '.$e->reason : $e->getMessage()).'); going on with the release it named.', $step);
 
             return;
         }
@@ -492,12 +495,33 @@ class Deployer
             return;
         }
 
+        // The record lives in the release, which the pool user can write;
+        // its hash goes on the deployment row too, so deleting or rewriting
+        // it shows up (slipstream:verify reads it back).
+        $meta = (array) $this->deployment->meta;
+        $meta['artifact'] = array_merge((array) ($meta['artifact'] ?? []), ['baseline_sha256' => hash_file('sha256', $sidecar.DIRECTORY_SEPARATOR.Baseline::FILE)]);
+        $this->deployment->update(['meta' => $meta]);
+
         $this->log->info('Recorded the hashes of '.count($files).' generated file(s) in bootstrap/cache.', $step);
         AuditLog::record('artifact.baseline', [
             'deployment' => $this->deployment->id,
             'sha' => $this->sha,
             'files' => array_map(fn (array $entry) => $entry[0], $files),
         ]);
+    }
+
+    /**
+     * Downloads and staging directories an artifact deploy left behind when
+     * it was killed outright (glob('*') never lists dot-prefixed entries).
+     */
+    protected function sweepIncoming(string $step): void
+    {
+        foreach (glob($this->releases.DIRECTORY_SEPARATOR.'.incoming-*') ?: [] as $stale) {
+            if (filemtime($stale) < time() - 7200) {
+                $this->log->info("Removing an abandoned download: {$stale}", $step);
+                $this->removePath($stale);
+            }
+        }
     }
 
     /**
@@ -945,15 +969,7 @@ class Deployer
             $this->log->info("Pruning old failed release: {$old}", $step);
         }
 
-        // A staging directory, or the download beside it, that an artifact
-        // deploy left behind when it was killed outright (glob('*') never
-        // lists dot-prefixed entries).
-        foreach (glob($this->releases.DIRECTORY_SEPARATOR.'.incoming-*') ?: [] as $stale) {
-            if (filemtime($stale) < time() - 7200) {
-                $this->log->info("Removing an abandoned download: {$stale}", $step);
-                $this->removePath($stale);
-            }
-        }
+        $this->sweepIncoming($step);
 
         $this->log->stepEnd($step);
         $this->runHooks($step, 'after');

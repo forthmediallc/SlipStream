@@ -189,13 +189,8 @@ class StatusCommand extends Command
             $refError = $e->getMessage();
         }
 
-        $backoff = null;
-        if ($poll && $server?->poll_seen_sha && strtolower((string) $running) !== strtolower($server->poll_seen_sha)) {
-            $state = app(Poller::class)->backoff($server->poll_seen_sha);
-            $backoff = $state === null ? null : ['failures' => $state['failures'], 'until' => $state['until']->toIso8601String()];
-        }
-
         $artifact = null;
+        $manifest = null;
         if (Slipstream::artifactMode()) {
             $store = app(ArtifactStore::class);
             $artifact = [
@@ -204,12 +199,23 @@ class StatusCommand extends Command
             ];
             try {
                 $deployRef = DeployRef::fromConfig();
-                $artifact['high_water'] = app(ArtifactSequence::class)->highWater($deployRef)['sequence'];
-                $pointer = app(ArtifactSource::class)->pointer($deployRef, accept: false);
+                $source = app(ArtifactSource::class);
+                $artifact['high_water'] = app(ArtifactSequence::class)->highWater($deployRef, $source->keys(), (string) Slipstream::releaseEnvironment())['sequence'];
+                $pointer = $source->pointer($deployRef, accept: false);
                 $artifact = ['sha' => $pointer->sha, 'sequence' => $pointer->sequence, 'published_at' => $pointer->publishedAt, 'by' => $pointer->by, 'key_id' => $pointer->keyId] + $artifact;
+                $manifest = $pointer->manifestSha256;
             } catch (\Throwable $e) {
                 $artifact['error'] = $e->getMessage();
             }
+        }
+
+        // The same back-off the poller applies: in artifact mode it belongs
+        // to the build the pointer names.
+        $backoff = null;
+        if ($poll && $server?->poll_seen_sha && strtolower((string) $running) !== strtolower($server->poll_seen_sha)) {
+            $seenManifest = $artifact !== null && $artifact['sha'] === strtolower($server->poll_seen_sha) ? $manifest : null;
+            $state = app(Poller::class)->backoff($server->poll_seen_sha, $seenManifest);
+            $backoff = $state === null ? null : ['failures' => $state['failures'], 'until' => $state['until']->toIso8601String()];
         }
 
         return [

@@ -89,42 +89,86 @@ class ArtifactSourceTest extends TestCase
         $release = app(ReleaseSource::class)->latest(DeployRef::fromConfig());
 
         $this->assertSame([self::SHA, 'production', false], [$release->sha, $release->name, $release->isTag]);
-        $this->assertSame('1000:'.self::MANIFEST, app(SettingsRepository::class)->get('artifact_sequence:branch:production'), 'the node remembers what it accepted');
-        $this->assertSame(['sequence' => 1000, 'manifest' => self::MANIFEST], app(ArtifactSequence::class)->highWater(DeployRef::fromConfig()));
+        // The mark is the signed pointer itself, kept locally and shared.
+        $envelope = json_decode((string) Storage::disk('artifacts')->get('app/refs/heads/production.json'), true);
+        $this->assertSame($envelope, app(SettingsRepository::class)->get('artifact_sequence:branch:production'), 'the node remembers what it accepted');
+        $this->assertSame($envelope, json_decode((string) \Slipstream\Fleet\SharedStore::cache()->get($this->sharedKey()), true));
+        $this->assertSame(['sequence' => 1000, 'manifest' => self::MANIFEST], $this->mark());
     }
 
-    public function test_a_mark_from_before_0_6_1_still_counts_and_learns_its_manifest(): void
-    {
-        app(SettingsRepository::class)->set('artifact_sequence:branch:production', '1000');
-        $this->publish(['sequence' => 999]);
-        try {
-            app(ReleaseSource::class)->latest(DeployRef::fromConfig());
-            $this->fail('followed a pointer below the old mark');
-        } catch (ArtifactRefused $e) {
-            $this->assertStringContainsString('sequence 999 is below 1000', $e->reason);
-        }
-
-        $this->publish(['sequence' => 1000]);
-        $this->assertSame(self::SHA, app(ReleaseSource::class)->latest(DeployRef::fromConfig())->sha);
-        $this->assertSame('1000:'.self::MANIFEST, app(SettingsRepository::class)->get('artifact_sequence:branch:production'));
-    }
-
-    public function test_an_implausible_mark_is_ignored_audited_once_and_replaced(): void
+    /**
+     * A value written to the shared store or the node's database by hand
+     * — far ahead, or just under the one-day ceiling, which would freeze the
+     * fleet for a day — counts for nothing: only a pointer the key signed
+     * can raise the mark.
+     */
+    public function test_a_mark_nobody_signed_counts_for_nothing_and_is_audited_once(): void
     {
         config()->set('slipstream.audit.enabled', true);
         Log::spy();
-        $huge = time() + 30 * 86400;
-        app(SettingsRepository::class)->set('artifact_sequence:branch:production', (string) $huge);
-        \Slipstream\Fleet\SharedStore::cache()->put('slipstream:artifact-seq:'.sha1('branch:production|'.\Slipstream\Fleet\SharedStore::scope()), '99999999999999999999999', 3600);
+        app(SettingsRepository::class)->set('artifact_sequence:branch:production', (string) (time() + 86399));
+        \Slipstream\Fleet\SharedStore::cache()->put($this->sharedKey(), (string) (time() + 30 * 86400), 3600);
         $this->publish(['sequence' => 1000]);
 
-        // One write to the store or the database must not stop every node deploying.
         $this->assertSame(self::SHA, app(ReleaseSource::class)->latest(DeployRef::fromConfig())->sha);
         $this->assertSame(self::SHA, app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), fresh: true)->sha);
 
-        Log::shouldHaveReceived('info')->with('slipstream.artifact.mark_ignored', \Mockery::on(fn (array $c) => $c['where'] === 'local' && $c['sequence'] === $huge))->once();
+        Log::shouldHaveReceived('info')->with('slipstream.artifact.mark_ignored', \Mockery::on(fn (array $c) => $c['where'] === 'local' && str_contains($c['reason'], 'bare number')))->once();
         Log::shouldHaveReceived('info')->with('slipstream.artifact.mark_ignored', \Mockery::on(fn (array $c) => $c['where'] === 'shared'))->once();
-        $this->assertSame(['sequence' => 1000, 'manifest' => self::MANIFEST], app(ArtifactSequence::class)->highWater(DeployRef::fromConfig()), 'both marks were replaced by the accepted pointer');
+        $this->assertSame(['sequence' => 1000, 'manifest' => self::MANIFEST], $this->mark(), 'both marks now hold the accepted pointer');
+    }
+
+    public function test_a_signed_pointer_counts_as_a_mark_only_for_this_ref_and_environment(): void
+    {
+        $other = Envelope::encode([
+            'ref' => 'refs/heads/staging', 'sha' => self::SHA, 'manifest_sha256' => self::MANIFEST, 'sequence' => time() + 86000,
+            'published_at' => now()->toIso8601String(), 'previous' => null, 'by' => 'ci', 'environment' => 'production', 'slipstream' => 'v0.6.2',
+        ], Envelope::DOMAIN_POINTER, $this->signer);
+        \Slipstream\Fleet\SharedStore::cache()->put($this->sharedKey(), $other, 3600);
+        $forged = Envelope::encode([
+            'ref' => 'refs/heads/production', 'sha' => self::SHA, 'manifest_sha256' => self::MANIFEST, 'sequence' => time() + 86000,
+            'published_at' => now()->toIso8601String(), 'previous' => null, 'by' => 'ci', 'environment' => 'production', 'slipstream' => 'v0.6.2',
+        ], Envelope::DOMAIN_POINTER, SodiumSigner::fromSpec('sodium:'.SodiumSigner::generate()['secret'], 'prod-2026'));
+        app(SettingsRepository::class)->set('artifact_sequence:branch:production', $forged);
+
+        $this->publish(['sequence' => 1000]);
+
+        $this->assertSame(self::SHA, app(ReleaseSource::class)->latest(DeployRef::fromConfig())->sha, 'neither another ref\'s pointer nor one signed by another key raises the mark');
+    }
+
+    public function test_the_shared_mark_is_written_under_the_stores_lock_and_without_it_when_the_lock_is_held(): void
+    {
+        $this->publish(['sequence' => 1000]);
+        $sequence = app(ArtifactSequence::class);
+        $sequence->lockWait = 1;
+        $pointer = app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), accept: false);
+        $envelope = (string) Storage::disk('artifacts')->get('app/refs/heads/production.json');
+        $keys = app(ArtifactSource::class)->keys();
+
+        $sequence->advance(DeployRef::fromConfig(), $pointer, $envelope, $keys, 'production');
+        $held = \Slipstream\Fleet\SharedStore::cache()->lock($this->sharedKey().':lock', 10);
+        $this->assertTrue($held->get(), 'advance released the lock it took');
+        $this->assertSame(1000, $this->mark()['sequence']);
+
+        // The lock now held by someone else ($held): after the wait it writes
+        // anyway, which can at worst lower the mark, never freeze it.
+        \Slipstream\Fleet\SharedStore::cache()->forget($this->sharedKey());
+        app(SettingsRepository::class)->forget('artifact_sequence:branch:production');
+        $sequence->advance(DeployRef::fromConfig(), $pointer, $envelope, $keys, 'production');
+        $this->assertSame(1000, $this->mark()['sequence']);
+    }
+
+    public function test_a_refused_deploy_by_commit_does_not_back_off_the_build_the_pointer_names(): void
+    {
+        $this->app->instance(ProcessDetacher::class, new FakeProcessDetacher);
+        // `slipstream:deploy --sha=` refused before anything said which build.
+        Deployment::query()->create([
+            'server_name' => 'test-node', 'sha' => self::SHA, 'branch' => 'production', 'trigger' => Deployment::TRIGGER_MANUAL,
+            'status' => Deployment::STATUS_FAILED, 'finished_at' => now(), 'failure_reason' => 'Refusing artifact (statement): signature does not verify',
+        ]);
+        $this->publish();
+
+        $this->assertSame(Poller::DEPLOYING, app(Poller::class)->tick(force: true)['result']);
     }
 
     public function test_an_equal_sequence_naming_another_release_is_refused(): void
@@ -314,6 +358,19 @@ class ArtifactSourceTest extends TestCase
 
         $this->publish(['manifest_sha256' => str_repeat('2', 64), 'sequence' => 1001]);
         $this->assertSame(Poller::DEPLOYING, app(Poller::class)->tick(force: true)['result']);
+    }
+
+    /**
+     * @return array{sequence: int, manifest: ?string}
+     */
+    protected function mark(): array
+    {
+        return app(ArtifactSequence::class)->highWater(DeployRef::fromConfig(), app(ArtifactSource::class)->keys(), 'production');
+    }
+
+    protected function sharedKey(): string
+    {
+        return 'slipstream:artifact-seq:'.sha1('branch:production|'.\Slipstream\Fleet\SharedStore::scope());
     }
 
     /**

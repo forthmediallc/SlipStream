@@ -221,6 +221,23 @@ class ReleaseStubTest extends TestCase
         $this->assertStringContainsString('no signed manifest', $process->getOutput());
     }
 
+    public function test_verify_tree_counts_a_missing_cache_record_and_a_planted_hot_file_as_drift(): void
+    {
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/four');
+        $tree = fn () => $this->tool('verify-tree', ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production']);
+
+        unlink($release.'/.slipstream/generated.json');
+        $process = $tree();
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('generated.json is missing', $process->getOutput());
+
+        file_put_contents($release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($release)));
+        file_put_contents($release.'/public/hot', 'https://attacker.example');
+        $process = $tree();
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('public/hot', $process->getOutput());
+    }
+
     public function test_verify_tree_pins_the_recorded_cache_hashes_in_a_state_directory(): void
     {
         $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/two');
@@ -258,7 +275,22 @@ class ReleaseStubTest extends TestCase
         $this->assertSame(1, $process->getExitCode());
         $this->assertStringContainsString('symlinks (1): public/uploads', $process->getOutput());
 
-        $this->assertSame(0, $this->tool('verify-tree', $arguments + ['--shared' => 'public/uploads'])->getExitCode());
+        $arguments += ['--shared' => 'public/uploads'];
+        $this->assertSame(0, $this->tool('verify-tree', $arguments)->getExitCode());
+
+        // public/storage: a link into the release's (shared) storage, as
+        // storage:link makes it, and nothing else.
+        mkdir($this->fixture->appRoot.'/storage/app/public', 0777, true);
+        $this->removeTree($release.'/storage');
+        symlink($this->fixture->appRoot.'/storage', $release.'/storage');
+        symlink($release.'/storage/app/public', $release.'/public/storage');
+        $this->assertSame(0, $this->tool('verify-tree', $arguments)->getExitCode());
+
+        unlink($release.'/public/storage');
+        symlink($this->fixture->appRoot.'/shared', $release.'/public/storage');
+        $process = $this->tool('verify-tree', $arguments);
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('symlinks (1): public/storage', $process->getOutput());
     }
 
     public function test_publish_writes_s3_objects_write_once_and_the_pointer_conditionally(): void

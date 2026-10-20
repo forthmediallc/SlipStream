@@ -251,6 +251,8 @@ class ArtifactFixture
         file_put_contents($dir.'/.slipstream/'.ArtifactStore::MANIFEST, $this->stored(ArtifactStore::MANIFEST));
         file_put_contents($dir.'/.slipstream/'.ArtifactStore::SIGNATURE, $this->stored(ArtifactStore::SIGNATURE));
         file_put_contents($dir.'/RELEASE_SHA', $this->sha."\n");
+        // What the deploy records just before the swap.
+        file_put_contents($dir.'/.slipstream/'.\Slipstream\Release\Core\Baseline::FILE, \Slipstream\Release\Core\Baseline::toJson(\Slipstream\Release\Core\Baseline::record($dir)));
 
         return $dir;
     }

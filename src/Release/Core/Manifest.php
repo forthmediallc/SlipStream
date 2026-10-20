@@ -14,8 +14,24 @@ final class Manifest
 
     public const MAX_PATH = 4096;
 
-    /** What a node writes into a release itself; publish lists these unless told otherwise. */
-    public const DEFAULT_GENERATED = ['bootstrap/cache', 'public/storage', 'public/hot'];
+    /**
+     * What a node writes into a release itself; publish lists these unless
+     * told otherwise. Not public/hot (only `npm run dev` writes it, and Vite
+     * loads every script from the URL inside), and not public/storage (the
+     * node makes it, but as a link, which STORAGE_LINKS checks instead).
+     */
+    public const DEFAULT_GENERATED = ['bootstrap/cache'];
+
+    /** Paths that may be symlinks, but only into the release's shared storage. */
+    public const STORAGE_LINKS = ['public/storage'];
+
+    /**
+     * Never excused, whatever a manifest's generated list says — releases
+     * signed with 0.6.1's defaults list both: a planted public/hot sends
+     * every page's scripts elsewhere, and a file under public/storage is
+     * served (and, behind a careless nginx, run).
+     */
+    public const NEVER_GENERATED = ['public/hot', 'public/storage'];
 
     /** Files the deploy itself adds to every release. */
     public const NODE_WRITTEN = ['RELEASE_SHA', '.slipstream'];
@@ -185,18 +201,21 @@ final class Manifest
      * Paths under $linked are what the deploy replaces with links to shared
      * copies (storage, the .env, the shared paths): skipped entirely. Every
      * other file the manifest lists is always checked, wherever it is. Paths
-     * under $generated only excuse what the manifest does not list — files
-     * and links the node writes itself (bootstrap/cache, public/storage) —
-     * so no ignore list can hide a change to a file CI signed.
+     * under $generated only excuse regular files the manifest does not list —
+     * the ones the node writes itself (bootstrap/cache) — so no ignore list
+     * can hide a change to a file CI signed. A symlink is drift anywhere else,
+     * unless it is one of $storageLinks and resolves into the release's own
+     * (shared) storage, as `storage:link` makes public/storage.
      *
      * @param  list<string>  $linked  path prefixes
      * @param  list<string>  $generated  path prefixes
+     * @param  list<string>  $storageLinks  exact paths
      * @return array{modified: list<string>, missing: list<string>, unlisted: list<string>, links: list<string>}
      */
-    public function verifyTree(string $root, array $linked = [], array $generated = []): array
+    public function verifyTree(string $root, array $linked = [], array $generated = [], array $storageLinks = []): array
     {
         $isLinked = fn (string $path): bool => self::under($path, $linked);
-        $isGenerated = fn (string $path): bool => self::under($path, $generated);
+        $isGenerated = fn (string $path): bool => self::under($path, $generated) && ! self::under($path, self::NEVER_GENERATED);
 
         $found = [];
         $links = [];
@@ -228,7 +247,16 @@ final class Manifest
         }
         sort($unlisted, SORT_STRING);
 
-        $links = array_values(array_filter($links, fn (string $path) => ! $isGenerated($path)));
+        $storage = realpath($root.'/storage');
+        $links = array_values(array_filter($links, function (string $path) use ($root, $storageLinks, $storage): bool {
+            if ($storage === false || ! in_array($path, array_map(fn ($p) => trim(str_replace('\\', '/', (string) $p), '/'), $storageLinks), true)) {
+                return true;
+            }
+            $target = realpath($root.'/'.$path);
+
+            return $target === false
+                || ($target !== $storage && ! str_starts_with($target, rtrim($storage, '/\\').DIRECTORY_SEPARATOR));
+        }));
 
         return ['modified' => $modified, 'missing' => $missing, 'unlisted' => $unlisted, 'links' => $links];
     }

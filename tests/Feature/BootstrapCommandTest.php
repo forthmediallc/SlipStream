@@ -304,6 +304,31 @@ class BootstrapCommandTest extends TestCase
         $this->assertSame(['sequence' => 1000, 'manifest_sha256' => str_repeat('9', 64)], Deployment::query()->where('sha', self::GOOD)->sole()->meta['pointer']);
     }
 
+    /**
+     * The pointer moves on while bootstrap deploys its head: the deploy ends
+     * superseded, and bootstrap follows the pointer to the new head instead
+     * of falling back to a previous that is stale too.
+     */
+    public function test_in_artifact_mode_a_superseded_head_follows_the_pointer_to_its_new_head(): void
+    {
+        $signer = $this->artifactPointer();
+        $newer = '3333333333333333333333333333333333333333';
+        $this->runner->superseded = [self::TAGGED];
+        $this->runner->during = function (Deployment $deployment) use ($signer, $newer) {
+            if ($deployment->sha === self::TAGGED) {
+                $this->writePointer($signer, $newer, str_repeat('7', 64), 1001, ['sha' => self::TAGGED, 'manifest_sha256' => str_repeat('8', 64)]);
+            }
+        };
+
+        $this->artisan('slipstream:bootstrap')
+            ->expectsOutputToContain('The pointer moved to 3333333 while bootstrap deployed; deploying that instead.')
+            ->assertExitCode(0);
+
+        $this->assertSame($newer, $this->running());
+        $this->assertSame(['sequence' => 1001, 'manifest_sha256' => str_repeat('7', 64)], Deployment::query()->where('sha', $newer)->sole()->meta['pointer']);
+        $this->assertSame(0, Deployment::query()->where('sha', self::GOOD)->count(), 'no fallback to the stale previous');
+    }
+
     public function test_in_artifact_mode_no_fallback_stops_at_the_head(): void
     {
         $this->artifactPointer();
@@ -345,7 +370,7 @@ class BootstrapCommandTest extends TestCase
      * Artifact mode against a pointer on a local disk: the head is TAGGED,
      * its previous GOOD.
      */
-    protected function artifactPointer(): void
+    protected function artifactPointer(): \Slipstream\Release\Core\SodiumSigner
     {
         rmdir($this->root.DIRECTORY_SEPARATOR.'repo.git');
         config()->set('slipstream.release.source', 'artifact');
@@ -359,13 +384,22 @@ class BootstrapCommandTest extends TestCase
         $signer = \Slipstream\Release\Core\SodiumSigner::fromSpec('sodium:'.$pair['secret'], 'k');
         config()->set('slipstream.artifacts.public_keys', 'k:'.$pair['public']);
 
-        \Illuminate\Support\Facades\Storage::disk('artifacts')->put('refs/heads/production.json', \Slipstream\Release\Core\Envelope::encode([
-            'ref' => 'refs/heads/production', 'sha' => self::TAGGED, 'manifest_sha256' => str_repeat('8', 64), 'sequence' => 1000,
-            'published_at' => '2026-10-20T00:00:00Z', 'previous' => ['sha' => self::GOOD, 'manifest_sha256' => str_repeat('9', 64)],
-            'by' => 'ci', 'environment' => 'production', 'slipstream' => 'v0.6.1',
-        ], \Slipstream\Release\Core\Envelope::DOMAIN_POINTER, $signer));
-
+        $this->writePointer($signer, self::TAGGED, str_repeat('8', 64), 1000, ['sha' => self::GOOD, 'manifest_sha256' => str_repeat('9', 64)]);
         $this->app->instance(ReleaseSource::class, app(\Slipstream\Release\ArtifactSource::class));
+
+        return $signer;
+    }
+
+    /**
+     * @param  array{sha: string, manifest_sha256: string}|null  $previous
+     */
+    protected function writePointer(\Slipstream\Release\Core\SodiumSigner $signer, string $sha, string $manifest, int $sequence, ?array $previous): void
+    {
+        \Illuminate\Support\Facades\Storage::disk('artifacts')->put('refs/heads/production.json', \Slipstream\Release\Core\Envelope::encode([
+            'ref' => 'refs/heads/production', 'sha' => $sha, 'manifest_sha256' => $manifest, 'sequence' => $sequence,
+            'published_at' => '2026-10-20T00:00:00Z', 'previous' => $previous,
+            'by' => 'ci', 'environment' => 'production', 'slipstream' => 'v0.6.2',
+        ], \Slipstream\Release\Core\Envelope::DOMAIN_POINTER, $signer));
     }
 
     protected function running(): ?string

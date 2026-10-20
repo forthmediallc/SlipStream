@@ -46,6 +46,37 @@ class StatusCommandTest extends TestCase
         }
     }
 
+    /**
+     * The back-off status shows is the poller's: in artifact mode it belongs
+     * to the build the pointer names, not to another build of that commit.
+     */
+    public function test_artifact_mode_shows_the_back_off_of_the_build_the_pointer_names(): void
+    {
+        $fixture = (new ArtifactFixture)->configure()->writeCheckout()->package();
+        $fixture->publish('ci');
+        Server::query()->where('server_name', 'test-node')->update(['poll_seen_sha' => $fixture->sha]);
+
+        try {
+            Deployment::query()->create([
+                'server_name' => 'test-node', 'trigger' => Deployment::TRIGGER_POLL, 'status' => Deployment::STATUS_FAILED, 'sha' => $fixture->sha,
+                'branch' => 'production', 'finished_at' => now(), 'meta' => ['pointer' => ['sequence' => 1, 'manifest_sha256' => str_repeat('0', 64)]],
+            ]);
+            $this->artisan('slipstream:status --json')
+                ->expectsOutputToContain('"backoff": null')
+                ->assertExitCode(0);
+
+            Deployment::query()->create([
+                'server_name' => 'test-node', 'trigger' => Deployment::TRIGGER_POLL, 'status' => Deployment::STATUS_FAILED, 'sha' => $fixture->sha,
+                'branch' => 'production', 'finished_at' => now(), 'meta' => ['pointer' => ['sequence' => $fixture->pointer->sequence, 'manifest_sha256' => $fixture->pointer->manifestSha256]],
+            ]);
+            $this->artisan('slipstream:status --json')
+                ->expectsOutputToContain('"failures": 1')
+                ->assertExitCode(0);
+        } finally {
+            $fixture->remove();
+        }
+    }
+
     public function test_the_overview_reads_like_the_front_page(): void
     {
         // One substring per output line, in output order (see the memory note

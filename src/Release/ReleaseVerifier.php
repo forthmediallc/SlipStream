@@ -2,6 +2,7 @@
 
 namespace Slipstream\Release;
 
+use Slipstream\Models\Deployment;
 use Slipstream\Release\Core\ArtifactRefused;
 use Slipstream\Release\Core\Baseline;
 use Slipstream\Release\Core\Envelope;
@@ -98,19 +99,31 @@ class ReleaseVerifier
         $result['linked'] = $linked;
         $result['ignored'] = $ignored;
 
-        $tree = $manifest->verifyTree($release, $linked, $ignored);
+        $tree = $manifest->verifyTree($release, $linked, $ignored, $this->storageLinks());
         $result['modified'] = $tree['modified'];
         $result['missing'] = $tree['missing'];
         $result['unlisted'] = $tree['unlisted'];
         $result['links'] = $tree['links'];
 
         // The caches the node generated, against the hashes the deploy
-        // recorded just before the swap.
+        // recorded just before the swap. The record sits in the release, as
+        // writable as the caches; the deployment row keeps its hash, so a
+        // record deleted or rewritten after the deploy shows up too.
         $baselineFile = $sidecar.DIRECTORY_SEPARATOR.Baseline::FILE;
+        $recordedHash = $this->recordedBaselineHash($release, $manifest->sha);
         if (is_file($baselineFile)) {
-            $baseline = Baseline::fromJson((string) file_get_contents($baselineFile));
+            $contents = (string) file_get_contents($baselineFile);
+            $baseline = Baseline::fromJson($contents);
             $result['baseline'] = true;
-            $result['generated'] = $baseline === null ? [Baseline::DIRECTORY.' (the recorded hashes are unreadable)'] : Baseline::compare($release, $baseline);
+            if ($recordedHash !== null && hash('sha256', $contents) !== $recordedHash) {
+                $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes were rewritten after the deploy)';
+            }
+            $result['generated'] = array_values(array_unique(array_merge(
+                $result['generated'],
+                $baseline === null ? [Baseline::DIRECTORY.' (the recorded hashes are unreadable)'] : Baseline::compare($release, $baseline),
+            )));
+        } elseif ($recordedHash !== null) {
+            $result['generated'][] = Baseline::DIRECTORY.' (the hashes recorded at deploy are gone)';
         }
 
         $result['ok'] = $result['signed']
@@ -146,6 +159,60 @@ class ReleaseVerifier
         }
 
         return $drift === [] ? null : 'files differ from the manifest: '.implode('; ', $drift);
+    }
+
+    /**
+     * The hash of the baseline the deploy that put this release in place
+     * recorded, from its deployment row; null when no row says.
+     */
+    protected function recordedBaselineHash(string $release, string $sha): ?string
+    {
+        try {
+            $rows = Deployment::query()
+                ->where('server_name', Slipstream::serverName())
+                ->where('status', Deployment::STATUS_DEPLOYED)
+                ->whereRaw('lower(sha) = ?', [strtolower($sha)])
+                ->orderByDesc('id')
+                ->limit(20)
+                ->get(['id', 'release_path', 'meta']);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        foreach ($rows as $row) {
+            if (basename(str_replace('\\', '/', (string) $row->release_path)) === basename(str_replace('\\', '/', $release))) {
+                $hash = $row->meta['artifact']['baseline_sha256'] ?? null;
+
+                return is_string($hash) ? $hash : null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * The paths `storage:link` makes, which may be links into the shared
+     * storage: public/storage and whatever filesystems.links adds.
+     *
+     * @return list<string>
+     */
+    protected function storageLinks(): array
+    {
+        $links = Manifest::STORAGE_LINKS;
+
+        try {
+            $base = rtrim(str_replace('\\', '/', base_path()), '/').'/';
+            foreach (array_keys((array) config('filesystems.links', [])) as $link) {
+                $link = str_replace('\\', '/', (string) $link);
+                if (str_starts_with($link, $base)) {
+                    $links[] = substr($link, strlen($base));
+                }
+            }
+        } catch (\Throwable) {
+            // No app to ask: the default only.
+        }
+
+        return array_values(array_unique($links));
     }
 
     /**

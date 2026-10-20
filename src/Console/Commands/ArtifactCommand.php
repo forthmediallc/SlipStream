@@ -33,7 +33,7 @@ class ArtifactCommand extends Command
                             {--generated= : publish, sign: paths a node writes itself, comma-separated (default bootstrap/cache,public/storage,public/hot)}
                             {--allow= : publish, sign: paths outside vendor/ allowed to carry key material, comma-separated}
                             {--keys= : publish, sign: the nodes\' public keys, to check they will accept what is signed (default: SLIPSTREAM_RELEASE_PUBLIC_KEYS)}
-                            {--ref= : The ref CI publishes to, e.g. refs/heads/production (package: default GITHUB_REF or the checked-out branch; publish: the build\'s)}
+                            {--ref= : The ref CI publishes to, e.g. refs/heads/production (package: default GITHUB_REF or the checked-out branch; publish and sign: required, default GITHUB_REF, and the build must agree)}
                             {--environment= : The environment the release is signed for (default: SLIPSTREAM_RELEASE_ENVIRONMENT)}
                             {--no-install : package: skip composer install (already done)}
                             {--key= : Signing key: sodium:<base64 secret> | file:<path> | kms:<key id, ARN or alias> (default: SLIPSTREAM_SIGNING_KEY)}
@@ -108,7 +108,7 @@ class ArtifactCommand extends Command
             return self::SUCCESS;
         }
 
-        $prepared = app(Publisher::class)->prepare((string) $this->argument('dir'), $this->publishSha(), $signer, $this->environment(), fn (string $line) => $this->line('  '.$line), $this->publishOptions());
+        $prepared = app(Publisher::class)->prepare((string) $this->argument('dir'), $this->publishSha(), $this->publishRef()->full(), $signer, $this->environment(), fn (string $line) => $this->line('  '.$line), $this->publishOptions());
 
         $this->components->twoColumnDetail('Commit', $prepared['manifest']->sha);
         $this->components->twoColumnDetail('Key', $signer->keyId());
@@ -133,11 +133,7 @@ class ArtifactCommand extends Command
             }
             $pointer = $publisher->rollback($sha, DeployRef::parse($refOption), $signer, $by, $environment, $say, $this->publishOptions());
         } else {
-            $dir = (string) $this->argument('dir');
-            $ref = $this->option('ref')
-                ? DeployRef::parse((string) $this->option('ref'))
-                : DeployRef::parse(\Slipstream\Release\Core\Manifest::fromJson((string) @file_get_contents(rtrim($dir, '/\\').DIRECTORY_SEPARATOR.ArtifactStore::MANIFEST))->ref);
-            $pointer = $publisher->publish($dir, $ref, $this->publishSha(), $signer, $by, $environment, $say, $this->publishOptions());
+            $pointer = $publisher->publish((string) $this->argument('dir'), $this->publishRef(), $this->publishSha(), $signer, $by, $environment, $say, $this->publishOptions());
         }
 
         $this->components->twoColumnDetail('Ref', $pointer->ref);
@@ -219,6 +215,20 @@ class ArtifactCommand extends Command
         }
 
         return $sha;
+    }
+
+    /**
+     * The ref being published, from the publish job — never the build's
+     * word. GitHub Actions sets GITHUB_REF.
+     */
+    protected function publishRef(): DeployRef
+    {
+        $ref = trim((string) ($this->option('ref') ?: getenv('GITHUB_REF') ?: ''));
+        if ($ref === '') {
+            throw new \RuntimeException('Name the ref being published: --ref=refs/heads/production (GitHub Actions sets GITHUB_REF). The build job does not get to say which ref it is for.');
+        }
+
+        return DeployRef::parse($ref);
     }
 
     /**

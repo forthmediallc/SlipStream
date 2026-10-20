@@ -61,7 +61,7 @@ class ArtifactPackageTest extends TestCase
         $this->assertSame(hash_file('sha256', $this->fixture->dist.'/release.tar.gz'), $manifest->archiveSha256);
         $this->assertSame(filesize($this->fixture->dist.'/release.tar.gz'), $manifest->archiveSize);
         $this->assertSame(['production', 'refs/heads/production', PHP_VERSION, 'v0.6.0-test'], [$manifest->environment, $manifest->ref, $manifest->php, $manifest->slipstream]);
-        $this->assertSame(['bootstrap/cache', 'public/storage', 'public/hot'], $manifest->generated);
+        $this->assertSame(['bootstrap/cache'], $manifest->generated);
 
         // The archive holds exactly the manifest's files.
         $out = $this->fixture->root.'/unpacked';
@@ -138,6 +138,32 @@ class ArtifactPackageTest extends TestCase
         $leftOut = implode("\n", array_filter($said, fn (string $line) => str_starts_with($line, 'Left out by name')));
         $this->assertStringContainsString('app/Sub/.env', $leftOut);
         $this->assertStringContainsString('packages/ui/node_modules', $leftOut);
+    }
+
+    public function test_what_the_node_writes_itself_is_refused_in_a_checkout(): void
+    {
+        foreach (['RELEASE_SHA' => 'aaaa', '.slipstream/manifest.json' => '{}'] as $path => $contents) {
+            $this->fixture->writeCheckout([$path => $contents]);
+
+            try {
+                $this->fixture->package();
+                $this->fail("packaged {$path}");
+            } catch (RuntimeException $e) {
+                $this->assertStringContainsString("{$path} is written by the node itself", $e->getMessage());
+            }
+
+            @unlink($this->fixture->checkout.'/'.$path);
+        }
+    }
+
+    public function test_never_ship_names_match_whatever_their_case(): void
+    {
+        $this->fixture->writeCheckout(['config/.ENV' => 'APP_KEY=x', 'AUTH.JSON' => '{}', '.NPMRC' => 'token', '.netrc' => 'machine x', '.aws/credentials' => '[default]'])->package();
+
+        $paths = array_keys(Manifest::fromJson((string) file_get_contents($this->fixture->dist.'/manifest.json'))->files);
+        foreach (['config/.ENV', 'AUTH.JSON', '.NPMRC', '.netrc', '.aws/credentials'] as $dropped) {
+            $this->assertNotContains($dropped, $paths);
+        }
     }
 
     public function test_a_private_key_is_refused_by_content_and_a_public_certificate_ships(): void

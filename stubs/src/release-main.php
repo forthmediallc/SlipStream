@@ -32,10 +32,12 @@ slipstream-release.php — artifact releases without the framework
                   Verifies, unpacks, writes RELEASE_SHA and .slipstream/. Prints files=N.
                   On a refusal, removes what it unpacked.
 
-  verify-tree     --release=<dir> --keys=… --environment=… [--shared=a,b] [--state-dir=<dir>] [--json]
+  verify-tree     --release=<dir> --keys=… --environment=… [--shared=a,b] [--links=public/storage,…]
+                  [--state-dir=<dir>] [--json]
                   The live release against its signed manifest and the cache hashes recorded at
                   deploy, from outside it: run it as root from a copy the deploy user cannot
-                  write, with keys from a root-owned file. Exit 0 clean, 1 drift.
+                  write, with keys from a root-owned file. --links names the paths that may be
+                  links into the release's storage (default public/storage). Exit 0 clean, 1 drift.
 
   publish         --archive=<file> --manifest=<build manifest> --ref=… --environment=…
                   --sha=<40 hex> (default GITHUB_SHA) --keys=<the nodes' keys>
@@ -403,9 +405,10 @@ function slipstream_release_point(array $options, string $sha, string $manifestS
  * is seen, so rewriting the copies inside the tree is caught too.
  *
  * @param  list<string>  $shared
+ * @param  list<string>  $storageLinks
  * @return array<string, mixed>
  */
-function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir): array
+function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir, array $storageLinks = Manifest::STORAGE_LINKS): array
 {
     $result = [
         'release' => $release, 'sha' => null, 'ok' => false, 'reason' => null, 'files' => 0,
@@ -442,13 +445,17 @@ function slipstream_release_verify_tree(string $release, Keys $keys, string $env
         default => null,
     };
 
-    $tree = $manifest->verifyTree($release, array_merge(Manifest::NODE_LINKED, $shared), array_merge(Manifest::NODE_WRITTEN, $manifest->generated));
+    $tree = $manifest->verifyTree($release, array_merge(Manifest::NODE_LINKED, $shared), array_merge(Manifest::NODE_WRITTEN, $manifest->generated), $storageLinks);
     foreach (['modified', 'missing', 'unlisted', 'links'] as $kind) {
         $result[$kind] = $tree[$kind];
     }
 
+    // Every deploy since 0.6.1 records the caches' hashes before the swap,
+    // so a release without the record has lost it.
     $recorded = is_file($sidecar.'/'.Baseline::FILE) ? Baseline::fromJson((string) file_get_contents($sidecar.'/'.Baseline::FILE)) : null;
-    if (is_file($sidecar.'/'.Baseline::FILE) && $recorded === null) {
+    if (! is_file($sidecar.'/'.Baseline::FILE)) {
+        $result['generated'][] = Baseline::DIRECTORY.' (no hashes recorded: .slipstream/'.Baseline::FILE.' is missing; a release deployed by 0.6.1 or later always has one)';
+    } elseif ($recorded === null) {
         $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes are unreadable)';
     }
     $baseline = $recorded;
@@ -616,6 +623,7 @@ try {
                 slipstream_release_need($options, 'environment'),
                 slipstream_release_list($options, 'shared', []),
                 slipstream_release_option($options, 'state-dir'),
+                slipstream_release_list($options, 'links', Manifest::STORAGE_LINKS),
             );
 
             if (isset($options['json'])) {
@@ -670,7 +678,7 @@ try {
             ], [
                 'max_unpacked_bytes' => (int) (slipstream_release_option($options, 'max-unpacked-bytes') ?? 4294967296),
                 'max_entries' => (int) (slipstream_release_option($options, 'max-entries') ?? 250000),
-            ], ReleaseBuilder::inspector(slipstream_release_list($options, 'allow', [])));
+            ], ReleaseBuilder::inspector(slipstream_release_list($options, 'allow', []), fn (string $line) => slipstream_release_say($line)));
             $json = $manifest->toJson();
             $statement = Envelope::encode(ReleaseBuilder::statementFor($manifest, $json, $environment)->toPayload(), Envelope::DOMAIN_MANIFEST, $signer);
             ReleaseBuilder::selfCheck($json, $statement, null, $nodeKeys);

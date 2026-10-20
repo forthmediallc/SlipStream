@@ -40,7 +40,7 @@ class Publisher
     {
         $this->store->pointerKey($ref); // a tag pattern has no pointer to write
 
-        ['manifest' => $manifest, 'json' => $json] = $this->prepare($dist, $sha, $signer, $environment, $say, $options);
+        ['manifest' => $manifest, 'json' => $json] = $this->prepare($dist, $sha, $ref->full(), $signer, $environment, $say, $options);
 
         if ($manifest->ref !== $ref->full()) {
             throw new RuntimeException("The build is for {$manifest->ref}; the pointer is {$ref->full()}. Package it for the ref it is published to.");
@@ -59,7 +59,7 @@ class Publisher
      * @param  array{generated?: list<string>, allow?: list<string>, keys?: Keys}  $options
      * @return array{manifest: Manifest, json: string}
      */
-    public function prepare(string $dist, string $sha, Signer $signer, string $environment, Closure $say, array $options = []): array
+    public function prepare(string $dist, string $sha, string $ref, Signer $signer, string $environment, Closure $say, array $options = []): array
     {
         $dist = rtrim($dist, '/\\');
         $archive = $dist.DIRECTORY_SEPARATOR.ArtifactStore::ARCHIVE;
@@ -76,6 +76,9 @@ class Publisher
         if ($built->sha !== $sha) {
             throw new RuntimeException("The build says it is {$built->sha}; this publish is for {$sha}. A build does not get to name its own commit.");
         }
+        if ($built->ref !== $ref) {
+            throw new RuntimeException("The build says it is for {$built->ref}; this publish is for {$ref}. A build does not get to name its own ref.");
+        }
 
         $generated = array_values($options['generated'] ?? Manifest::DEFAULT_GENERATED);
         foreach ($generated as $path) {
@@ -90,14 +93,14 @@ class Publisher
             'slipstream' => $built->slipstream,
             'environment' => $environment,
             'sha' => $sha,
-            'ref' => $built->ref,
+            'ref' => $ref,
             'built_at' => $built->builtAt,
             'php' => $built->php,
             'generated' => $generated,
         ], [
             'max_unpacked_bytes' => (int) config('slipstream.artifacts.max_unpacked_bytes', 4294967296),
             'max_entries' => (int) config('slipstream.artifacts.max_entries', 250000),
-        ], ReleaseBuilder::inspector(array_values($options['allow'] ?? [])));
+        ], ReleaseBuilder::inspector(array_values($options['allow'] ?? []), $say));
         if ($manifest->files !== $built->files) {
             $say('The build job\'s manifest did not match the archive; the archive wins.');
         }

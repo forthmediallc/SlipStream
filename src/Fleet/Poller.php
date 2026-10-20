@@ -136,9 +136,11 @@ class Poller
             $failures = $failures->filter(function (Deployment $failed) use ($manifestSha256) {
                 // A deploy refused during the fetch never got meta.artifact;
                 // the pointer it was started from says which build it was.
+                // One that says neither (a refused `--sha` deploy) is not
+                // evidence against the build the pointer names.
                 $failedManifest = $failed->meta['artifact']['manifest_sha256'] ?? $failed->meta['pointer']['manifest_sha256'] ?? null;
 
-                return $failedManifest === null || $failedManifest === $manifestSha256;
+                return $failedManifest === $manifestSha256;
             })->values();
         }
 

@@ -17,11 +17,31 @@ class FakeDeploymentRunner extends DeploymentRunner
     /** @var list<int> */
     public array $ran = [];
 
+    /**
+     * Commits whose deploy ends superseded (the pointer moved on meanwhile).
+     *
+     * @var list<string>
+     */
+    public array $superseded = [];
+
+    /** @var (\Closure(Deployment): void)|null runs while a deploy "runs" */
+    public ?\Closure $during = null;
+
     public function __construct(protected string $appRoot) {}
 
     public function run(Deployment $deployment): Deployment
     {
         $this->ran[] = $deployment->id;
+
+        if ($this->during !== null) {
+            ($this->during)($deployment);
+        }
+
+        if (in_array(strtolower((string) $deployment->sha), $this->superseded, true)) {
+            $deployment->update(['status' => Deployment::STATUS_SUPERSEDED, 'failure_reason' => 'Superseded (fake)', 'finished_at' => now()]);
+
+            return $deployment->refresh();
+        }
 
         if (in_array(strtolower((string) $deployment->sha), $this->failing, true)) {
             $deployment->update([

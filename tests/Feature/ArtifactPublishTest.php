@@ -99,7 +99,7 @@ class ArtifactPublishTest extends TestCase
             $publisher->publish($this->fixture->dist, DeployRef::parse('refs/heads/staging'), $this->fixture->sha, $this->fixture->signer, 'ci', 'production', fn () => null);
             $this->fail('published a production build to staging');
         } catch (RuntimeException $e) {
-            $this->assertStringContainsString('The build is for refs/heads/production; the pointer is refs/heads/staging', $e->getMessage());
+            $this->assertStringContainsString('The build says it is for refs/heads/production; this publish is for refs/heads/staging', $e->getMessage());
         }
 
         try {
@@ -131,11 +131,20 @@ class ArtifactPublishTest extends TestCase
             ->expectsOutputToContain('SLIPSTREAM_RELEASE_PUBLIC_KEYS=cli-key:'.base64_encode($signer->publicKey()))
             ->assertExitCode(0);
 
-        $this->artisan('slipstream:artifact', ['action' => 'publish', 'dir' => $this->fixture->dist, '--key' => $secret, '--key-id' => 'cli-key', '--by' => 'ci'])
+        // The ref and the commit come from the publish job, never the build.
+        $this->artisan('slipstream:artifact', ['action' => 'publish', 'dir' => $this->fixture->dist, '--sha' => $this->fixture->sha, '--key' => $secret, '--key-id' => 'cli-key', '--by' => 'ci'])
+            ->expectsOutputToContain('Name the ref being published')
+            ->assertExitCode(1);
+
+        $this->artisan('slipstream:artifact', ['action' => 'publish', 'dir' => $this->fixture->dist, '--ref' => 'refs/heads/production', '--key' => $secret, '--key-id' => 'cli-key', '--by' => 'ci'])
             ->expectsOutputToContain('Name the commit being published')
             ->assertExitCode(1);
 
-        $this->artisan('slipstream:artifact', ['action' => 'publish', 'dir' => $this->fixture->dist, '--sha' => $this->fixture->sha, '--key' => $secret, '--key-id' => 'cli-key', '--by' => 'ci'])
+        $this->artisan('slipstream:artifact', ['action' => 'sign', 'dir' => $this->fixture->dist, '--ref' => 'refs/heads/staging', '--sha' => $this->fixture->sha, '--key' => $secret, '--key-id' => 'cli-key'])
+            ->expectsOutputToContain('A build does not get to name its own ref')
+            ->assertExitCode(1);
+
+        $this->artisan('slipstream:artifact', ['action' => 'publish', 'dir' => $this->fixture->dist, '--ref' => 'refs/heads/production', '--sha' => $this->fixture->sha, '--key' => $secret, '--key-id' => 'cli-key', '--by' => 'ci'])
             ->expectsOutputToContain('Published: refs/heads/production → aaaaaaa.')
             ->assertExitCode(0);
 
@@ -168,7 +177,7 @@ class ArtifactPublishTest extends TestCase
         file_put_contents($this->fixture->dist.'/manifest.json', json_encode($built));
 
         $this->fixture->publish();
-        $this->assertSame(['bootstrap/cache', 'public/storage', 'public/hot'], json_decode($this->fixture->stored('manifest.json'), true)['generated']);
+        $this->assertSame(['bootstrap/cache'], json_decode($this->fixture->stored('manifest.json'), true)['generated']);
 
         $this->fixture->writeCheckout()->package(str_repeat('b', 40));
         (new Publisher(new ArtifactStore))->publish($this->fixture->dist, DeployRef::parse('refs/heads/production'), str_repeat('b', 40), $this->fixture->signer, 'ci', 'production', fn () => null, ['generated' => ['public/build']]);
@@ -206,6 +215,12 @@ class ArtifactPublishTest extends TestCase
             [['app/Hello.php' => '<?php', 'app/.env' => 'APP_KEY=base64:secret'], 'app/.env must never ship'],
             [['app/Hello.php' => '<?php', 'config/jwt.key' => "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n"], 'config/jwt.key holds a private key'],
             [['app/Hello.php' => '<?php', 'packages/x/node_modules/a.js' => 'x'], 'node_modules/a.js must never ship'],
+            [['app/Hello.php' => '<?php', 'APP/.ENV' => 'APP_KEY=x'], 'APP/.ENV must never ship'],
+            // What the node writes itself: shipped, it is overwritten and then
+            // reported as modified forever.
+            [['app/Hello.php' => '<?php', 'bootstrap/cache/config.php' => '<?php return [];'], 'bootstrap/cache/config.php is written by the node itself'],
+            [['app/Hello.php' => '<?php', 'RELEASE_SHA' => 'x'], 'RELEASE_SHA is written by the node itself'],
+            [['app/Hello.php' => '<?php', '.slipstream/manifest.json' => '{}'], '.slipstream/manifest.json is written by the node itself'],
         ] as [$files, $reason]) {
             $this->buildArchive($files);
 

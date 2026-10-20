@@ -92,18 +92,22 @@ class Packager
         $say('Build hooks: after composer');
         BuildHooks::run($checkout, $sha, $options['ref'], 'after-composer', $say);
 
+        $allow = array_values(array_filter((array) config('slipstream.artifacts.allow', []), 'is_string'));
         $dropped = [];
-        $files = $this->files($checkout, $output, $dropped);
+        $files = $this->files($checkout, $output, $dropped, $allow);
         if ($dropped !== []) {
             $say('Left out by name (never shipped): '.implode(', ', array_slice($dropped, 0, 20)).(count($dropped) > 20 ? ', and '.(count($dropped) - 20).' more' : ''));
         }
 
-        $allow = array_values(array_filter((array) config('slipstream.artifacts.allow', []), 'is_string'));
-        $problems = ReleaseRules::problems($checkout, $files, $allow);
+        $inspection = ReleaseRules::inspect($checkout, $files, $allow);
+        foreach ($inspection['warnings'] as $warning) {
+            $say('Warning: '.$warning.' (vendor code ships; check it is a test fixture).');
+        }
+        $problems = $inspection['problems'];
         if ($problems !== []) {
             throw new RuntimeException('Refusing to package: '.implode('; ', array_slice($problems, 0, 10))
                 .(count($problems) > 10 ? '; and '.(count($problems) - 10).' more' : '')
-                .'. Keep key material out of the release (a secrets manager, or the node), or list the path in artifacts.allow.');
+                .'. A release carries neither key material nor what the node writes itself (RELEASE_SHA, .slipstream/); keep keys in a secrets manager, or list a path in artifacts.allow.');
         }
         $say(count($files).' files');
 
@@ -158,9 +162,10 @@ class Packager
      * Every regular file that ships, sorted, forward slashes.
      *
      * @param  list<string>  $dropped  what the never-ship name rules left out
+     * @param  list<string>  $allow  paths let through on purpose
      * @return list<string>
      */
-    protected function files(string $checkout, string $output, array &$dropped = []): array
+    protected function files(string $checkout, string $output, array &$dropped = [], array $allow = []): array
     {
         $exclude = array_merge(self::EXCLUDE, array_values(array_filter((array) config('slipstream.artifacts.exclude', []), 'is_string')));
         $exclude = array_map(fn (string $path) => trim(str_replace('\\', '/', $path), '/'), $exclude);
@@ -170,7 +175,7 @@ class Packager
         }
 
         $files = [];
-        $this->walk($checkout, '', $exclude, $files, $dropped);
+        $this->walk($checkout, '', $exclude, $files, $dropped, $allow);
         sort($files, SORT_STRING);
         sort($dropped, SORT_STRING);
 
@@ -181,8 +186,9 @@ class Packager
      * @param  list<string>  $exclude
      * @param  list<string>  $files
      * @param  list<string>  $dropped
+     * @param  list<string>  $allow
      */
-    protected function walk(string $checkout, string $relative, array $exclude, array &$files, array &$dropped = []): void
+    protected function walk(string $checkout, string $relative, array $exclude, array &$files, array &$dropped = [], array $allow = []): void
     {
         $dir = $relative === '' ? $checkout : $checkout.'/'.$relative;
 
@@ -196,7 +202,7 @@ class Packager
                 continue;
             }
             // .git, node_modules, .env*, auth.json, .npmrc, … at any depth.
-            if (ReleaseRules::neverShips($path)) {
+            if (ReleaseRules::neverShips($path, $allow)) {
                 $dropped[] = $path;
 
                 continue;
@@ -209,7 +215,7 @@ class Packager
             }
 
             if (is_dir($absolute)) {
-                $this->walk($checkout, $path, $exclude, $files, $dropped);
+                $this->walk($checkout, $path, $exclude, $files, $dropped, $allow);
 
                 continue;
             }

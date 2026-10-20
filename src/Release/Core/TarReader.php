@@ -50,6 +50,22 @@ final class TarReader
         $longName = null;
         $created = [];
 
+        // With a manifest, the only directories an archive may carry are
+        // the ones its files sit in (all TarWriter ever writes).
+        $directories = null;
+        if ($expected !== null) {
+            $directories = [];
+            foreach (array_keys($expected) as $file) {
+                $parts = explode('/', (string) $file);
+                array_pop($parts);
+                $walked = '';
+                foreach ($parts as $part) {
+                    $walked = $walked === '' ? $part : $walked.'/'.$part;
+                    $directories[$walked] = true;
+                }
+            }
+        }
+
         try {
             while (true) {
                 $header = $stream->read(self::BLOCK);
@@ -107,6 +123,9 @@ final class TarReader
                 }
 
                 if ($type === '5') {
+                    if ($directories !== null && ! isset($directories[$name])) {
+                        throw new ArtifactRefused('files', 'the archive carries a directory no file in the manifest is in: '.self::printable($name));
+                    }
                     self::ensureDirectory($into, $name, $created);
 
                     continue;

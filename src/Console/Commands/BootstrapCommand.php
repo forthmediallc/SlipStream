@@ -98,7 +98,29 @@ class BootstrapCommand extends Command
         if ($running === $release->sha) {
             $this->components->twoColumnDetail('Release', 'already serving '.$release->short());
         } elseif ($pointer !== null) {
-            if (! $this->deploy($runner, $release, $ref, true, ['sequence' => $pointer->sequence, 'manifest_sha256' => $pointer->manifestSha256])) {
+            // Deploy what the pointer names. If the pointer moves on meanwhile
+            // (the deploy ends superseded, or fails and the pointer has moved),
+            // follow it to the new head — a few times at most — rather than
+            // fall back to a previous that is stale too.
+            $outcome = null;
+            for ($attempt = 0; $attempt < 4; $attempt++) {
+                $outcome = $this->deploy($runner, $release, $ref, true, ['sequence' => $pointer->sequence, 'manifest_sha256' => $pointer->manifestSha256])->status;
+                if ($outcome === Deployment::STATUS_DEPLOYED) {
+                    break;
+                }
+
+                $fresh = $this->freshPointer($source, $ref);
+                if ($fresh === null || $fresh->sha === $release->sha) {
+                    $pointer = $fresh ?? $pointer;
+
+                    break;
+                }
+                $pointer = $fresh;
+                $release = new ReleaseRef($fresh->sha, $release->name, $ref->isTag());
+                $this->components->warn('The pointer moved to '.$release->short().' while bootstrap deployed; deploying that instead.');
+            }
+
+            if ($outcome !== Deployment::STATUS_DEPLOYED) {
                 if ($this->option('no-fallback') || $pointer->previous === null || $pointer->previous['sha'] === $release->sha) {
                     Activity::log('bootstrap.failed', ['sha' => $release->sha, 'ref' => $release->ref()]);
 
@@ -110,7 +132,7 @@ class BootstrapCommand extends Command
                 $this->components->warn('Falling back to the pointer\'s previous release '.$fallback->short().', which the signed pointer vouches for.');
                 Activity::log('bootstrap.fell_back', ['failed_sha' => $release->sha, 'sha' => $fallback->sha, 'ref' => $release->ref(), 'from' => 'pointer.previous']);
 
-                if (! $this->deploy($runner, $fallback, $ref, false, ['sequence' => $pointer->sequence, 'manifest_sha256' => $pointer->previous['manifest_sha256']])) {
+                if ($this->deploy($runner, $fallback, $ref, false, ['sequence' => $pointer->sequence, 'manifest_sha256' => $pointer->previous['manifest_sha256']])->status !== Deployment::STATUS_DEPLOYED) {
                     Activity::log('bootstrap.failed', ['sha' => $fallback->sha, 'ref' => $release->ref(), 'fallback' => true]);
 
                     return $this->failWith('The fallback deploy of '.$fallback->short().' failed too.');
@@ -118,7 +140,7 @@ class BootstrapCommand extends Command
 
                 $fellBack = $fallback;
             }
-        } elseif (! $this->deploy($runner, $release, $ref, true)) {
+        } elseif ($this->deploy($runner, $release, $ref, true)->status !== Deployment::STATUS_DEPLOYED) {
             $good = $this->option('no-fallback') ? null : $lastGood->get($ref);
             $refused = null;
 
@@ -146,7 +168,7 @@ class BootstrapCommand extends Command
             Activity::log('bootstrap.fell_back', ['failed_sha' => $release->sha, 'sha' => $good['sha'], 'ref' => $release->ref()]);
 
             $fallback = new ReleaseRef($good['sha'], $good['name'], $ref->isTag());
-            if (! $this->deploy($runner, $fallback, $ref, false)) {
+            if ($this->deploy($runner, $fallback, $ref, false)->status !== Deployment::STATUS_DEPLOYED) {
                 Activity::log('bootstrap.failed', ['sha' => $good['sha'], 'ref' => $release->ref(), 'fallback' => true]);
 
                 return $this->failWith('The fallback deploy of '.$fallback->short().' failed too.');
@@ -246,7 +268,7 @@ class BootstrapCommand extends Command
     /**
      * @param  array{sequence: int, manifest_sha256: string}|null  $pointer  artifact mode: the pointer that vouches for this release, and the manifest it names
      */
-    protected function deploy(DeploymentRunner $runner, ReleaseRef $release, DeployRef $ref, bool $isRef, ?array $pointer = null): bool
+    protected function deploy(DeploymentRunner $runner, ReleaseRef $release, DeployRef $ref, bool $isRef, ?array $pointer = null): Deployment
     {
         $deployment = Deployment::query()->create([
             'server_name' => Slipstream::serverName(),
@@ -268,12 +290,28 @@ class BootstrapCommand extends Command
             $this->components->error("Deploy #{$deployment->id} ended {$deployment->status}: ".($deployment->failure_reason ?: 'no reason recorded'));
             $this->line("  Log: php artisan slipstream:deployment {$deployment->id}");
 
-            return false;
+            return $deployment;
         }
 
         $this->components->twoColumnDetail('Deployed', $release->short());
 
-        return true;
+        return $deployment;
+    }
+
+    /**
+     * The pointer as the store holds it now, or null when it cannot be had.
+     */
+    protected function freshPointer(ReleaseSource $source, DeployRef $ref): ?\Slipstream\Release\Core\Pointer
+    {
+        if (! $source instanceof ArtifactSource) {
+            return null;
+        }
+
+        try {
+            return $source->pointer($ref, fresh: true);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     protected function mirror(SettingsRepository $settings): int

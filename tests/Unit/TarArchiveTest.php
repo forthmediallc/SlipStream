@@ -191,6 +191,26 @@ class TarArchiveTest extends TestCase
         }
     }
 
+    public function test_a_directory_no_listed_file_is_in_is_refused(): void
+    {
+        $this->write('app/Hello.php', 'hi');
+        $expected = $this->expected(['app/Hello.php']);
+        file_put_contents($this->base.'/extra.tar.gz', $this->tar([['app', '5', ''], ['app/plugins', '5', ''], ['app/Hello.php', '0', 'hi']]));
+
+        try {
+            TarReader::extract($this->base.'/extra.tar.gz', $this->base.'/out', [], $expected);
+            $this->fail('created a directory the manifest does not account for');
+        } catch (ArtifactRefused $e) {
+            $this->assertStringContainsString('a directory no file in the manifest is in: app/plugins', $e->getMessage());
+        }
+        $this->assertDirectoryDoesNotExist($this->base.'/out/app/plugins');
+
+        // Without a manifest (publish reading what it will sign) it unpacks.
+        $this->removeTree($this->base.'/out');
+        mkdir($this->base.'/out');
+        $this->assertSame(['app/Hello.php'], array_keys(TarReader::extract($this->base.'/extra.tar.gz', $this->base.'/out')));
+    }
+
     public function test_only_zero_padding_up_to_a_record_may_follow_the_end_marker(): void
     {
         file_put_contents($this->base.'/padded.tar.gz', $this->tar([['a.txt', '0', 'x']], str_repeat("\0", 9216)));

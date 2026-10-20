@@ -56,13 +56,20 @@ final class ReleaseBuilder
      * the packager applies, now on bytes the build job cannot talk its way
      * around.
      *
-     * @param  list<string>  $allow  paths allowed to carry key material
+     * @param  list<string>  $allow  paths allowed through on purpose
+     * @param  (\Closure(string): void)|null  $warn  told about key material under vendor/
      * @return \Closure(string, array<string, array{0: string, 1: int}>): void
      */
-    public static function inspector(array $allow = []): \Closure
+    public static function inspector(array $allow = [], ?\Closure $warn = null): \Closure
     {
-        return function (string $root, array $files) use ($allow): void {
-            $problems = ReleaseRules::problems($root, array_map('strval', array_keys($files)), $allow);
+        return function (string $root, array $files) use ($allow, $warn): void {
+            $inspection = ReleaseRules::inspect($root, array_map('strval', array_keys($files)), $allow);
+            foreach ($inspection['warnings'] as $warning) {
+                if ($warn !== null) {
+                    $warn('Warning: '.$warning.' (vendor code ships; check it is a test fixture).');
+                }
+            }
+            $problems = $inspection['problems'];
             if ($problems !== []) {
                 throw new \RuntimeException('Refusing to publish: '.implode('; ', array_slice($problems, 0, 10))
                     .(count($problems) > 10 ? '; and '.(count($problems) - 10).' more' : '')

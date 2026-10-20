@@ -75,7 +75,7 @@ class ArtifactSource implements ReleaseHistory, ReleaseSource
             $this->refuse($ref, 'pointer', "it names {$pointer->ref}, not {$ref->full()}", ['key_id' => $pointer->keyId]);
         }
 
-        $mark = $this->sequence->highWater($ref);
+        $mark = $this->sequence->highWater($ref, $keys, $environment);
         $highWater = $mark['sequence'];
         if ($pointer->sequence < $highWater) {
             $this->refuse($ref, 'pointer', "sequence {$pointer->sequence} is below {$highWater}, which this node already accepted; publish a rollback rather than put an old pointer back", ['key_id' => $pointer->keyId, 'sha' => $pointer->sha]);
@@ -92,7 +92,8 @@ class ArtifactSource implements ReleaseHistory, ReleaseSource
             $this->sequence->forgetRefusal($ref);
         }
         if ($accept && ($pointer->sequence > $highWater || $mark['manifest'] === null)) {
-            $this->sequence->advance($ref, $pointer->sequence, $pointer->manifestSha256);
+            // The signed pointer itself is the mark: nothing else can raise it.
+            $this->sequence->advance($ref, $pointer, $envelope, $keys, $environment);
         }
         if ($accept && $pointer->sequence > $highWater) {
             AuditLog::record('artifact.accepted', [

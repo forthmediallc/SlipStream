@@ -570,8 +570,24 @@ final class Manifest
 
     public const MAX_PATH = 4096;
 
-    /** What a node writes into a release itself; publish lists these unless told otherwise. */
-    public const DEFAULT_GENERATED = ['bootstrap/cache', 'public/storage', 'public/hot'];
+    /**
+     * What a node writes into a release itself; publish lists these unless
+     * told otherwise. Not public/hot (only `npm run dev` writes it, and Vite
+     * loads every script from the URL inside), and not public/storage (the
+     * node makes it, but as a link, which STORAGE_LINKS checks instead).
+     */
+    public const DEFAULT_GENERATED = ['bootstrap/cache'];
+
+    /** Paths that may be symlinks, but only into the release's shared storage. */
+    public const STORAGE_LINKS = ['public/storage'];
+
+    /**
+     * Never excused, whatever a manifest's generated list says — releases
+     * signed with 0.6.1's defaults list both: a planted public/hot sends
+     * every page's scripts elsewhere, and a file under public/storage is
+     * served (and, behind a careless nginx, run).
+     */
+    public const NEVER_GENERATED = ['public/hot', 'public/storage'];
 
     /** Files the deploy itself adds to every release. */
     public const NODE_WRITTEN = ['RELEASE_SHA', '.slipstream'];
@@ -741,18 +757,21 @@ final class Manifest
      * Paths under $linked are what the deploy replaces with links to shared
      * copies (storage, the .env, the shared paths): skipped entirely. Every
      * other file the manifest lists is always checked, wherever it is. Paths
-     * under $generated only excuse what the manifest does not list — files
-     * and links the node writes itself (bootstrap/cache, public/storage) —
-     * so no ignore list can hide a change to a file CI signed.
+     * under $generated only excuse regular files the manifest does not list —
+     * the ones the node writes itself (bootstrap/cache) — so no ignore list
+     * can hide a change to a file CI signed. A symlink is drift anywhere else,
+     * unless it is one of $storageLinks and resolves into the release's own
+     * (shared) storage, as `storage:link` makes public/storage.
      *
      * @param  list<string>  $linked  path prefixes
      * @param  list<string>  $generated  path prefixes
+     * @param  list<string>  $storageLinks  exact paths
      * @return array{modified: list<string>, missing: list<string>, unlisted: list<string>, links: list<string>}
      */
-    public function verifyTree(string $root, array $linked = [], array $generated = []): array
+    public function verifyTree(string $root, array $linked = [], array $generated = [], array $storageLinks = []): array
     {
         $isLinked = fn (string $path): bool => self::under($path, $linked);
-        $isGenerated = fn (string $path): bool => self::under($path, $generated);
+        $isGenerated = fn (string $path): bool => self::under($path, $generated) && ! self::under($path, self::NEVER_GENERATED);
 
         $found = [];
         $links = [];
@@ -784,7 +803,16 @@ final class Manifest
         }
         sort($unlisted, SORT_STRING);
 
-        $links = array_values(array_filter($links, fn (string $path) => ! $isGenerated($path)));
+        $storage = realpath($root.'/storage');
+        $links = array_values(array_filter($links, function (string $path) use ($root, $storageLinks, $storage): bool {
+            if ($storage === false || ! in_array($path, array_map(fn ($p) => trim(str_replace('\\', '/', (string) $p), '/'), $storageLinks), true)) {
+                return true;
+            }
+            $target = realpath($root.'/'.$path);
+
+            return $target === false
+                || ($target !== $storage && ! str_starts_with($target, rtrim($storage, '/\\').DIRECTORY_SEPARATOR));
+        }));
 
         return ['modified' => $modified, 'missing' => $missing, 'unlisted' => $unlisted, 'links' => $links];
     }
@@ -1001,13 +1029,20 @@ final class ReleaseBuilder
      * the packager applies, now on bytes the build job cannot talk its way
      * around.
      *
-     * @param  list<string>  $allow  paths allowed to carry key material
+     * @param  list<string>  $allow  paths allowed through on purpose
+     * @param  (\Closure(string): void)|null  $warn  told about key material under vendor/
      * @return \Closure(string, array<string, array{0: string, 1: int}>): void
      */
-    public static function inspector(array $allow = []): \Closure
+    public static function inspector(array $allow = [], ?\Closure $warn = null): \Closure
     {
-        return function (string $root, array $files) use ($allow): void {
-            $problems = ReleaseRules::problems($root, array_map('strval', array_keys($files)), $allow);
+        return function (string $root, array $files) use ($allow, $warn): void {
+            $inspection = ReleaseRules::inspect($root, array_map('strval', array_keys($files)), $allow);
+            foreach ($inspection['warnings'] as $warning) {
+                if ($warn !== null) {
+                    $warn('Warning: '.$warning.' (vendor code ships; check it is a test fixture).');
+                }
+            }
+            $problems = $inspection['problems'];
             if ($problems !== []) {
                 throw new \RuntimeException('Refusing to publish: '.implode('; ', array_slice($problems, 0, 10))
                     .(count($problems) > 10 ? '; and '.(count($problems) - 10).' more' : '')
@@ -1119,42 +1154,56 @@ final class ReleaseBuilder
 /**
  * What a release must never carry, wherever it sits in the tree: VCS and
  * dependency directories, environment and credential files, local
- * databases, private keys. The packager leaves the names out; publish
- * applies the same rules to the archive itself, because the build job that
- * produced it is the untrusted side and Object Lock makes whatever reaches
- * the bucket permanent.
+ * databases, private keys, and what the node writes into a release itself.
+ * The packager leaves the names out; publish applies the same rules to the
+ * archive itself, because the build job that produced it is the untrusted
+ * side and Object Lock makes whatever reaches the bucket permanent.
+ *
+ * Names match case-insensitively (.ENV is .env on half the filesystems a
+ * checkout lands on). Key material is found by content, in the whole file;
+ * under vendor/, where packages ship test keys, it is a warning.
  */
 final class ReleaseRules
 {
-    /** Directory names never shipped, at any depth. */
-    public const NEVER_SHIP_DIRECTORIES = ['.git', 'node_modules'];
+    /** Directory names never shipped, at any depth (lower case). */
+    public const NEVER_SHIP_DIRECTORIES = ['.git', 'node_modules', '.aws', '.docker', '.ssh', '.kube'];
 
-    /** File names never shipped, at any depth. */
-    public const NEVER_SHIP_FILES = ['auth.json', '.envrc', '.npmrc', '.sentryclirc'];
+    /** File names never shipped, at any depth (lower case). */
+    public const NEVER_SHIP_FILES = [
+        'auth.json', '.envrc', '.npmrc', '.sentryclirc', '.netrc', '_netrc', '.pgpass',
+        '.htpasswd', '.git-credentials', '.s3cfg', '.dockercfg',
+    ];
 
-    /** Key-store extensions refused outside vendor/. */
+    /** Key-store extensions. */
     public const KEY_STORES = ['p12', 'pfx', 'jks', 'keystore'];
 
-    /** Files larger than this are not read for key material. */
-    public const SCAN_LIMIT = 1048576;
+    public const KEY_PATTERN = '/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/';
 
     /**
      * Whether a path, or any directory on the way to it, must never ship.
+     *
+     * @param  list<string>  $allow  paths or path prefixes let through on purpose
      */
-    public static function neverShips(string $path): bool
+    public static function neverShips(string $path, array $allow = []): bool
     {
-        $segments = explode('/', trim(str_replace('\\', '/', $path), '/'));
+        $path = trim(str_replace('\\', '/', $path), '/');
+        if ($allow !== [] && Manifest::under($path, $allow)) {
+            return false;
+        }
+
+        $segments = explode('/', $path);
         $last = count($segments) - 1;
 
         foreach ($segments as $i => $segment) {
-            if (in_array($segment, self::NEVER_SHIP_DIRECTORIES, true)) {
+            $lower = strtolower($segment);
+            if (in_array($lower, self::NEVER_SHIP_DIRECTORIES, true)) {
                 return true;
             }
-            if ($i === $last && self::neverShipsName($segment, $path)) {
+            // .env, .env.production, .env~, .envrc — and a directory named so.
+            if (str_starts_with($lower, '.env') && $lower !== '.env.example') {
                 return true;
             }
-            // Name rules apply to directories on the way too (.env.d, …).
-            if ($i < $last && (str_starts_with($segment, '.env') && $segment !== '.env.example')) {
+            if ($i === $last && self::neverShipsName($lower, $path)) {
                 return true;
             }
         }
@@ -1163,9 +1212,21 @@ final class ReleaseRules
     }
 
     /**
-     * Why a file must not ship, judged by what it holds: a private key, or
-     * a key store. Null when it may. Vendor code and allowed paths pass;
-     * public certificates (a CA bundle) are fine.
+     * What the deploy writes into every release itself. Shipped, it would be
+     * overwritten on the node and then reported as modified forever.
+     */
+    public static function nodeWritten(string $path): bool
+    {
+        $path = trim(str_replace('\\', '/', $path), '/');
+
+        return $path === 'RELEASE_SHA'
+            || $path === '.slipstream' || str_starts_with($path, '.slipstream/')
+            || (str_starts_with($path, 'bootstrap/cache/') && substr_count($path, '/') === 2 && str_ends_with(strtolower($path), '.php'));
+    }
+
+    /**
+     * Why contents must not ship: a private key, or a key store. Null when
+     * they may. Public certificates (a CA bundle) are fine.
      *
      * @param  list<string>  $allow  paths or path prefixes allowed to carry key material
      */
@@ -1179,7 +1240,7 @@ final class ReleaseRules
         if (in_array(strtolower(pathinfo($path, PATHINFO_EXTENSION)), self::KEY_STORES, true)) {
             return "{$path} is a key store";
         }
-        if ($contents !== null && preg_match('/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/', $contents) === 1) {
+        if ($contents !== null && preg_match(self::KEY_PATTERN, $contents) === 1) {
             return "{$path} holds a private key";
         }
 
@@ -1187,51 +1248,94 @@ final class ReleaseRules
     }
 
     /**
-     * Every problem with a tree on disk, for the files given: names that
-     * never ship and key material.
+     * Whether a file holds a private key anywhere in it, read in chunks so
+     * one appended to a large file is found too.
+     */
+    public static function containsPrivateKey(string $file): bool
+    {
+        $in = @fopen($file, 'rb');
+        if ($in === false) {
+            return false;
+        }
+
+        try {
+            $carry = '';
+            while (! feof($in)) {
+                $chunk = fread($in, 1048576);
+                if ($chunk === false || $chunk === '') {
+                    break;
+                }
+                if (preg_match(self::KEY_PATTERN, $carry.$chunk) === 1) {
+                    return true;
+                }
+                // A header split across two chunks is caught next time round.
+                $carry = substr($carry.$chunk, -128);
+            }
+
+            return false;
+        } finally {
+            fclose($in);
+        }
+    }
+
+    /**
+     * Every problem with the files of a tree, and what is only worth a
+     * warning (key material under vendor/).
      *
      * @param  list<string>  $paths  release-relative files
      * @param  list<string>  $allow
-     * @return list<string>
+     * @return array{problems: list<string>, warnings: list<string>}
      */
-    public static function problems(string $root, array $paths, array $allow = []): array
+    public static function inspect(string $root, array $paths, array $allow = []): array
     {
         $problems = [];
+        $warnings = [];
 
         foreach ($paths as $path) {
-            $path = (string) $path;
-            if (self::neverShips($path)) {
+            $path = trim(str_replace('\\', '/', (string) $path), '/');
+            if (self::nodeWritten($path)) {
+                $problems[] = "{$path} is written by the node itself";
+
+                continue;
+            }
+            if (self::neverShips($path, $allow)) {
                 $problems[] = "{$path} must never ship";
 
                 continue;
             }
-
-            $file = $root.'/'.$path;
-            $contents = null;
-            if (! str_starts_with($path, 'vendor/') && is_file($file) && (int) filesize($file) <= self::SCAN_LIMIT) {
-                $contents = (string) @file_get_contents($file);
+            if ($allow !== [] && Manifest::under($path, $allow)) {
+                continue;
             }
-            if (($problem = self::secretProblem($path, $contents, $allow)) !== null) {
-                $problems[] = $problem;
+
+            $problem = null;
+            if (in_array(strtolower(pathinfo($path, PATHINFO_EXTENSION)), self::KEY_STORES, true)) {
+                $problem = "{$path} is a key store";
+            } elseif (self::containsPrivateKey($root.'/'.$path)) {
+                $problem = "{$path} holds a private key";
+            }
+
+            if ($problem !== null) {
+                if (str_starts_with($path, 'vendor/')) {
+                    $warnings[] = $problem;
+                } else {
+                    $problems[] = $problem;
+                }
             }
         }
 
-        return $problems;
+        return ['problems' => $problems, 'warnings' => $warnings];
     }
 
-    private static function neverShipsName(string $name, string $path): bool
+    private static function neverShipsName(string $lower, string $path): bool
     {
-        if (in_array($name, self::NEVER_SHIP_FILES, true)) {
+        if (in_array($lower, self::NEVER_SHIP_FILES, true)) {
             return true;
         }
-        if (str_starts_with($name, '.env') && $name !== '.env.example') {
-            return true;
-        }
-        if (str_starts_with($name, '.yarnrc')) {
+        if (str_starts_with($lower, '.yarnrc')) {
             return true;
         }
 
-        return ! str_starts_with(ltrim($path, '/'), 'vendor/') && preg_match('/\.sqlite3?$/i', $name) === 1;
+        return ! str_starts_with($path, 'vendor/') && preg_match('/\.sqlite3?$/', $lower) === 1;
     }
 }
 
@@ -1455,6 +1559,22 @@ final class TarReader
         $longName = null;
         $created = [];
 
+        // With a manifest, the only directories an archive may carry are
+        // the ones its files sit in (all TarWriter ever writes).
+        $directories = null;
+        if ($expected !== null) {
+            $directories = [];
+            foreach (array_keys($expected) as $file) {
+                $parts = explode('/', (string) $file);
+                array_pop($parts);
+                $walked = '';
+                foreach ($parts as $part) {
+                    $walked = $walked === '' ? $part : $walked.'/'.$part;
+                    $directories[$walked] = true;
+                }
+            }
+        }
+
         try {
             while (true) {
                 $header = $stream->read(self::BLOCK);
@@ -1512,6 +1632,9 @@ final class TarReader
                 }
 
                 if ($type === '5') {
+                    if ($directories !== null && ! isset($directories[$name])) {
+                        throw new ArtifactRefused('files', 'the archive carries a directory no file in the manifest is in: '.self::printable($name));
+                    }
                     self::ensureDirectory($into, $name, $created);
 
                     continue;
@@ -2039,10 +2162,12 @@ slipstream-release.php — artifact releases without the framework
                   Verifies, unpacks, writes RELEASE_SHA and .slipstream/. Prints files=N.
                   On a refusal, removes what it unpacked.
 
-  verify-tree     --release=<dir> --keys=… --environment=… [--shared=a,b] [--state-dir=<dir>] [--json]
+  verify-tree     --release=<dir> --keys=… --environment=… [--shared=a,b] [--links=public/storage,…]
+                  [--state-dir=<dir>] [--json]
                   The live release against its signed manifest and the cache hashes recorded at
                   deploy, from outside it: run it as root from a copy the deploy user cannot
-                  write, with keys from a root-owned file. Exit 0 clean, 1 drift.
+                  write, with keys from a root-owned file. --links names the paths that may be
+                  links into the release's storage (default public/storage). Exit 0 clean, 1 drift.
 
   publish         --archive=<file> --manifest=<build manifest> --ref=… --environment=…
                   --sha=<40 hex> (default GITHUB_SHA) --keys=<the nodes' keys>
@@ -2410,9 +2535,10 @@ function slipstream_release_point(array $options, string $sha, string $manifestS
  * is seen, so rewriting the copies inside the tree is caught too.
  *
  * @param  list<string>  $shared
+ * @param  list<string>  $storageLinks
  * @return array<string, mixed>
  */
-function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir): array
+function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir, array $storageLinks = Manifest::STORAGE_LINKS): array
 {
     $result = [
         'release' => $release, 'sha' => null, 'ok' => false, 'reason' => null, 'files' => 0,
@@ -2449,13 +2575,17 @@ function slipstream_release_verify_tree(string $release, Keys $keys, string $env
         default => null,
     };
 
-    $tree = $manifest->verifyTree($release, array_merge(Manifest::NODE_LINKED, $shared), array_merge(Manifest::NODE_WRITTEN, $manifest->generated));
+    $tree = $manifest->verifyTree($release, array_merge(Manifest::NODE_LINKED, $shared), array_merge(Manifest::NODE_WRITTEN, $manifest->generated), $storageLinks);
     foreach (['modified', 'missing', 'unlisted', 'links'] as $kind) {
         $result[$kind] = $tree[$kind];
     }
 
+    // Every deploy since 0.6.1 records the caches' hashes before the swap,
+    // so a release without the record has lost it.
     $recorded = is_file($sidecar.'/'.Baseline::FILE) ? Baseline::fromJson((string) file_get_contents($sidecar.'/'.Baseline::FILE)) : null;
-    if (is_file($sidecar.'/'.Baseline::FILE) && $recorded === null) {
+    if (! is_file($sidecar.'/'.Baseline::FILE)) {
+        $result['generated'][] = Baseline::DIRECTORY.' (no hashes recorded: .slipstream/'.Baseline::FILE.' is missing; a release deployed by 0.6.1 or later always has one)';
+    } elseif ($recorded === null) {
         $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes are unreadable)';
     }
     $baseline = $recorded;
@@ -2623,6 +2753,7 @@ try {
                 slipstream_release_need($options, 'environment'),
                 slipstream_release_list($options, 'shared', []),
                 slipstream_release_option($options, 'state-dir'),
+                slipstream_release_list($options, 'links', Manifest::STORAGE_LINKS),
             );
 
             if (isset($options['json'])) {
@@ -2677,7 +2808,7 @@ try {
             ], [
                 'max_unpacked_bytes' => (int) (slipstream_release_option($options, 'max-unpacked-bytes') ?? 4294967296),
                 'max_entries' => (int) (slipstream_release_option($options, 'max-entries') ?? 250000),
-            ], ReleaseBuilder::inspector(slipstream_release_list($options, 'allow', [])));
+            ], ReleaseBuilder::inspector(slipstream_release_list($options, 'allow', []), fn (string $line) => slipstream_release_say($line)));
             $json = $manifest->toJson();
             $statement = Envelope::encode(ReleaseBuilder::statementFor($manifest, $json, $environment)->toPayload(), Envelope::DOMAIN_MANIFEST, $signer);
             ReleaseBuilder::selfCheck($json, $statement, null, $nodeKeys);

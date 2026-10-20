@@ -87,6 +87,8 @@ class ArtifactDeployTest extends TestCase
             'manifest_sha256' => $this->fixture->pointer->manifestSha256,
             'key_id' => 'test-key',
             'bound' => true,
+            // The hash of the cache record, kept off the release's disk.
+            'baseline_sha256' => hash_file('sha256', $live.'/.slipstream/generated.json'),
         ], $deployment->meta['artifact']);
         $this->assertSame([], glob($this->fixture->appRoot.'/releases/.incoming-*'), 'nothing left staged');
     }
@@ -233,11 +235,48 @@ PHP)->package(str_repeat('f', 40)); // a new commit: a published release is neve
         $this->assertRefused('statement', 'signature does not verify');
     }
 
-    public function test_a_bad_pointer_signature_is_refused_and_nothing_is_swapped(): void
+    /**
+     * The poller refuses a bad pointer before any deploy starts (no row:
+     * ArtifactSourceTest). One that turns bad after a deploy started says
+     * nothing about the pointer that deploy was started from, which was
+     * checked when it was read.
+     */
+    public function test_a_pointer_that_turns_bad_mid_deploy_does_not_stop_it(): void
     {
+        $recorded = $this->recorded();
         $this->fixture->resignPointer($this->fixture->otherSigner());
 
-        $this->assertRefused('pointer', 'signature does not verify');
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $recorded]);
+        $deployer->run();
+
+        $this->assertSame(Deployment::STATUS_DEPLOYED, $deployment->refresh()->status, 'bound to the manifest the verified pointer named');
+        $this->assertTrue($deployment->meta['artifact']['bound']);
+    }
+
+    public function test_garbage_written_to_the_pointer_after_the_migrations_does_not_abort_the_swap(): void
+    {
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $this->recorded()]);
+        $deployer->runner->during = function (string $command) {
+            if (str_contains($command, 'slipstream:healthcheck')) {
+                \Illuminate\Support\Facades\Storage::disk('artifacts')->put('app/refs/heads/production.json', '{"not":"a pointer"}');
+            }
+        };
+
+        $deployer->run();
+
+        $this->assertSame(Deployment::STATUS_DEPLOYED, $deployment->refresh()->status);
+        $this->assertSame($this->fixture->sha, trim((string) file_get_contents($this->fixture->appRoot.'/current/RELEASE_SHA')));
+    }
+
+    public function test_a_stale_download_is_swept_even_when_the_deploy_then_fails(): void
+    {
+        $stale = $this->fixture->appRoot.'/releases/.incoming-20260101_000000_ddddddd';
+        mkdir($stale);
+        touch($stale, time() - 3 * 3600);
+        $this->fixture->tamperArchive();
+
+        $this->assertRefused('archive', 'does not match the signed manifest');
+        $this->assertDirectoryDoesNotExist($stale);
     }
 
     public function test_a_file_whose_hash_does_not_match_the_manifest_is_refused_and_nothing_is_swapped(): void
