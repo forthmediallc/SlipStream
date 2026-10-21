@@ -118,6 +118,52 @@ class ArtifactSourceTest extends TestCase
         $this->assertSame(['sequence' => 1000, 'manifest' => self::MANIFEST], $this->mark(), 'both marks now hold the accepted pointer');
     }
 
+    /**
+     * Upgrading must not open a window for an older pointer: the bare mark
+     * 0.6.0 or 0.6.1 kept in the node's own database is a floor until the
+     * next accepted pointer replaces it. The shared store's copy is not (any
+     * fleet member can write it).
+     */
+    public function test_a_mark_from_before_0_6_2_in_the_nodes_own_database_is_a_floor_until_replaced(): void
+    {
+        app(SettingsRepository::class)->set('artifact_sequence:branch:production', '1000:'.self::MANIFEST);
+        $this->publish(['sequence' => 999, 'sha' => self::OLDER]);
+        try {
+            app(ReleaseSource::class)->latest(DeployRef::fromConfig());
+            $this->fail('followed a pointer older than the mark 0.6.1 recorded');
+        } catch (ArtifactRefused $e) {
+            $this->assertStringContainsString('sequence 999 is below 1000', $e->reason);
+        }
+
+        $this->publish(['sequence' => 1000]);
+        $this->assertSame(self::SHA, app(ReleaseSource::class)->latest(DeployRef::fromConfig())->sha);
+        $this->assertIsArray(app(SettingsRepository::class)->get('artifact_sequence:branch:production'), 'replaced by the signed pointer');
+
+        // The same bare mark in the shared store counts for nothing.
+        app(SettingsRepository::class)->forget('artifact_sequence:branch:production');
+        \Slipstream\Fleet\SharedStore::cache()->put($this->sharedKey(), '5000', 3600);
+        $this->publish(['sequence' => 999, 'sha' => self::OLDER]);
+        $this->assertSame(self::OLDER, app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), fresh: true)->sha);
+    }
+
+    /**
+     * A shared mark someone wiped or garbled is written again by the next
+     * node that accepts the pointer, so fresh nodes keep their floor.
+     */
+    public function test_a_wiped_shared_mark_is_written_again_on_the_next_acceptance(): void
+    {
+        $this->publish(['sequence' => 1000]);
+        app(ReleaseSource::class)->latest(DeployRef::fromConfig());
+
+        \Slipstream\Fleet\SharedStore::cache()->put($this->sharedKey(), 'garbage', 3600);
+        app(ArtifactSource::class)->pointer(DeployRef::fromConfig(), fresh: true); // the next minute's check
+
+        $this->assertSame(
+            json_decode((string) Storage::disk('artifacts')->get('app/refs/heads/production.json'), true),
+            json_decode((string) \Slipstream\Fleet\SharedStore::cache()->get($this->sharedKey()), true),
+        );
+    }
+
     public function test_a_signed_pointer_counts_as_a_mark_only_for_this_ref_and_environment(): void
     {
         $other = Envelope::encode([

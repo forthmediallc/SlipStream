@@ -87,19 +87,23 @@ class ReleaseVerifier
             }
         }
 
-        // What the node links to shared copies is skipped; what it writes
-        // itself (the signed manifest's list, never the release's own
+        // Each link the node makes must lead exactly where the deploy points
+        // it (a storage link aimed at storage/logs, or a storage link aimed at
+        // the app root, would serve logs, sessions or the .env); what the node
+        // writes itself (the signed manifest's list, never the release's own
         // config, which ships inside the archive) excuses only unlisted
         // files. Every file CI signed is checked.
-        $linked = array_values(array_unique(array_merge(
-            Manifest::NODE_LINKED,
-            array_map(fn (string $path) => trim(str_replace('\\', '/', $path), '/'), array_keys($this->sharedPaths())),
-        )));
+        $shared = [];
+        foreach ($this->sharedPaths() as $path => $sharedPath) {
+            $shared[trim(str_replace('\\', '/', (string) $path), '/')] = is_string($sharedPath) && $sharedPath !== '' ? $sharedPath : null;
+        }
+        $linked = array_values(array_unique(['storage', ...array_keys($shared)]));
         $ignored = array_values(array_unique(array_merge(Manifest::NODE_WRITTEN, $manifest->generated)));
         $result['linked'] = $linked;
         $result['ignored'] = $ignored;
 
-        $tree = $manifest->verifyTree($release, $linked, $ignored, $this->storageLinks());
+        $targets = Manifest::linkTargets(Slipstream::appRoot(), $this->storageLinks(), $shared);
+        $tree = $manifest->verifyTree($release, $linked, $ignored, $targets);
         $result['modified'] = $tree['modified'];
         $result['missing'] = $tree['missing'];
         $result['unlisted'] = $tree['unlisted'];
@@ -191,10 +195,11 @@ class ReleaseVerifier
     }
 
     /**
-     * The paths `storage:link` makes, which may be links into the shared
-     * storage: public/storage and whatever filesystems.links adds.
+     * The links `storage:link` makes and exactly where each leads, relative
+     * to the app root: public/storage to storage/app/public, and whatever
+     * filesystems.links adds (a target outside storage is not checked).
      *
-     * @return list<string>
+     * @return array<string, string>
      */
     protected function storageLinks(): array
     {
@@ -202,17 +207,19 @@ class ReleaseVerifier
 
         try {
             $base = rtrim(str_replace('\\', '/', base_path()), '/').'/';
-            foreach (array_keys((array) config('filesystems.links', [])) as $link) {
+            $storage = rtrim(str_replace('\\', '/', storage_path()), '/').'/';
+            foreach ((array) config('filesystems.links', []) as $link => $target) {
                 $link = str_replace('\\', '/', (string) $link);
-                if (str_starts_with($link, $base)) {
-                    $links[] = substr($link, strlen($base));
+                $target = str_replace('\\', '/', (string) $target);
+                if (str_starts_with($link, $base) && str_starts_with($target.'/', $storage)) {
+                    $links[substr($link, strlen($base))] = 'storage/'.ltrim(substr($target, strlen($storage)), '/');
                 }
             }
         } catch (\Throwable) {
             // No app to ask: the default only.
         }
 
-        return array_values(array_unique($links));
+        return $links;
     }
 
     /**

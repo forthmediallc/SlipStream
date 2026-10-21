@@ -277,9 +277,16 @@ class ArtifactFixture
 
     protected function removeTree(string $path): void
     {
-        if (is_link($path) || is_file($path)) {
-            @chmod($path, 0666);
+        if (is_link($path)) {
+            // Never chmod a link: chmod follows it, and a test link aimed at
+            // the app root would leave that directory without its x bit.
             @unlink($path) || @rmdir($path);
+
+            return;
+        }
+        if (is_file($path)) {
+            @chmod($path, 0666);
+            @unlink($path);
 
             return;
         }

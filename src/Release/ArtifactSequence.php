@@ -36,20 +36,24 @@ class ArtifactSequence
     {
         $local = $this->mark('local', $ref, $keys, $environment, fn () => $this->settings->get($this->key($ref)));
         $shared = $this->mark('shared', $ref, $keys, $environment, fn () => SharedStore::cache()->get($this->sharedKey($ref)));
+        $mark = $shared['sequence'] > $local['sequence'] ? $shared : $local;
 
-        return $shared['sequence'] > $local['sequence'] ? $shared : $local;
+        return ['sequence' => $mark['sequence'], 'manifest' => $mark['manifest']];
     }
 
     /**
-     * Record an accepted pointer — its signed envelope — where it raises the
-     * mark: an atomic max under the shared store's lock where it has one. A
-     * write without the lock can at worst lower the mark, never freeze it.
+     * Record an accepted pointer — its signed envelope — wherever the mark is
+     * lower, missing, garbled or unsigned: called on every acceptance, so a
+     * shared mark someone wiped is written again within a minute and fresh
+     * nodes keep their floor. The shared store's lock is taken only when
+     * there is something to write; a write without it can at worst lower
+     * the mark, never freeze it.
      */
     public function advance(DeployRef $ref, Pointer $pointer, string $envelope, Keys $keys, string $environment): void
     {
         try {
             $local = $this->mark('local', $ref, $keys, $environment, fn () => $this->settings->get($this->key($ref)));
-            if ($pointer->sequence > $local['sequence'] || $local['manifest'] === null) {
+            if (self::needsWrite($local, $pointer)) {
                 $this->settings->set($this->key($ref), $envelope);
             }
         } catch (\Throwable) {
@@ -59,6 +63,11 @@ class ArtifactSequence
         try {
             $cache = SharedStore::cache();
             $key = $this->sharedKey($ref);
+            $read = fn () => $cache->get($key);
+
+            if (! self::needsWrite($this->mark('shared', $ref, $keys, $environment, $read), $pointer)) {
+                return;
+            }
 
             $lock = null;
             try {
@@ -72,8 +81,7 @@ class ArtifactSequence
             }
 
             try {
-                $shared = $this->mark('shared', $ref, $keys, $environment, fn () => $cache->get($key));
-                if ($pointer->sequence > $shared['sequence'] || $shared['manifest'] === null) {
+                if (self::needsWrite($this->mark('shared', $ref, $keys, $environment, $read), $pointer)) {
                     $cache->put($key, $envelope, now()->addDays(365));
                 }
             } finally {
@@ -82,6 +90,14 @@ class ArtifactSequence
         } catch (\Throwable) {
             // A cache outage must never block a deploy.
         }
+    }
+
+    /**
+     * @param  array{sequence: int, manifest: ?string, signed: bool}  $mark
+     */
+    protected static function needsWrite(array $mark, Pointer $pointer): bool
+    {
+        return ! $mark['signed'] || $pointer->sequence > $mark['sequence'];
     }
 
     /**
@@ -116,15 +132,18 @@ class ArtifactSequence
     /**
      * A stored mark, verified: the sequence and manifest of the signed
      * pointer it holds, or nothing. Anything else is ignored and audited
-     * once per value — a bare number from 0.6.0 or 0.6.1 included, so one
-     * written by hand is seen.
+     * once per value — with one exception: a bare number 0.6.0 or 0.6.1
+     * recorded in the node's own database, already in the past, is a floor
+     * until the next accepted pointer replaces it, so upgrading does not open
+     * a window for an older pointer. (The shared store's copy is not: any
+     * fleet member can write it.)
      *
      * @param  \Closure(): mixed  $read
-     * @return array{sequence: int, manifest: ?string}
+     * @return array{sequence: int, manifest: ?string, signed: bool}
      */
     protected function mark(string $where, DeployRef $ref, Keys $keys, string $environment, \Closure $read): array
     {
-        $none = ['sequence' => 0, 'manifest' => null];
+        $none = ['sequence' => 0, 'manifest' => null, 'signed' => false];
 
         try {
             $value = $read();
@@ -141,7 +160,11 @@ class ArtifactSequence
         }
 
         try {
-            if (is_int($value) || (is_string($value) && preg_match('/^\d+(:[0-9a-f]{64})?$/', $value) === 1)) {
+            if (is_int($value) || (is_string($value) && preg_match('/^(\d+)(?::([0-9a-f]{64}))?$/', $value, $m) === 1)) {
+                $sequence = is_int($value) ? $value : (strlen(ltrim($m[1], '0')) >= 19 ? PHP_INT_MAX : (int) $m[1]);
+                if ($where === 'local' && $sequence <= time()) {
+                    return ['sequence' => $sequence, 'manifest' => is_string($value) ? ($m[2] ?? null) : null, 'signed' => false];
+                }
                 throw new \RuntimeException('it is a bare number, not a signed pointer (0.6.0 and 0.6.1 wrote such marks; the next accepted pointer replaces it)');
             }
             if (! is_string($value)) {
@@ -156,7 +179,7 @@ class ArtifactSequence
                 throw new \RuntimeException("its sequence {$pointer->sequence} is more than a day in the future");
             }
 
-            return ['sequence' => $pointer->sequence, 'manifest' => $pointer->manifestSha256];
+            return ['sequence' => $pointer->sequence, 'manifest' => $pointer->manifestSha256, 'signed' => true];
         } catch (\Throwable $e) {
             $this->ignored($ref, $where, is_string($value) ? $value : json_encode($value), $e->getMessage());
 

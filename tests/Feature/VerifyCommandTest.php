@@ -75,12 +75,80 @@ class VerifyCommandTest extends TestCase
         file_put_contents($this->release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($this->release)));
         @mkdir($this->release.'/storage/logs', 0777, true);
         file_put_contents($this->release.'/storage/logs/laravel.log', 'noise');
-        file_put_contents($this->release.'/.env', 'APP_KEY=x');
         config()->set('slipstream.deploy.shared_paths', ['public/uploads' => 'shared/uploads']);
         @mkdir($this->release.'/public/uploads', 0777, true);
         file_put_contents($this->release.'/public/uploads/photo.jpg', 'jpg');
 
         $this->artisan('slipstream:verify')->assertExitCode(0);
+    }
+
+    /**
+     * The node makes .env a link to the shared copy; a regular file there is
+     * configuration nobody deployed.
+     */
+    public function test_an_env_file_in_place_of_the_link_is_drift(): void
+    {
+        file_put_contents($this->release.'/.env', "APP_KEY=base64:attacker\nDB_HOST=evil.example\n");
+
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('.env')
+            ->assertExitCode(1);
+    }
+
+    /**
+     * Each link the deploy makes must lead exactly where it points it: a
+     * storage link aimed at storage/logs, or at the app root, serves logs,
+     * sessions or the .env over HTTP.
+     */
+    public function test_every_link_the_node_makes_must_lead_exactly_where_the_deploy_points_it(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('needs symlinks (run under WSL).');
+        }
+
+        $root = $this->fixture->appRoot;
+        mkdir($root.'/storage/app/public', 0777, true);
+        mkdir($root.'/storage/logs', 0777, true);
+        mkdir($root.'/shared/uploads', 0777, true);
+        config()->set('slipstream.deploy.shared_paths', ['public/uploads' => 'shared/uploads']);
+        $link = function (string $path, string $target): void {
+            if (is_link($this->release.'/'.$path)) {
+                unlink($this->release.'/'.$path);
+            } elseif (is_dir($this->release.'/'.$path)) {
+                $this->removeTree($this->release.'/'.$path);
+            }
+            symlink($target, $this->release.'/'.$path);
+        };
+
+        // As a deploy leaves it.
+        $link('storage', $root.'/storage');
+        $link('.env', $root.'/.env');
+        $link('public/storage', $this->release.'/storage/app/public');
+        $link('public/uploads', $root.'/shared/uploads');
+        $this->artisan('slipstream:verify')->assertExitCode(0);
+
+        foreach ([
+            ['public/storage', $this->release.'/storage/logs'],
+            ['public/storage', $this->release.'/storage'],
+            ['.env', $root.'/elsewhere.env'],
+            ['public/uploads', $root],
+        ] as [$path, $target]) {
+            touch($root.'/elsewhere.env');
+            $link($path, $target);
+            $this->artisan('slipstream:verify')
+                ->expectsOutputToContain($path)
+                ->assertExitCode(1);
+        }
+
+        // The release's own storage link at the app root, and public/storage
+        // through it: /storage/.env.
+        $link('.env', $root.'/.env');
+        $link('public/uploads', $root.'/shared/uploads');
+        $link('storage', $root);
+        $link('public/storage', $this->release.'/storage');
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('Symlinks')
+            ->assertExitCode(1);
     }
 
     public function test_json_output_and_audit_lines(): void

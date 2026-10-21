@@ -578,8 +578,11 @@ final class Manifest
      */
     public const DEFAULT_GENERATED = ['bootstrap/cache'];
 
-    /** Paths that may be symlinks, but only into the release's shared storage. */
-    public const STORAGE_LINKS = ['public/storage'];
+    /**
+     * The links `storage:link` makes, each to exactly its target (relative
+     * to the app root, whose storage the release's storage links to).
+     */
+    public const STORAGE_LINKS = ['public/storage' => 'storage/app/public'];
 
     /**
      * Never excused, whatever a manifest's generated list says — releases
@@ -754,21 +757,24 @@ final class Manifest
     /**
      * Compare a tree on disk with the manifest. Symlinks are never followed.
      *
-     * Paths under $linked are what the deploy replaces with links to shared
-     * copies (storage, the .env, the shared paths): skipped entirely. Every
-     * other file the manifest lists is always checked, wherever it is. Paths
-     * under $generated only excuse regular files the manifest does not list —
-     * the ones the node writes itself (bootstrap/cache) — so no ignore list
-     * can hide a change to a file CI signed. A symlink is drift anywhere else,
-     * unless it is one of $storageLinks and resolves into the release's own
-     * (shared) storage, as `storage:link` makes public/storage.
+     * Every file the manifest lists is checked, wherever it is. Paths under
+     * $generated only excuse regular files the manifest does not list — the
+     * ones the node writes itself (bootstrap/cache) — so no ignore list can
+     * hide a change to a file CI signed.
      *
-     * @param  list<string>  $linked  path prefixes
+     * A symlink is drift unless it is one the node makes: a path in
+     * $linkTargets, whose link must resolve to exactly the target given there
+     * (storage to the shared storage, public/storage to storage/app/public,
+     * the .env to the shared .env), or one under $linked when no target is
+     * known (null). A real directory under $linked — a release not linked
+     * yet — is skipped; anywhere else what is in it is checked like any file.
+     *
+     * @param  list<string>  $linked  path prefixes the deploy replaces with links
      * @param  list<string>  $generated  path prefixes
-     * @param  list<string>  $storageLinks  exact paths
+     * @param  array<string, string|null>  $linkTargets  path => the absolute path a link there must resolve to
      * @return array{modified: list<string>, missing: list<string>, unlisted: list<string>, links: list<string>}
      */
-    public function verifyTree(string $root, array $linked = [], array $generated = [], array $storageLinks = []): array
+    public function verifyTree(string $root, array $linked = [], array $generated = [], array $linkTargets = []): array
     {
         $isLinked = fn (string $path): bool => self::under($path, $linked);
         $isGenerated = fn (string $path): bool => self::under($path, $generated) && ! self::under($path, self::NEVER_GENERATED);
@@ -803,18 +809,64 @@ final class Manifest
         }
         sort($unlisted, SORT_STRING);
 
-        $storage = realpath($root.'/storage');
-        $links = array_values(array_filter($links, function (string $path) use ($root, $storageLinks, $storage): bool {
-            if ($storage === false || ! in_array($path, array_map(fn ($p) => trim(str_replace('\\', '/', (string) $p), '/'), $storageLinks), true)) {
-                return true;
+        $targets = [];
+        foreach ($linkTargets as $path => $target) {
+            $targets[trim(str_replace('\\', '/', (string) $path), '/')] = $target;
+        }
+        $links = array_values(array_filter($links, function (string $path) use ($root, $targets, $isLinked): bool {
+            if (array_key_exists($path, $targets)) {
+                return $targets[$path] !== null && ! self::resolvesTo($root.'/'.$path, $targets[$path]);
             }
-            $target = realpath($root.'/'.$path);
 
-            return $target === false
-                || ($target !== $storage && ! str_starts_with($target, rtrim($storage, '/\\').DIRECTORY_SEPARATOR));
+            return ! $isLinked($path);
         }));
 
         return ['modified' => $modified, 'missing' => $missing, 'unlisted' => $unlisted, 'links' => $links];
+    }
+
+    /**
+     * Whether a link resolves to exactly the given path.
+     */
+    public static function resolvesTo(string $link, string $target): bool
+    {
+        $actual = realpath($link);
+        if ($actual === false) {
+            return false;
+        }
+        $expected = realpath($target) ?: $target;
+        $normalize = fn (string $path) => rtrim(str_replace('\\', '/', $path), '/');
+
+        return DIRECTORY_SEPARATOR === '\\'
+            ? strcasecmp($normalize($actual), $normalize($expected)) === 0
+            : $normalize($actual) === $normalize($expected);
+    }
+
+    /**
+     * Where each link the deploy makes must lead, for an app root: storage to
+     * the shared storage, public/storage (and any other storage link) into
+     * it exactly, the .env and auth.json to the shared copies, each shared
+     * path to its shared directory.
+     *
+     * @param  array<string, string>  $storageLinks  release path => target relative to the app root
+     * @param  array<string, string|null>  $sharedPaths  release path => shared path relative to the app root (null: not known)
+     * @return array<string, string|null>
+     */
+    public static function linkTargets(string $appRoot, array $storageLinks = ['public/storage' => 'storage/app/public'], array $sharedPaths = []): array
+    {
+        $appRoot = rtrim(str_replace('\\', '/', $appRoot), '/');
+        $targets = [
+            'storage' => $appRoot.'/storage',
+            '.env' => $appRoot.'/.env',
+            'auth.json' => $appRoot.'/auth.json',
+        ];
+        foreach ($storageLinks as $path => $target) {
+            $targets[trim((string) $path, '/')] = $appRoot.'/'.trim($target, '/');
+        }
+        foreach ($sharedPaths as $path => $shared) {
+            $targets[trim((string) $path, '/')] = $shared === null ? null : $appRoot.'/'.trim(str_replace('\\', '/', $shared), '/');
+        }
+
+        return $targets;
     }
 
     /**
@@ -850,13 +902,18 @@ final class Manifest
                 continue;
             }
             $path = $relative === '' ? $name : $relative.'/'.$name;
+            $absolute = $root.'/'.$path;
+            // A link is always looked at, where the node makes one too: the
+            // target is what matters.
+            if (is_link($absolute)) {
+                $links[] = $path;
+
+                continue;
+            }
             if ($ignored($path)) {
                 continue;
             }
-            $absolute = $root.'/'.$path;
-            if (is_link($absolute)) {
-                $links[] = $path;
-            } elseif (is_dir($absolute)) {
+            if (is_dir($absolute)) {
                 $this->walk($root, $path, $ignored, $found, $links);
             } elseif (is_file($absolute)) {
                 $found[$path] = (int) filesize($absolute);
@@ -1043,12 +1100,58 @@ final class ReleaseBuilder
                 }
             }
             $problems = $inspection['problems'];
+            // Nodes refuse a directory no listed file is in; signed, the
+            // commit's write-once slot would be spent on a release no node takes.
+            foreach (self::directoriesWithoutFiles($root, array_map('strval', array_keys($files))) as $directory) {
+                $problems[] = "{$directory}/ is a directory no file is in";
+            }
             if ($problems !== []) {
                 throw new \RuntimeException('Refusing to publish: '.implode('; ', array_slice($problems, 0, 10))
                     .(count($problems) > 10 ? '; and '.(count($problems) - 10).' more' : '')
                     .'. Leave them out of the build (or name a path that may carry a key with --allow).');
             }
         };
+    }
+
+    /**
+     * The directories an unpacked archive created that hold none of its
+     * files, at any depth.
+     *
+     * @param  list<string>  $files
+     * @return list<string>
+     */
+    public static function directoriesWithoutFiles(string $root, array $files): array
+    {
+        $ancestors = [];
+        foreach ($files as $file) {
+            $parts = explode('/', $file);
+            array_pop($parts);
+            $walked = '';
+            foreach ($parts as $part) {
+                $walked = $walked === '' ? $part : $walked.'/'.$part;
+                $ancestors[$walked] = true;
+            }
+        }
+
+        $empty = [];
+        $walk = function (string $relative) use (&$walk, &$empty, $root, $ancestors): void {
+            foreach (@scandir($relative === '' ? $root : $root.'/'.$relative) ?: [] as $name) {
+                if ($name === '.' || $name === '..') {
+                    continue;
+                }
+                $path = $relative === '' ? $name : $relative.'/'.$name;
+                if (is_dir($root.'/'.$path) && ! is_link($root.'/'.$path)) {
+                    if (! isset($ancestors[$path])) {
+                        $empty[] = $path;
+                    }
+                    $walk($path);
+                }
+            }
+        };
+        $walk('');
+        sort($empty, SORT_STRING);
+
+        return $empty;
     }
 
     /**
@@ -2162,12 +2265,16 @@ slipstream-release.php — artifact releases without the framework
                   Verifies, unpacks, writes RELEASE_SHA and .slipstream/. Prints files=N.
                   On a refusal, removes what it unpacked.
 
-  verify-tree     --release=<dir> --keys=… --environment=… [--shared=a,b] [--links=public/storage,…]
-                  [--state-dir=<dir>] [--json]
+  verify-tree     --release=<dir> --keys=… --environment=… --state-dir=<dir> [--app-root=<dir>]
+                  [--shared=path[=shared/path],…] [--links=path=target,…] [--json]
                   The live release against its signed manifest and the cache hashes recorded at
                   deploy, from outside it: run it as root from a copy the deploy user cannot
-                  write, with keys from a root-owned file. --links names the paths that may be
-                  links into the release's storage (default public/storage). Exit 0 clean, 1 drift.
+                  write, with keys from a root-owned file, and with --state-dir, which pins
+                  what it first saw (without it the in-tree record is only as safe as the tree).
+                  Every link the deploy makes must lead exactly where it points them under the
+                  app root (default: the directory holding releases/): storage, the .env,
+                  auth.json, the shared paths given a target, public/storage to
+                  storage/app/public, and each --links pair. Exit 0 clean, 1 drift, 2 usage.
 
   publish         --archive=<file> --manifest=<build manifest> --ref=… --environment=…
                   --sha=<40 hex> (default GITHUB_SHA) --keys=<the nodes' keys>
@@ -2534,15 +2641,16 @@ function slipstream_release_point(array $options, string $sha, string $manifestS
  * each release's manifest and recorded hashes are pinned the first time it
  * is seen, so rewriting the copies inside the tree is caught too.
  *
- * @param  list<string>  $shared
- * @param  list<string>  $storageLinks
+ * @param  array<string, string|null>  $shared  release path => shared path under the app root (null: not checked)
+ * @param  array<string, string>  $storageLinks  release path => target under the app root
  * @return array<string, mixed>
  */
-function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir, array $storageLinks = Manifest::STORAGE_LINKS): array
+function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir, array $storageLinks = Manifest::STORAGE_LINKS, ?string $appRoot = null): array
 {
     $result = [
         'release' => $release, 'sha' => null, 'ok' => false, 'reason' => null, 'files' => 0,
         'modified' => [], 'missing' => [], 'unlisted' => [], 'links' => [], 'generated' => [], 'baseline' => 'none',
+        'app_root' => $appRoot, 'pinned' => $stateDir !== null,
     ];
     $sidecar = $release.'/.slipstream';
 
@@ -2575,7 +2683,20 @@ function slipstream_release_verify_tree(string $release, Keys $keys, string $env
         default => null,
     };
 
-    $tree = $manifest->verifyTree($release, array_merge(Manifest::NODE_LINKED, $shared), array_merge(Manifest::NODE_WRITTEN, $manifest->generated), $storageLinks);
+    // Every link the deploy makes leads exactly where it points it, under
+    // the app root; without one, only the storage links can be checked (they
+    // resolve through the release's own storage link).
+    if ($appRoot !== null) {
+        $linked = ['storage', ...array_keys($shared)];
+        $targets = Manifest::linkTargets($appRoot, $storageLinks, $shared);
+    } else {
+        $linked = [...Manifest::NODE_LINKED, ...array_keys($shared)];
+        $targets = [];
+        foreach ($storageLinks as $path => $target) {
+            $targets[$path] = $release.'/'.trim($target, '/');
+        }
+    }
+    $tree = $manifest->verifyTree($release, $linked, array_merge(Manifest::NODE_WRITTEN, $manifest->generated), $targets);
     foreach (['modified', 'missing', 'unlisted', 'links'] as $kind) {
         $result[$kind] = $tree[$kind];
     }
@@ -2747,13 +2868,49 @@ try {
             if ($real === false || ! is_dir($real)) {
                 slipstream_release_fail("no release at {$release}");
             }
+            $real = str_replace('\\', '/', $real);
+            $appRoot = slipstream_release_option($options, 'app-root');
+            if ($appRoot === null && basename(dirname($real)) === 'releases') {
+                $appRoot = dirname($real, 2);
+            }
+            // path[=target] pairs: the path in the release, the target under
+            // the app root. A --links path needs its target (public/storage
+            // has a default); a --shared path without one may link anywhere.
+            $pairs = function (string $name, array $defaults) use ($options): array {
+                $map = [];
+                foreach (slipstream_release_list($options, $name, []) as $item) {
+                    [$path, $target] = array_pad(explode('=', str_replace('\\', '/', $item), 2), 2, null);
+                    $path = trim($path, '/');
+                    $target ??= $defaults[$path] ?? null;
+                    if ($path === '' || ($target === null && $name === 'links')) {
+                        slipstream_release_fail("--{$name} takes path=target, the target relative to the app root (e.g. --links=public/media=storage/app/media)", 2);
+                    }
+                    if ($target !== null && (trim($target, '/') === '' || preg_match('#^(?:/|[A-Za-z]:)#', $target) === 1 || in_array('..', explode('/', $target), true))) {
+                        slipstream_release_fail("--{$name}: the target for {$path} must be a path relative to the app root", 2);
+                    }
+                    $map[$path] = $target === null ? null : trim($target, '/');
+                }
+
+                return $map;
+            };
+            $storageLinks = $pairs('links', Manifest::STORAGE_LINKS) + Manifest::STORAGE_LINKS;
+            $shared = $pairs('shared', []);
+            $stateDir = slipstream_release_option($options, 'state-dir');
+            if ($stateDir === null) {
+                fwrite(STDERR, "slipstream-release: without --state-dir the cache record inside the release is only as safe as the release; for the 11.5.2 check pin it, e.g. --state-dir=/var/lib/slipstream-verify\n");
+            }
+            if ($appRoot === null) {
+                fwrite(STDERR, "slipstream-release: no app root (pass --app-root): where storage, the .env, auth.json and the shared paths link to is not checked\n");
+            }
+
             $result = slipstream_release_verify_tree(
-                str_replace('\\', '/', $real),
+                $real,
                 Keys::parse(slipstream_release_need($options, 'keys')),
                 slipstream_release_need($options, 'environment'),
-                slipstream_release_list($options, 'shared', []),
-                slipstream_release_option($options, 'state-dir'),
-                slipstream_release_list($options, 'links', Manifest::STORAGE_LINKS),
+                $shared,
+                $stateDir,
+                $storageLinks,
+                $appRoot,
             );
 
             if (isset($options['json'])) {

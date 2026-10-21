@@ -1264,8 +1264,10 @@ The build job is the untrusted side, so `publish` takes nothing on its word:
 - the manifest it signs is rebuilt from the archive's own bytes, and the paths a node may
   write are publish's own (`--generated`, defaulting to `bootstrap/cache`), never the build's;
 - the archive is read with the node's reader and limits, and refused if it carries anything
-  `package` would have left out or refused, or what the node writes itself
-  (`bootstrap/cache/*.php` included); `--allow` lets a path through on purpose;
+  `package` would have left out or refused, what the node writes itself
+  (`bootstrap/cache/*.php` included), or a directory no file is in (every node would refuse
+  it, and the commit's write-once slot would be spent); `--allow` lets a path through on
+  purpose;
 - both signatures are checked under the nodes' keys (`--keys`) before anything uploads, so a
   KMS alias pointing at a key no node trusts is found in CI, not by every node refusing;
 - releases are **write-once**: the same bytes again (a re-run of the publish job) are
@@ -1391,13 +1393,18 @@ release's inventory of components.
 ### Verifying the live release
 
 Both checks compare the release with its signed manifest: the statement under trusted keys,
-every file the manifest lists re-hashed, nothing added, symlinks only where the node makes
-them (`storage`, the `.env` and `auth.json`, the shared paths, and `public/storage` only into
-the shared storage), and the generated caches (`bootstrap/cache/*.php`) against the hashes the
-deploy recorded just before the swap. Paths the signed manifest marks as node-written excuse
-only regular files it does not list, and never anything under `public/hot` or
-`public/storage`. In artifact mode a release without a usable manifest is drift, not "nothing
-to verify": deleting it must not silence the check. So is a lost record of the cache hashes:
+every file the manifest lists re-hashed, nothing added, and the generated caches
+(`bootstrap/cache/*.php`) against the hashes the deploy recorded just before the swap. A
+symlink is allowed only where the deploy makes one, and only leading exactly where it points
+it: `storage` to the app root's shared `storage`, `public/storage` to `storage/app/public`
+(and each `filesystems.links` entry to its target), the `.env` and `auth.json` to the shared
+copies, each shared path to its shared directory. A storage link aimed at `storage/logs`, or
+at the app root, would serve logs, sessions or the `.env` over HTTP; a regular `.env` file in
+place of the link is configuration nobody deployed. All of it is drift. Paths the signed
+manifest marks as node-written excuse only regular files it does not list, and never
+anything under `public/hot` or `public/storage`. In artifact mode a release without a usable
+manifest is drift, not "nothing to verify": deleting it must not silence the check. So is a
+lost record of the cache hashes:
 `slipstream:verify` compares the record with the hash the deploy wrote on its deployment row,
 and `verify-tree` counts a missing record as drift (every deploy since 0.6.1 writes one).
 
@@ -1417,7 +1424,7 @@ Description=Check the live release against its signed manifest
 Type=oneshot
 ExecStart=/usr/bin/php /opt/slipstream/slipstream-release.php verify-tree \
     --release=/var/www/app/current --environment=production \
-    --keys=file:/etc/slipstream/release-keys --shared=public/uploads \
+    --keys=file:/etc/slipstream/release-keys --shared=public/uploads=shared/uploads \
     --state-dir=/var/lib/slipstream-verify --json
 
 # /etc/systemd/system/slipstream-verify.timer
@@ -1431,13 +1438,22 @@ WantedBy=timers.target
 
 It prints one line per run (`artifact.verify_ok` or `artifact.verify_drift`, as JSON with
 `--json`) to the journal; ship it with the rest of the logs and alarm on `verify_drift`, and
-on a day without a `verify_ok`. Exit 0 clean, 1 drift. `--shared` names the shared paths the
-deploy links (they are not in the shared `.env`, and the release's own config is the build's
-word); `--links` names the paths that may be links into the release's storage, when
-`filesystems.links` adds any to `public/storage`. `--state-dir` pins each release's manifest
-hash and recorded cache hashes the first
-time it sees it, so rewriting the copies inside the tree is caught too; running it hourly
-keeps the window before the first look short.
+on a day without a `verify_ok`. Exit 0 clean, 1 drift, 2 on a usage error.
+
+- **`--state-dir` is what makes the root-run check hold.** It pins each release's manifest
+  hash and recorded cache hashes the first time it sees it; without it the record of the
+  caches inside the release is only as safe as the release (the in-app check compares it
+  with the deployment row, which the pool user can write too), and the tool says so on
+  stderr. Running it hourly keeps the window before the first look short.
+- `--shared` names the shared paths the deploy links, each with its shared directory under
+  the app root (`public/uploads=shared/uploads`): they are not in the shared `.env`, and the
+  release's own config is the build's word. A path given without a target is allowed to link
+  anywhere.
+- The app root is the directory that holds `releases/`, found from where `--release` really
+  leads (`/var/www/app/current` to `/var/www/app/releases/<dir>`); `--app-root` overrides it.
+  Without one, where `storage`, the `.env`, `auth.json` and the shared paths lead is not
+  checked, and the tool says so. When `filesystems.links` makes more storage links than
+  `public/storage`, name each with its target: `--links=public/media=storage/app/media`.
 
 The in-app check stays for convenience, and `slipstream:doctor` runs it (**live release**):
 
@@ -1507,10 +1523,13 @@ mark is the accepted signed pointer itself, kept in the node's settings
 replaced with an older copy is refused by every node that saw the newer one. The mark is
 verified whenever it is read: only a pointer the release key signed, for this ref and
 environment, can raise it. Anything else stored there — a number written by hand, just under
-a day ahead or far beyond, or a mark from 0.6.0 or 0.6.1 — counts for nothing and is audited
-once (`slipstream.artifact.mark_ignored`), so no write to the shared store or the node's
-database can stop the fleet deploying. Refusals are audited once per change, not once a
-minute.
+a day ahead or far beyond — counts for nothing and is audited once
+(`slipstream.artifact.mark_ignored`), so no write to the shared store can stop the fleet
+deploying. One exception covers the upgrade: the bare mark 0.6.0 or 0.6.1 kept in the node's
+own database, if it is already in the past, is a floor until the next accepted pointer
+replaces it. Every acceptance re-checks both copies and writes back one that is missing,
+garbled or unsigned, so a wiped shared mark is restored within a minute and fresh nodes keep
+their floor. Refusals are audited once per change, not once a minute.
 
 What remains: a fresh instance has no mark, and accepts whatever signed pointer the store
 holds — and the stub runs that release's artisan before the app-level mark is consulted. So
@@ -1540,6 +1559,25 @@ statement verifies only while its key is listed, and `slipstream:verify` says so
   in place of `ls-remote`; `slipstream:provision` does not look for build tools.
 
 ## Upgrading
+
+### To 0.6.3
+
+Small follow-ups from a third review of artifact mode; git mode is unchanged.
+
+- **Links are held to their exact targets.** Both verifiers now require `storage` to link to
+  the app root's shared `storage`, `public/storage` to `storage/app/public`, the `.env` and
+  `auth.json` to the shared copies, and each shared path to its shared directory; a regular
+  `.env` in the release is drift. For `verify-tree`, give `--shared` its targets
+  (`--shared=public/uploads=shared/uploads`); the app root is found from `releases/<dir>`, or
+  pass `--app-root`. `--links` now takes `path=target` pairs and adds to `public/storage`;
+  any other name without a target exits 2.
+- **`verify-tree` without `--state-dir`** now says on stderr that the cache record is only as
+  safe as the release. Keep `--state-dir` in the timer.
+- **Upgrade window closed:** the bare mark 0.6.0 or 0.6.1 kept in the node's own database is
+  a floor again until the next accepted pointer replaces it. Every acceptance now restores a
+  missing or garbled shared mark.
+- **Publish refuses an archive with a directory no file is in**, which every node refuses.
+- Copy the new `slipstream-release.php` into the image and the repository. No migration.
 
 ### To 0.6.2
 

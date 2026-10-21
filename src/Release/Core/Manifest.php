@@ -22,8 +22,11 @@ final class Manifest
      */
     public const DEFAULT_GENERATED = ['bootstrap/cache'];
 
-    /** Paths that may be symlinks, but only into the release's shared storage. */
-    public const STORAGE_LINKS = ['public/storage'];
+    /**
+     * The links `storage:link` makes, each to exactly its target (relative
+     * to the app root, whose storage the release's storage links to).
+     */
+    public const STORAGE_LINKS = ['public/storage' => 'storage/app/public'];
 
     /**
      * Never excused, whatever a manifest's generated list says — releases
@@ -198,21 +201,24 @@ final class Manifest
     /**
      * Compare a tree on disk with the manifest. Symlinks are never followed.
      *
-     * Paths under $linked are what the deploy replaces with links to shared
-     * copies (storage, the .env, the shared paths): skipped entirely. Every
-     * other file the manifest lists is always checked, wherever it is. Paths
-     * under $generated only excuse regular files the manifest does not list —
-     * the ones the node writes itself (bootstrap/cache) — so no ignore list
-     * can hide a change to a file CI signed. A symlink is drift anywhere else,
-     * unless it is one of $storageLinks and resolves into the release's own
-     * (shared) storage, as `storage:link` makes public/storage.
+     * Every file the manifest lists is checked, wherever it is. Paths under
+     * $generated only excuse regular files the manifest does not list — the
+     * ones the node writes itself (bootstrap/cache) — so no ignore list can
+     * hide a change to a file CI signed.
      *
-     * @param  list<string>  $linked  path prefixes
+     * A symlink is drift unless it is one the node makes: a path in
+     * $linkTargets, whose link must resolve to exactly the target given there
+     * (storage to the shared storage, public/storage to storage/app/public,
+     * the .env to the shared .env), or one under $linked when no target is
+     * known (null). A real directory under $linked — a release not linked
+     * yet — is skipped; anywhere else what is in it is checked like any file.
+     *
+     * @param  list<string>  $linked  path prefixes the deploy replaces with links
      * @param  list<string>  $generated  path prefixes
-     * @param  list<string>  $storageLinks  exact paths
+     * @param  array<string, string|null>  $linkTargets  path => the absolute path a link there must resolve to
      * @return array{modified: list<string>, missing: list<string>, unlisted: list<string>, links: list<string>}
      */
-    public function verifyTree(string $root, array $linked = [], array $generated = [], array $storageLinks = []): array
+    public function verifyTree(string $root, array $linked = [], array $generated = [], array $linkTargets = []): array
     {
         $isLinked = fn (string $path): bool => self::under($path, $linked);
         $isGenerated = fn (string $path): bool => self::under($path, $generated) && ! self::under($path, self::NEVER_GENERATED);
@@ -247,18 +253,64 @@ final class Manifest
         }
         sort($unlisted, SORT_STRING);
 
-        $storage = realpath($root.'/storage');
-        $links = array_values(array_filter($links, function (string $path) use ($root, $storageLinks, $storage): bool {
-            if ($storage === false || ! in_array($path, array_map(fn ($p) => trim(str_replace('\\', '/', (string) $p), '/'), $storageLinks), true)) {
-                return true;
+        $targets = [];
+        foreach ($linkTargets as $path => $target) {
+            $targets[trim(str_replace('\\', '/', (string) $path), '/')] = $target;
+        }
+        $links = array_values(array_filter($links, function (string $path) use ($root, $targets, $isLinked): bool {
+            if (array_key_exists($path, $targets)) {
+                return $targets[$path] !== null && ! self::resolvesTo($root.'/'.$path, $targets[$path]);
             }
-            $target = realpath($root.'/'.$path);
 
-            return $target === false
-                || ($target !== $storage && ! str_starts_with($target, rtrim($storage, '/\\').DIRECTORY_SEPARATOR));
+            return ! $isLinked($path);
         }));
 
         return ['modified' => $modified, 'missing' => $missing, 'unlisted' => $unlisted, 'links' => $links];
+    }
+
+    /**
+     * Whether a link resolves to exactly the given path.
+     */
+    public static function resolvesTo(string $link, string $target): bool
+    {
+        $actual = realpath($link);
+        if ($actual === false) {
+            return false;
+        }
+        $expected = realpath($target) ?: $target;
+        $normalize = fn (string $path) => rtrim(str_replace('\\', '/', $path), '/');
+
+        return DIRECTORY_SEPARATOR === '\\'
+            ? strcasecmp($normalize($actual), $normalize($expected)) === 0
+            : $normalize($actual) === $normalize($expected);
+    }
+
+    /**
+     * Where each link the deploy makes must lead, for an app root: storage to
+     * the shared storage, public/storage (and any other storage link) into
+     * it exactly, the .env and auth.json to the shared copies, each shared
+     * path to its shared directory.
+     *
+     * @param  array<string, string>  $storageLinks  release path => target relative to the app root
+     * @param  array<string, string|null>  $sharedPaths  release path => shared path relative to the app root (null: not known)
+     * @return array<string, string|null>
+     */
+    public static function linkTargets(string $appRoot, array $storageLinks = ['public/storage' => 'storage/app/public'], array $sharedPaths = []): array
+    {
+        $appRoot = rtrim(str_replace('\\', '/', $appRoot), '/');
+        $targets = [
+            'storage' => $appRoot.'/storage',
+            '.env' => $appRoot.'/.env',
+            'auth.json' => $appRoot.'/auth.json',
+        ];
+        foreach ($storageLinks as $path => $target) {
+            $targets[trim((string) $path, '/')] = $appRoot.'/'.trim($target, '/');
+        }
+        foreach ($sharedPaths as $path => $shared) {
+            $targets[trim((string) $path, '/')] = $shared === null ? null : $appRoot.'/'.trim(str_replace('\\', '/', $shared), '/');
+        }
+
+        return $targets;
     }
 
     /**
@@ -294,13 +346,18 @@ final class Manifest
                 continue;
             }
             $path = $relative === '' ? $name : $relative.'/'.$name;
+            $absolute = $root.'/'.$path;
+            // A link is always looked at, where the node makes one too: the
+            // target is what matters.
+            if (is_link($absolute)) {
+                $links[] = $path;
+
+                continue;
+            }
             if ($ignored($path)) {
                 continue;
             }
-            $absolute = $root.'/'.$path;
-            if (is_link($absolute)) {
-                $links[] = $path;
-            } elseif (is_dir($absolute)) {
+            if (is_dir($absolute)) {
                 $this->walk($root, $path, $ignored, $found, $links);
             } elseif (is_file($absolute)) {
                 $found[$path] = (int) filesize($absolute);

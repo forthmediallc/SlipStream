@@ -332,6 +332,87 @@ class ReleaseStubTest extends TestCase
         $this->assertSame($before, (string) file_get_contents($s3.'/app-releases/production/refs/heads/production.json'));
     }
 
+    public function test_verify_tree_holds_every_link_to_its_exact_target_under_the_app_root(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('needs symlinks (run under WSL).');
+        }
+
+        $root = $this->fixture->appRoot;
+        $release = $this->fixture->unpackInto($root.'/releases/five'); // app root: two levels up
+        mkdir($root.'/storage/app/public', 0777, true);
+        mkdir($root.'/shared/uploads', 0777, true);
+        $this->removeTree($release.'/storage');
+        symlink($root.'/storage', $release.'/storage');
+        symlink($root.'/.env', $release.'/.env');
+        symlink($release.'/storage/app/public', $release.'/public/storage');
+        symlink($root.'/shared/uploads', $release.'/public/uploads');
+        $tree = fn (array $extra = []) => $this->tool('verify-tree', $extra + ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production', '--state-dir' => $this->fixture->root.'/state', '--shared' => 'public/uploads=shared/uploads']);
+
+        $process = $tree();
+        $this->assertSame(0, $process->getExitCode(), $process->getOutput().$process->getErrorOutput());
+        $this->assertStringNotContainsString('without --state-dir', $process->getErrorOutput());
+
+        foreach ([['.env', $root.'/storage'], ['public/uploads', $root], ['storage', $root]] as [$path, $target]) {
+            $original = readlink($release.'/'.$path);
+            unlink($release.'/'.$path);
+            symlink($target, $release.'/'.$path);
+
+            $process = $tree();
+            $this->assertSame(1, $process->getExitCode(), "{$path} pointed at {$target}");
+            $this->assertStringContainsString($path, $process->getOutput());
+
+            unlink($release.'/'.$path);
+            symlink($original, $release.'/'.$path);
+        }
+
+        // --links names more storage links; public/storage is still held.
+        mkdir($root.'/storage/app/media', 0777, true);
+        symlink($release.'/storage/app/media', $release.'/public/media');
+        $this->assertSame(1, $tree()->getExitCode(), 'public/media is drift until it is named');
+        $process = $tree(['--links' => 'public/media=storage/app/media']);
+        $this->assertSame(0, $process->getExitCode(), $process->getOutput().$process->getErrorOutput());
+        mkdir($root.'/storage/logs', 0777, true);
+        unlink($release.'/public/storage');
+        symlink($root.'/storage/logs', $release.'/public/storage');
+        $process = $tree(['--links' => 'public/media=storage/app/media']);
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('symlinks (1): public/storage', $process->getOutput());
+        unlink($release.'/public/storage');
+        symlink($release.'/storage/app/public', $release.'/public/storage');
+
+        // An explicit --app-root that is not where the links lead: all drift.
+        $process = $tree(['--app-root' => $this->fixture->root.'/other']);
+        $this->assertSame(1, $process->getExitCode());
+    }
+
+    public function test_verify_tree_says_when_it_runs_without_a_state_directory(): void
+    {
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/six');
+
+        $process = $this->tool('verify-tree', ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production']);
+
+        $this->assertStringContainsString('without --state-dir the cache record inside the release is only as safe as the release', $process->getErrorOutput());
+    }
+
+    public function test_verify_tree_refuses_link_targets_it_cannot_hold_a_link_to(): void
+    {
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/seven');
+        $arguments = ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production', '--state-dir' => $this->fixture->root.'/state'];
+
+        // A storage link with no target would turn a correct link into
+        // drift, and a target outside the app root can never be met.
+        foreach ([['--links' => 'public/media'], ['--links' => 'public/media=/srv/media'], ['--shared' => 'public/uploads=../uploads'], ['--shared' => 'public/uploads=']] as $bad) {
+            $process = $this->tool('verify-tree', $bad + $arguments);
+            $this->assertSame(2, $process->getExitCode(), (string) json_encode($bad));
+            $this->assertStringContainsString('relative to the app root', $process->getErrorOutput());
+        }
+
+        // public/storage has a known target, so its name alone still works.
+        $process = $this->tool('verify-tree', ['--links' => 'public/storage'] + $arguments);
+        $this->assertSame(0, $process->getExitCode(), $process->getOutput().$process->getErrorOutput());
+    }
+
     public function test_usage_and_missing_options_exit_2(): void
     {
         $this->assertSame(2, $this->tool('frobnicate', [])->getExitCode());

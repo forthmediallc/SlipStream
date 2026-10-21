@@ -70,12 +70,58 @@ final class ReleaseBuilder
                 }
             }
             $problems = $inspection['problems'];
+            // Nodes refuse a directory no listed file is in; signed, the
+            // commit's write-once slot would be spent on a release no node takes.
+            foreach (self::directoriesWithoutFiles($root, array_map('strval', array_keys($files))) as $directory) {
+                $problems[] = "{$directory}/ is a directory no file is in";
+            }
             if ($problems !== []) {
                 throw new \RuntimeException('Refusing to publish: '.implode('; ', array_slice($problems, 0, 10))
                     .(count($problems) > 10 ? '; and '.(count($problems) - 10).' more' : '')
                     .'. Leave them out of the build (or name a path that may carry a key with --allow).');
             }
         };
+    }
+
+    /**
+     * The directories an unpacked archive created that hold none of its
+     * files, at any depth.
+     *
+     * @param  list<string>  $files
+     * @return list<string>
+     */
+    public static function directoriesWithoutFiles(string $root, array $files): array
+    {
+        $ancestors = [];
+        foreach ($files as $file) {
+            $parts = explode('/', $file);
+            array_pop($parts);
+            $walked = '';
+            foreach ($parts as $part) {
+                $walked = $walked === '' ? $part : $walked.'/'.$part;
+                $ancestors[$walked] = true;
+            }
+        }
+
+        $empty = [];
+        $walk = function (string $relative) use (&$walk, &$empty, $root, $ancestors): void {
+            foreach (@scandir($relative === '' ? $root : $root.'/'.$relative) ?: [] as $name) {
+                if ($name === '.' || $name === '..') {
+                    continue;
+                }
+                $path = $relative === '' ? $name : $relative.'/'.$name;
+                if (is_dir($root.'/'.$path) && ! is_link($root.'/'.$path)) {
+                    if (! isset($ancestors[$path])) {
+                        $empty[] = $path;
+                    }
+                    $walk($path);
+                }
+            }
+        };
+        $walk('');
+        sort($empty, SORT_STRING);
+
+        return $empty;
     }
 
     /**

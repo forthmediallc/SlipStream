@@ -91,8 +91,10 @@ class ArtifactSource implements ReleaseHistory, ReleaseSource
         if ($accept) {
             $this->sequence->forgetRefusal($ref);
         }
-        if ($accept && ($pointer->sequence > $highWater || $mark['manifest'] === null)) {
-            // The signed pointer itself is the mark: nothing else can raise it.
+        if ($accept) {
+            // The signed pointer itself is the mark: nothing else can raise
+            // it. Every acceptance re-checks both copies, so a wiped or
+            // garbled one is written again and fresh nodes keep their floor.
             $this->sequence->advance($ref, $pointer, $envelope, $keys, $environment);
         }
         if ($accept && $pointer->sequence > $highWater) {

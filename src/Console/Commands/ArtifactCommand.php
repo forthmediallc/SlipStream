@@ -30,7 +30,7 @@ class ArtifactCommand extends Command
                             {dir=dist : The dist directory: package writes it, sign and publish read it}
                             {--checkout= : package: the checkout to build (default: the current directory)}
                             {--sha= : The commit. package: default git rev-parse HEAD; publish and sign: required, default GITHUB_SHA, and the build must agree; publish --rollback: the release to point at}
-                            {--generated= : publish, sign: paths a node writes itself, comma-separated (default bootstrap/cache,public/storage,public/hot)}
+                            {--generated= : publish, sign: paths a node writes itself, comma-separated (default bootstrap/cache)}
                             {--allow= : publish, sign: paths outside vendor/ allowed to carry key material, comma-separated}
                             {--keys= : publish, sign: the nodes\' public keys, to check they will accept what is signed (default: SLIPSTREAM_RELEASE_PUBLIC_KEYS)}
                             {--ref= : The ref CI publishes to, e.g. refs/heads/production (package: default GITHUB_REF or the checked-out branch; publish and sign: required, default GITHUB_REF, and the build must agree)}

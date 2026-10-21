@@ -240,6 +240,31 @@ class ArtifactPublishTest extends TestCase
         $this->assertTrue(Storage::disk('artifacts')->exists('app/refs/heads/production.json'));
     }
 
+    /**
+     * Nodes refuse a directory no listed file is in. Signed, the release
+     * would spend the commit's write-once slot on something no node takes.
+     */
+    public function test_publish_refuses_an_archive_with_a_directory_no_file_is_in(): void
+    {
+        $file = "<?php\n";
+        $tar = '';
+        foreach ([['app', '5', ''], ['app/plugins', '5', ''], ['app/Hello.php', '0', $file]] as [$name, $type, $data]) {
+            $header = str_pad($name, 100, "\0").sprintf("%07o\0%07o\0%07o\0%011o\0%011o\0", 0644, 0, 0, strlen($data), 0)
+                .'        '.$type.str_repeat("\0", 100)."ustar\x0000".str_repeat("\0", 64).sprintf("%07o\0%07o\0", 0, 0).str_repeat("\0", 167);
+            $sum = array_sum(array_map('ord', str_split($header)));
+            $tar .= substr_replace($header, sprintf("%06o\0 ", $sum), 148, 8).$data.str_repeat("\0", (512 - strlen($data) % 512) % 512);
+        }
+        file_put_contents($this->fixture->dist.'/release.tar.gz', gzencode($tar.str_repeat("\0", 1024)));
+
+        try {
+            $this->fixture->publish();
+            $this->fail('signed an archive every node would refuse');
+        } catch (RuntimeException $e) {
+            $this->assertStringContainsString('app/plugins/ is a directory no file is in', $e->getMessage());
+        }
+        $this->assertSame([], Storage::disk('artifacts')->allFiles(), 'the commit\'s slot is still free');
+    }
+
     public function test_publish_refuses_what_nodes_would_refuse_before_anything_uploads(): void
     {
         // Signed with a key the nodes do not hold.

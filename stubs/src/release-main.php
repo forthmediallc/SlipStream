@@ -32,12 +32,16 @@ slipstream-release.php — artifact releases without the framework
                   Verifies, unpacks, writes RELEASE_SHA and .slipstream/. Prints files=N.
                   On a refusal, removes what it unpacked.
 
-  verify-tree     --release=<dir> --keys=… --environment=… [--shared=a,b] [--links=public/storage,…]
-                  [--state-dir=<dir>] [--json]
+  verify-tree     --release=<dir> --keys=… --environment=… --state-dir=<dir> [--app-root=<dir>]
+                  [--shared=path[=shared/path],…] [--links=path=target,…] [--json]
                   The live release against its signed manifest and the cache hashes recorded at
                   deploy, from outside it: run it as root from a copy the deploy user cannot
-                  write, with keys from a root-owned file. --links names the paths that may be
-                  links into the release's storage (default public/storage). Exit 0 clean, 1 drift.
+                  write, with keys from a root-owned file, and with --state-dir, which pins
+                  what it first saw (without it the in-tree record is only as safe as the tree).
+                  Every link the deploy makes must lead exactly where it points them under the
+                  app root (default: the directory holding releases/): storage, the .env,
+                  auth.json, the shared paths given a target, public/storage to
+                  storage/app/public, and each --links pair. Exit 0 clean, 1 drift, 2 usage.
 
   publish         --archive=<file> --manifest=<build manifest> --ref=… --environment=…
                   --sha=<40 hex> (default GITHUB_SHA) --keys=<the nodes' keys>
@@ -404,15 +408,16 @@ function slipstream_release_point(array $options, string $sha, string $manifestS
  * each release's manifest and recorded hashes are pinned the first time it
  * is seen, so rewriting the copies inside the tree is caught too.
  *
- * @param  list<string>  $shared
- * @param  list<string>  $storageLinks
+ * @param  array<string, string|null>  $shared  release path => shared path under the app root (null: not checked)
+ * @param  array<string, string>  $storageLinks  release path => target under the app root
  * @return array<string, mixed>
  */
-function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir, array $storageLinks = Manifest::STORAGE_LINKS): array
+function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir, array $storageLinks = Manifest::STORAGE_LINKS, ?string $appRoot = null): array
 {
     $result = [
         'release' => $release, 'sha' => null, 'ok' => false, 'reason' => null, 'files' => 0,
         'modified' => [], 'missing' => [], 'unlisted' => [], 'links' => [], 'generated' => [], 'baseline' => 'none',
+        'app_root' => $appRoot, 'pinned' => $stateDir !== null,
     ];
     $sidecar = $release.'/.slipstream';
 
@@ -445,7 +450,20 @@ function slipstream_release_verify_tree(string $release, Keys $keys, string $env
         default => null,
     };
 
-    $tree = $manifest->verifyTree($release, array_merge(Manifest::NODE_LINKED, $shared), array_merge(Manifest::NODE_WRITTEN, $manifest->generated), $storageLinks);
+    // Every link the deploy makes leads exactly where it points it, under
+    // the app root; without one, only the storage links can be checked (they
+    // resolve through the release's own storage link).
+    if ($appRoot !== null) {
+        $linked = ['storage', ...array_keys($shared)];
+        $targets = Manifest::linkTargets($appRoot, $storageLinks, $shared);
+    } else {
+        $linked = [...Manifest::NODE_LINKED, ...array_keys($shared)];
+        $targets = [];
+        foreach ($storageLinks as $path => $target) {
+            $targets[$path] = $release.'/'.trim($target, '/');
+        }
+    }
+    $tree = $manifest->verifyTree($release, $linked, array_merge(Manifest::NODE_WRITTEN, $manifest->generated), $targets);
     foreach (['modified', 'missing', 'unlisted', 'links'] as $kind) {
         $result[$kind] = $tree[$kind];
     }
@@ -617,13 +635,49 @@ try {
             if ($real === false || ! is_dir($real)) {
                 slipstream_release_fail("no release at {$release}");
             }
+            $real = str_replace('\\', '/', $real);
+            $appRoot = slipstream_release_option($options, 'app-root');
+            if ($appRoot === null && basename(dirname($real)) === 'releases') {
+                $appRoot = dirname($real, 2);
+            }
+            // path[=target] pairs: the path in the release, the target under
+            // the app root. A --links path needs its target (public/storage
+            // has a default); a --shared path without one may link anywhere.
+            $pairs = function (string $name, array $defaults) use ($options): array {
+                $map = [];
+                foreach (slipstream_release_list($options, $name, []) as $item) {
+                    [$path, $target] = array_pad(explode('=', str_replace('\\', '/', $item), 2), 2, null);
+                    $path = trim($path, '/');
+                    $target ??= $defaults[$path] ?? null;
+                    if ($path === '' || ($target === null && $name === 'links')) {
+                        slipstream_release_fail("--{$name} takes path=target, the target relative to the app root (e.g. --links=public/media=storage/app/media)", 2);
+                    }
+                    if ($target !== null && (trim($target, '/') === '' || preg_match('#^(?:/|[A-Za-z]:)#', $target) === 1 || in_array('..', explode('/', $target), true))) {
+                        slipstream_release_fail("--{$name}: the target for {$path} must be a path relative to the app root", 2);
+                    }
+                    $map[$path] = $target === null ? null : trim($target, '/');
+                }
+
+                return $map;
+            };
+            $storageLinks = $pairs('links', Manifest::STORAGE_LINKS) + Manifest::STORAGE_LINKS;
+            $shared = $pairs('shared', []);
+            $stateDir = slipstream_release_option($options, 'state-dir');
+            if ($stateDir === null) {
+                fwrite(STDERR, "slipstream-release: without --state-dir the cache record inside the release is only as safe as the release; for the 11.5.2 check pin it, e.g. --state-dir=/var/lib/slipstream-verify\n");
+            }
+            if ($appRoot === null) {
+                fwrite(STDERR, "slipstream-release: no app root (pass --app-root): where storage, the .env, auth.json and the shared paths link to is not checked\n");
+            }
+
             $result = slipstream_release_verify_tree(
-                str_replace('\\', '/', $real),
+                $real,
                 Keys::parse(slipstream_release_need($options, 'keys')),
                 slipstream_release_need($options, 'environment'),
-                slipstream_release_list($options, 'shared', []),
-                slipstream_release_option($options, 'state-dir'),
-                slipstream_release_list($options, 'links', Manifest::STORAGE_LINKS),
+                $shared,
+                $stateDir,
+                $storageLinks,
+                $appRoot,
             );
 
             if (isset($options['json'])) {
