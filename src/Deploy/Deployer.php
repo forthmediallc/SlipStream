@@ -476,13 +476,16 @@ class Deployer
 
     /**
      * The hashes of what the node generated into the release (config,
-     * route and service caches), recorded just before it goes live.
+     * route and service caches, and the compiled views), recorded just
+     * before it goes live.
      */
     protected function recordBaseline(string $step): void
     {
         if (! Slipstream::artifactMode() || ! $this->releasePath) {
             return;
         }
+
+        $this->compileViews($step);
 
         $files = Baseline::record($this->releasePath);
         $sidecar = $this->releasePath.DIRECTORY_SEPARATOR.ArtifactFetcher::SIDECAR;
@@ -502,12 +505,36 @@ class Deployer
         $meta['artifact'] = array_merge((array) ($meta['artifact'] ?? []), ['baseline_sha256' => hash_file('sha256', $sidecar.DIRECTORY_SEPARATOR.Baseline::FILE)]);
         $this->deployment->update(['meta' => $meta]);
 
-        $this->log->info('Recorded the hashes of '.count($files).' generated file(s) in bootstrap/cache.', $step);
+        $views = array_filter($files, fn (string $path): bool => str_starts_with($path, Baseline::VIEWS.'/'), ARRAY_FILTER_USE_KEY);
+        $this->log->info('Recorded the hashes of '.count($files).' generated file(s) in bootstrap/cache, '.count($views).' of them compiled views.', $step);
         AuditLog::record('artifact.baseline', [
             'deployment' => $this->deployment->id,
             'sha' => $this->sha,
-            'files' => array_map(fn (array $entry) => $entry[0], $files),
+            // The caches by name; the views, often hundreds, by count and
+            // through the hash of the record that lists them.
+            'files' => array_map(fn (array $entry) => $entry[0], array_diff_key($files, $views)),
+            'views' => count($views),
+            'record_sha256' => $meta['artifact']['baseline_sha256'],
         ]);
+    }
+
+    /**
+     * Every view compiled into the release before the record is taken, by
+     * the paths Laravel renders them from, so none compiles after the swap,
+     * where it would be drift. A release whose Slipstream predates the
+     * command (a rollback to one) compiles its views into the shared
+     * storage, as it always did, and has none here to record.
+     */
+    protected function compileViews(string $step): void
+    {
+        if (! is_file($this->releasePath.'/vendor/slipstream/slipstream/src/Console/Commands/ViewsCommand.php')) {
+            $this->log->info('This release\'s Slipstream predates slipstream:views: its views compile into the shared storage, outside the checks.', $step);
+
+            return;
+        }
+
+        $this->log->info('Compiling every view into the release…', $step);
+        $this->shell($this->releasePath)->run([$this->php, 'artisan', 'slipstream:views'], $this->releasePath, $step, timeout: self::HOOK_TIMEOUT);
     }
 
     /**

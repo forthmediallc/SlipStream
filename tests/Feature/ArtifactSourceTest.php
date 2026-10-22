@@ -120,11 +120,11 @@ class ArtifactSourceTest extends TestCase
 
     /**
      * Upgrading must not open a window for an older pointer: the bare mark
-     * 0.6.0 or 0.6.1 kept in the node's own database is a floor until the
-     * next accepted pointer replaces it. The shared store's copy is not (any
-     * fleet member can write it).
+     * 0.6.0 or 0.6.1 kept in Slipstream's database is a floor until the next
+     * accepted pointer replaces it. The shared store's copy is not (anyone
+     * who can write the cache can put a number there).
      */
-    public function test_a_mark_from_before_0_6_2_in_the_nodes_own_database_is_a_floor_until_replaced(): void
+    public function test_a_mark_from_before_0_6_2_in_slipstreams_database_is_a_floor_until_replaced(): void
     {
         app(SettingsRepository::class)->set('artifact_sequence:branch:production', '1000:'.self::MANIFEST);
         $this->publish(['sequence' => 999, 'sha' => self::OLDER]);

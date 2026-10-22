@@ -288,6 +288,7 @@ Rollback is **code only** — it does not reverse database migrations. Prefer ex
 | `slipstream:artifact` | The CI side of [artifact releases](#artifact-releases-build-once-in-ci): `package` a checkout into `dist/`, `sign` it, `publish` it (or `--rollback --sha=` to repoint), `list` what the store holds, `keygen` a local key pair. `sign` and `publish` take the commit and ref from `--sha` and `--ref` (defaults `GITHUB_SHA`, `GITHUB_REF`) and `--generated`, `--allow`, `--keys` |
 | `slipstream:verify` | Compare a release (default: the live one) with its signed manifest and its recorded cache hashes; exit 1 on drift (in artifact mode a missing manifest is drift), 2 with nothing to compare in git mode (`--release=`, `--json`, `--audit`). Scheduled weekly in artifact mode; the standalone tool's `verify-tree` is the check to run from outside the release |
 | `slipstream:healthcheck` | Pre-swap checks (DB, Redis, custom); prints the release it ran in |
+| `slipstream:views` | Compile every view by the path Laravel renders it from, the error pages and the `/up` health page included. An artifact deploy runs it just before it records the hashes, so nothing compiles after the swap |
 | `slipstream:heartbeat` | Refresh this node in the fleet registry, publish its `.env` snapshot, apply any queued env push, fail deploys orphaned by a killed process, download due provider hook ranges; in poll mode, check the deploy ref and start a deploy when it moved (scheduled every minute) |
 | `slipstream:prune` | Trim old deploy events + webhook deliveries + terminal env pushes; fail stuck deploys/applies; forget long-silent servers when `SLIPSTREAM_FORGET_OFFLINE_AFTER_HOURS` is set (scheduled daily) |
 | `slipstream:relay` | Fan a stored relay payload out to peers (spawned detached; not run by hand) |
@@ -1159,9 +1160,10 @@ release (there is nothing to re-run, and the bytes are not trusted), the deploym
 failure after that — a hook, the health check — keeps the release as `.failed` for
 inspection, as always. A verified deploy audits `slipstream.artifact.verified` with the
 commit, the manifest hash, the archive hash, the file count and whether a pointer named it
-(`bound`). Just before the swap the deploy records the hashes of the caches the node
-generated (`bootstrap/cache/*.php`) in `.slipstream/generated.json` and audits them as
-`slipstream.artifact.baseline`.
+(`bound`). Just before the swap the deploy compiles every view into the release
+(`php artisan slipstream:views`), then records the hashes of everything the node generated
+under `bootstrap/cache`, the caches and the compiled views, in `.slipstream/generated.json`,
+and audits it as `slipstream.artifact.baseline`.
 
 **Every deploy is tied to the pointer that named it.** A poll or bootstrap deploy carries the
 pointer it started from and fetches exactly the manifest that pointer named, even if the
@@ -1264,10 +1266,10 @@ The build job is the untrusted side, so `publish` takes nothing on its word:
 - the manifest it signs is rebuilt from the archive's own bytes, and the paths a node may
   write are publish's own (`--generated`, defaulting to `bootstrap/cache`), never the build's;
 - the archive is read with the node's reader and limits, and refused if it carries anything
-  `package` would have left out or refused, what the node writes itself
-  (`bootstrap/cache/*.php` included), or a directory no file is in (every node would refuse
-  it, and the commit's write-once slot would be spent); `--allow` lets a path through on
-  purpose;
+  `package` would have left out or refused, what the node writes itself (any `.php` under
+  `bootstrap/cache`, compiled views included), or a directory no file is in (every node would
+  refuse it, and the commit's write-once slot would be spent); `--allow` lets a never-ship
+  name or a file with key material through on purpose, and nothing else;
 - both signatures are checked under the nodes' keys (`--keys`) before anything uploads, so a
   KMS alias pointing at a key no node trusts is found in CI, not by every node refusing;
 - releases are **write-once**: the same bytes again (a re-run of the publish job) are
@@ -1393,20 +1395,32 @@ release's inventory of components.
 ### Verifying the live release
 
 Both checks compare the release with its signed manifest: the statement under trusted keys,
-every file the manifest lists re-hashed, nothing added, and the generated caches
-(`bootstrap/cache/*.php`) against the hashes the deploy recorded just before the swap. A
-symlink is allowed only where the deploy makes one, and only leading exactly where it points
-it: `storage` to the app root's shared `storage`, `public/storage` to `storage/app/public`
-(and each `filesystems.links` entry to its target), the `.env` and `auth.json` to the shared
-copies, each shared path to its shared directory. A storage link aimed at `storage/logs`, or
-at the app root, would serve logs, sessions or the `.env` over HTTP; a regular `.env` file in
-place of the link is configuration nobody deployed. All of it is drift. Paths the signed
-manifest marks as node-written excuse only regular files it does not list, and never
-anything under `public/hot` or `public/storage`. In artifact mode a release without a usable
-manifest is drift, not "nothing to verify": deleting it must not silence the check. So is a
-lost record of the cache hashes:
-`slipstream:verify` compares the record with the hash the deploy wrote on its deployment row,
-and `verify-tree` counts a missing record as drift (every deploy since 0.6.1 writes one).
+every file the manifest lists re-hashed, nothing added, and what the node generated under
+`bootstrap/cache`, the caches and the compiled views, against the hashes the deploy recorded
+just before the swap. A symlink is allowed only where the deploy makes one, and only leading
+exactly where it points it: `storage` to the app root's shared `storage`, `public/storage` to
+`storage/app/public` (and each `filesystems.links` entry to its target), the `.env` and
+`auth.json` to the shared copies, each shared path to its shared directory. A storage link
+aimed at `storage/logs`, or at the app root, would serve logs, sessions or the `.env` over
+HTTP; a regular `.env` file in place of the link is configuration nobody deployed. All of it
+is drift. Paths the signed manifest marks as node-written excuse only regular files it does
+not list, and never anything under `public/hot` or `public/storage`. In artifact mode a
+release without a usable manifest is drift, not "nothing to verify": deleting it must not
+silence the check. So is a lost record of the cache hashes: `slipstream:verify` compares the
+record with the hash the deploy wrote on its deployment row, and `verify-tree` counts a
+missing record as drift (every deploy since 0.6.1 writes one).
+
+**Compiled views are code the app runs, so both checks cover them.** In artifact mode views
+compile into the release, under `bootstrap/cache/views`, not into the shared
+`storage/framework/views`, which neither check reads. Laravel's timestamp check on compiled
+views is off there: a release's files never change, and a second compile of a view is not
+byte-for-byte the first. Just before the swap the deploy runs `php artisan slipstream:views`,
+which compiles every view by the path Laravel renders it from, the framework's error pages and
+the `/up` health page included, and the record then covers them all. A compiled view that
+changes, goes missing or appears after that is drift. Two kinds still compile on first use,
+and each is reported once it does: markdown mail, whose HTML compiles apart from the view, and
+Blade rendered from a string (`Blade::render`, or a component whose `render()` returns a
+string). Keep them off hosts the check covers.
 
 **The PCI DSS 11.5.2 control is `verify-tree`, run from outside the release.** The release
 tree belongs to the deploy user, who is also the PHP-FPM pool user, and `slipstream:verify`
@@ -1423,7 +1437,7 @@ Description=Check the live release against its signed manifest
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/php /opt/slipstream/slipstream-release.php verify-tree \
-    --release=/var/www/app/current --environment=production \
+    --release=/var/www/app/current --app-root=/var/www/app --environment=production \
     --keys=file:/etc/slipstream/release-keys --shared=public/uploads=shared/uploads \
     --state-dir=/var/lib/slipstream-verify --json
 
@@ -1438,21 +1452,27 @@ WantedBy=timers.target
 
 It prints one line per run (`artifact.verify_ok` or `artifact.verify_drift`, as JSON with
 `--json`) to the journal; ship it with the rest of the logs and alarm on `verify_drift`, and
-on a day without a `verify_ok`. Exit 0 clean, 1 drift, 2 on a usage error.
+on a day without a `verify_ok`. Exit 0 clean, 1 drift, 2 on a usage error, which includes an
+option the command does not take: a misspelt one, or one newer than the installed copy.
 
-- **`--state-dir` is what makes the root-run check hold.** It pins each release's manifest
-  hash and recorded cache hashes the first time it sees it; without it the record of the
-  caches inside the release is only as safe as the release (the in-app check compares it
-  with the deployment row, which the pool user can write too), and the tool says so on
-  stderr. Running it hourly keeps the window before the first look short.
+- **`--state-dir` pins each release the first time the tool sees it**: its manifest hash and
+  the recorded hashes, so a rewrite of the record inside the tree is caught. Without it that
+  record is only as safe as the release (the in-app check compares it with the deployment
+  row, which the pool user can write too), and the tool says so on stderr.
+- **Alarm on a first look no deploy explains.** A pin is keyed by where the release is, so
+  the deploy user can move or copy a release and make the next run a first look, which pins
+  whatever is there then. Every line carries `first_look` (`true` the run a release is
+  pinned), and each deploy causes exactly one per node; any other is the release moving
+  under the check. Running hourly keeps the window before a first look short.
 - `--shared` names the shared paths the deploy links, each with its shared directory under
   the app root (`public/uploads=shared/uploads`): they are not in the shared `.env`, and the
   release's own config is the build's word. A path given without a target is allowed to link
   anywhere.
-- The app root is the directory that holds `releases/`, found from where `--release` really
-  leads (`/var/www/app/current` to `/var/www/app/releases/<dir>`); `--app-root` overrides it.
-  Without one, where `storage`, the `.env`, `auth.json` and the shared paths lead is not
-  checked, and the tool says so. When `filesystems.links` makes more storage links than
+- The app root is the directory that holds `current` and `releases/`. Pass it with
+  `--app-root`, or let the tool take it from `--release` as written (`/var/www/app/current`,
+  or `/var/www/app/releases/<dir>`), never through a link; with neither, it exits 2. The
+  release must be one of the app root's `releases/`, wherever `current` leads: a copy
+  elsewhere is drift. When `filesystems.links` makes more storage links than
   `public/storage`, name each with its target: `--links=public/media=storage/app/media`.
 
 The in-app check stays for convenience, and `slipstream:doctor` runs it (**live release**):
@@ -1525,11 +1545,14 @@ verified whenever it is read: only a pointer the release key signed, for this re
 environment, can raise it. Anything else stored there — a number written by hand, just under
 a day ahead or far beyond — counts for nothing and is audited once
 (`slipstream.artifact.mark_ignored`), so no write to the shared store can stop the fleet
-deploying. One exception covers the upgrade: the bare mark 0.6.0 or 0.6.1 kept in the node's
-own database, if it is already in the past, is a floor until the next accepted pointer
-replaces it. Every acceptance re-checks both copies and writes back one that is missing,
-garbled or unsigned, so a wiped shared mark is restored within a minute and fresh nodes keep
-their floor. Refusals are audited once per change, not once a minute.
+deploying. One exception covers the upgrade: the bare mark 0.6.0 or 0.6.1 kept in
+Slipstream's database (the node's own, or the fleet's when Slipstream's tables are shared), if
+it is already in the past, is a floor until the next accepted pointer replaces it; the cache
+cannot write there. Every acceptance re-checks both copies and writes back one that is
+missing, garbled or unsigned, so fresh nodes keep their floor. Only an acceptance does: while
+every node is refusing a replayed pointer, a shared mark wiped meanwhile stays wiped until the
+next publish, and a fresh instance in that window takes the replayed pointer (see below).
+Refusals are audited once per change, not once a minute.
 
 What remains: a fresh instance has no mark, and accepts whatever signed pointer the store
 holds — and the stub runs that release's artisan before the app-level mark is consulted. So
@@ -1560,6 +1583,29 @@ statement verifies only while its key is listed, and `slipstream:verify` says so
 
 ## Upgrading
 
+### To 0.6.4
+
+Follow-ups from a fourth review of artifact mode, for the PCI DSS 11.5.2 check; git mode is
+unchanged.
+
+- **Copy the new `slipstream-release.php` into the image first.** Deploys now write a new
+  format of `.slipstream/generated.json`, and an older copy of the tool reads it as
+  unreadable, which is drift.
+- **Compiled views are checked.** In artifact mode views compile into the release, under
+  `bootstrap/cache/views`, and the deploy compiles every one of them with
+  `php artisan slipstream:views` just before it records the hashes; both verifiers compare
+  them. A record from an earlier deploy is still compared over what it covered, so the first
+  0.6.4 release a node deploys has its views checked from the next deploy on. Markdown mail
+  and Blade rendered from strings compile on first use and are reported when they do.
+- **`verify-tree` fails closed.** It takes the app root from `--release` as written or from
+  `--app-root`, exits 2 when it cannot tell, and reports a release outside the app root's
+  `releases/` as drift. It exits 2 on any option the command does not take. Add
+  `--app-root` to the timer.
+- **`first_look`** on every `verify-tree` line is `true` the run a release is first pinned.
+  Each deploy causes exactly one per node: alarm on any other.
+- Publishing refuses compiled views and caches anywhere under `bootstrap/cache`, as
+  `package` already left them out. No migration.
+
 ### To 0.6.3
 
 Small follow-ups from a third review of artifact mode; git mode is unchanged.
@@ -1573,8 +1619,8 @@ Small follow-ups from a third review of artifact mode; git mode is unchanged.
   any other name without a target exits 2.
 - **`verify-tree` without `--state-dir`** now says on stderr that the cache record is only as
   safe as the release. Keep `--state-dir` in the timer.
-- **Upgrade window closed:** the bare mark 0.6.0 or 0.6.1 kept in the node's own database is
-  a floor again until the next accepted pointer replaces it. Every acceptance now restores a
+- **Upgrade window closed:** the bare mark 0.6.0 or 0.6.1 kept in Slipstream's database is a
+  floor again until the next accepted pointer replaces it. Every acceptance now restores a
   missing or garbled shared mark.
 - **Publish refuses an archive with a directory no file is in**, which every node refuses.
 - Copy the new `slipstream-release.php` into the image and the repository. No migration.

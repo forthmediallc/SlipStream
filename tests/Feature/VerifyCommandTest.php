@@ -231,6 +231,49 @@ class VerifyCommandTest extends TestCase
             ->assertExitCode(1);
     }
 
+    /**
+     * In artifact mode views compile into the release, and they are code
+     * the app runs: on a vault, the payment frame. One edited after the
+     * deploy, or one that appears, is drift.
+     */
+    public function test_a_compiled_view_changed_or_added_after_the_deploy_is_drift(): void
+    {
+        @mkdir($this->release.'/bootstrap/cache/views', 0777, true);
+        file_put_contents($this->release.'/bootstrap/cache/views/0a1b.php', '<form><?php echo e($title); ?></form>');
+        file_put_contents($this->release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($this->release)));
+        $this->artisan('slipstream:verify')->assertExitCode(0);
+
+        file_put_contents($this->release.'/bootstrap/cache/views/0a1b.php', '<form><?php echo e($title); ?></form><script src="https://skim.example/x.js"></script>');
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('bootstrap/cache/views/0a1b.php')
+            ->assertExitCode(1);
+
+        file_put_contents($this->release.'/bootstrap/cache/views/0a1b.php', '<form><?php echo e($title); ?></form>');
+        file_put_contents($this->release.'/bootstrap/cache/views/ffff.php', '<?php system($_GET["c"]);');
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('bootstrap/cache/views/ffff.php')
+            ->assertExitCode(1);
+    }
+
+    /**
+     * A record from before 0.6.4 covers what it covered: the first release a
+     * 0.6.3 deploy puts in place compiles its views where that record never
+     * looked, and that is no drift.
+     */
+    public function test_a_record_from_before_0_6_4_is_held_to_the_caches_alone(): void
+    {
+        @mkdir($this->release.'/bootstrap/cache/views', 0777, true);
+        file_put_contents($this->release.'/bootstrap/cache/config.php', '<?php return [];');
+        file_put_contents($this->release.'/bootstrap/cache/views/0a1b.php', '<form></form>');
+        file_put_contents($this->release.'/.slipstream/generated.json', (string) json_encode(['format' => 1, 'files' => Baseline::record($this->release, 1)]));
+        $this->artisan('slipstream:verify')->assertExitCode(0);
+
+        file_put_contents($this->release.'/bootstrap/cache/config.php', '<?php system($_GET["c"]); return [];');
+        $this->artisan('slipstream:verify')
+            ->expectsOutputToContain('bootstrap/cache/config.php')
+            ->assertExitCode(1);
+    }
+
     public function test_a_planted_vite_hot_file_or_php_under_public_storage_is_drift(): void
     {
         // Vite loads every script from the URL in public/hot.

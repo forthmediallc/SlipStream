@@ -226,8 +226,9 @@ class Packager
             if (str_starts_with($path, 'storage/') && $name !== '.gitignore') {
                 continue;
             }
-            // bootstrap/cache/*.php is what the node generates (config,
-            // routes, packages); it must never ship.
+            // Every .php under bootstrap/cache is the node's: the caches
+            // (config, routes, packages) and the compiled views below them.
+            // It must never ship.
             if (str_starts_with($path, 'bootstrap/cache/') && str_ends_with($name, '.php')) {
                 continue;
             }

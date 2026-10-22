@@ -63,7 +63,8 @@ final class ReleaseRules
     }
 
     /**
-     * What the deploy writes into every release itself. Shipped, it would be
+     * What the deploy writes into every release itself: the sidecar, and the
+     * caches and compiled views under bootstrap/cache. Shipped, it would be
      * overwritten on the node and then reported as modified forever.
      */
     public static function nodeWritten(string $path): bool
@@ -72,7 +73,7 @@ final class ReleaseRules
 
         return $path === 'RELEASE_SHA'
             || $path === '.slipstream' || str_starts_with($path, '.slipstream/')
-            || (str_starts_with($path, 'bootstrap/cache/') && substr_count($path, '/') === 2 && str_ends_with(strtolower($path), '.php'));
+            || (str_starts_with($path, 'bootstrap/cache/') && str_ends_with(strtolower($path), '.php'));
     }
 
     /**

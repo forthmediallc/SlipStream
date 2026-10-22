@@ -33,6 +33,7 @@ use Slipstream\Console\Commands\ServersCommand;
 use Slipstream\Console\Commands\SettingsCommand;
 use Slipstream\Console\Commands\StatusCommand;
 use Slipstream\Console\Commands\VerifyCommand;
+use Slipstream\Console\Commands\ViewsCommand;
 use Slipstream\Console\Commands\WebhookRangesCommand;
 use Slipstream\Console\Commands\WebhookSecretCommand;
 use Slipstream\Http\Middleware\AuthorizeSlipstream;
@@ -46,6 +47,7 @@ use Slipstream\Livewire\ServersPage;
 use Slipstream\Livewire\SettingsPage;
 use Slipstream\Livewire\WebhookPage;
 use Slipstream\Release\ArtifactSource;
+use Slipstream\Release\Core\Baseline;
 use Slipstream\Release\GitRefSource;
 use Slipstream\Release\ReleaseSource;
 use Slipstream\Settings\SettingsRepository;
@@ -66,6 +68,28 @@ class SlipstreamServiceProvider extends ServiceProvider
         $this->app->bindIf(ReleaseSource::class, fn ($app) => Slipstream::artifactMode()
             ? $app->make(ArtifactSource::class)
             : $app->make(GitRefSource::class));
+
+        // Before any provider boots, so before anything has compiled a view.
+        $this->app->booting(fn () => $this->compileViewsIntoTheRelease());
+    }
+
+    /**
+     * In artifact mode views compile into the release, beside the caches the
+     * deploy records, so both verifiers see them: the shared
+     * storage/framework/views is outside every check. And a compiled view is
+     * not compiled again because its source looks as new as it is: a
+     * release's files never change, and a compile is not byte-for-byte
+     * repeatable (@once), so it would read as drift.
+     */
+    protected function compileViewsIntoTheRelease(): void
+    {
+        if (! Slipstream::artifactMode()) {
+            return;
+        }
+
+        $config = $this->app['config'];
+        $config->set('view.compiled', $this->app->basePath(Baseline::VIEWS));
+        $config->set('view.check_cache_timestamps', false);
     }
 
     public function boot(): void
@@ -139,6 +163,7 @@ class SlipstreamServiceProvider extends ServiceProvider
             WebhookRangesCommand::class,
             ArtifactCommand::class,
             VerifyCommand::class,
+            ViewsCommand::class,
         ]);
     }
 

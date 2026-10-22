@@ -422,6 +422,137 @@ class ReleaseStubTest extends TestCase
     }
 
     /**
+     * A misspelt option, or one newer than the installed copy, would be
+     * ignored and quietly weaken the check it was meant to set.
+     */
+    public function test_an_option_the_command_does_not_take_exits_2(): void
+    {
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/nine');
+        $arguments = ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production'];
+
+        $process = $this->tool('verify-tree', $arguments + ['--statedir' => $this->fixture->root.'/state']);
+        $this->assertSame(2, $process->getExitCode());
+        $this->assertStringContainsString('verify-tree takes no --statedir', $process->getErrorOutput());
+        $this->assertDirectoryDoesNotExist($this->fixture->root.'/state');
+
+        $process = $this->tool('publish', $this->built() + ['--sha' => $this->fixture->sha, '--app-root' => '/srv']);
+        $this->assertSame(2, $process->getExitCode());
+        $this->assertStringContainsString('publish takes no --app-root', $process->getErrorOutput());
+
+        $this->assertSame(0, $this->tool('verify-tree', $arguments + ['--json' => true])->getExitCode(), 'its own options pass');
+    }
+
+    /**
+     * The app root comes from the path the timer names, never through a
+     * link the deploy user can re-aim, and the release must be one of its
+     * releases.
+     */
+    public function test_verify_tree_takes_the_app_root_only_from_the_path_it_is_given(): void
+    {
+        $outside = $this->fixture->unpackInto($this->fixture->root.'/copy');
+        $arguments = ['--keys' => $this->keys(), '--environment' => 'production'];
+
+        $process = $this->tool('verify-tree', $arguments + ['--release' => $outside]);
+        $this->assertSame(2, $process->getExitCode());
+        $this->assertStringContainsString('cannot tell the app root', $process->getErrorOutput());
+
+        $process = $this->tool('verify-tree', $arguments + ['--release' => $outside, '--app-root' => $this->fixture->appRoot, '--json' => true]);
+        $this->assertSame(1, $process->getExitCode());
+        $line = json_decode(trim($process->getOutput()), true);
+        $this->assertSame('the release is not one of '.str_replace('\\', '/', $this->fixture->appRoot).'/releases/', $line['reason']);
+    }
+
+    public function test_verify_tree_holds_a_current_aimed_outside_the_app_roots_releases_as_drift(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('needs symlinks (run under WSL).');
+        }
+
+        $root = $this->fixture->appRoot;
+        $release = $this->fixture->unpackInto($root.'/releases/ten');
+        symlink($release, $root.'/current');
+        $arguments = ['--release' => $root.'/current', '--keys' => $this->keys(), '--environment' => 'production'];
+        $this->assertSame(0, $this->tool('verify-tree', $arguments)->getExitCode(), 'the app root is current\'s own directory');
+
+        // current re-aimed at a copy elsewhere, even one under a releases/
+        // directory of its own: the app root stays where current is.
+        $copy = $this->fixture->unpackInto($this->fixture->root.'/x/releases/ten');
+        unlink($root.'/current');
+        symlink($copy, $root.'/current');
+        $process = $this->tool('verify-tree', $arguments);
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('the release is not one of '.$root.'/releases/', $process->getOutput());
+    }
+
+    /**
+     * A pin is keyed by where the release is, so moving one makes the next
+     * run a first look. Only a deploy should cause one, and every line says
+     * whether it was.
+     */
+    public function test_verify_tree_says_when_a_run_is_its_first_look_at_a_release(): void
+    {
+        $releases = $this->fixture->appRoot.'/releases';
+        $release = $this->fixture->unpackInto($releases.'/eleven');
+        $tree = fn (string $at, array $extra = []) => json_decode(trim($this->tool('verify-tree', $extra + ['--release' => $at, '--keys' => $this->keys(), '--environment' => 'production', '--json' => true])->getOutput()), true);
+        $state = ['--state-dir' => $this->fixture->root.'/state'];
+
+        $this->assertNull($tree($release)['first_look'], 'nothing is pinned without a state directory');
+        $this->assertTrue($tree($release, $state)['first_look']);
+        $this->assertFalse($tree($release, $state)['first_look']);
+
+        // The deploy user moves the release; the next run pins it afresh.
+        rename($release, $releases.'/twelve');
+        $line = $tree($releases.'/twelve', $state);
+        $this->assertTrue($line['first_look']);
+        $this->assertSame('artifact.verify_ok', $line['event']);
+    }
+
+    public function test_verify_tree_checks_the_compiled_views_the_deploy_recorded(): void
+    {
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/thirteen');
+        @mkdir($release.'/bootstrap/cache/views', 0777, true);
+        file_put_contents($release.'/bootstrap/cache/views/0a1b.php', '<form><?php echo e($title); ?></form>');
+        file_put_contents($release.'/.slipstream/generated.json', Baseline::toJson(Baseline::record($release)));
+        $tree = fn () => $this->tool('verify-tree', ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production', '--state-dir' => $this->fixture->root.'/state']);
+        $this->assertSame(0, $tree()->getExitCode());
+
+        file_put_contents($release.'/bootstrap/cache/views/0a1b.php', '<form><?php echo e($title); ?></form><script src="https://skim.example/x.js"></script>');
+        file_put_contents($release.'/bootstrap/cache/views/ffff.php', '<?php system($_GET["c"]);');
+        $process = $tree();
+        $this->assertSame(1, $process->getExitCode());
+        $this->assertStringContainsString('bootstrap/cache/views/0a1b.php, bootstrap/cache/views/ffff.php', $process->getOutput());
+    }
+
+    /**
+     * Records and pins from before 0.6.4 covered the top of bootstrap/cache
+     * only: the first release a 0.6.3 deploy puts in place compiles its
+     * views where neither looked.
+     */
+    public function test_verify_tree_compares_an_older_record_or_pin_over_what_it_covered(): void
+    {
+        $release = $this->fixture->unpackInto($this->fixture->appRoot.'/releases/fourteen');
+        @mkdir($release.'/bootstrap/cache/views', 0777, true);
+        file_put_contents($release.'/bootstrap/cache/config.php', '<?php return [];');
+        file_put_contents($release.'/.slipstream/generated.json', (string) json_encode(['format' => 1, 'files' => Baseline::record($release, 1)]));
+        $state = $this->fixture->root.'/state';
+        mkdir($state);
+        // The pin 0.6.3 wrote on its first look: no format in it.
+        file_put_contents($state.'/'.sha1(str_replace('\\', '/', (string) realpath($release))).'.json', (string) json_encode([
+            'release' => str_replace('\\', '/', (string) realpath($release)), 'manifest_sha256' => hash_file('sha256', $release.'/.slipstream/manifest.json'),
+            'generated' => Baseline::record($release, 1), 'pinned_at' => '2026-10-20T00:00:00+00:00',
+        ]));
+        file_put_contents($release.'/bootstrap/cache/views/0a1b.php', '<form></form>');
+        $tree = fn () => $this->tool('verify-tree', ['--release' => $release, '--keys' => $this->keys(), '--environment' => 'production', '--state-dir' => $state, '--json' => true]);
+
+        $line = json_decode(trim($tree()->getOutput()), true);
+        $this->assertSame('artifact.verify_ok', $line['event'], (string) json_encode($line));
+        $this->assertFalse($line['first_look']);
+
+        file_put_contents($release.'/bootstrap/cache/config.php', '<?php system($_GET["c"]); return [];');
+        $this->assertSame(['bootstrap/cache/config.php'], json_decode(trim($tree()->getOutput()), true)['generated']);
+    }
+
+    /**
      * An `aws` that keeps objects in a directory and honours the two
      * conditional headers the tool sends; force-conflict makes the next
      * pointer write lose a race.

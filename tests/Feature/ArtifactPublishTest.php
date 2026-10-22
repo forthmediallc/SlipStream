@@ -219,6 +219,7 @@ class ArtifactPublishTest extends TestCase
             // What the node writes itself: shipped, it is overwritten and then
             // reported as modified forever.
             [['app/Hello.php' => '<?php', 'bootstrap/cache/config.php' => '<?php return [];'], 'bootstrap/cache/config.php is written by the node itself'],
+            [['app/Hello.php' => '<?php', 'bootstrap/cache/views/0a1b.php' => '<form></form>'], 'bootstrap/cache/views/0a1b.php is written by the node itself'],
             [['app/Hello.php' => '<?php', 'RELEASE_SHA' => 'x'], 'RELEASE_SHA is written by the node itself'],
             [['app/Hello.php' => '<?php', '.slipstream/manifest.json' => '{}'], '.slipstream/manifest.json is written by the node itself'],
         ] as [$files, $reason]) {
@@ -229,6 +230,9 @@ class ArtifactPublishTest extends TestCase
                 $this->fail("published an archive that must be refused: {$reason}");
             } catch (RuntimeException $e) {
                 $this->assertStringContainsString($reason, $e->getMessage());
+                // --allow lets a never-ship name or key material through, and
+                // nothing the node writes.
+                $this->assertSame(! str_contains($reason, 'written by the node itself'), str_contains($e->getMessage(), '--allow'), "the --allow hint for: {$reason}");
             }
         }
 
@@ -261,6 +265,7 @@ class ArtifactPublishTest extends TestCase
             $this->fail('signed an archive every node would refuse');
         } catch (RuntimeException $e) {
             $this->assertStringContainsString('app/plugins/ is a directory no file is in', $e->getMessage());
+            $this->assertStringNotContainsString('--allow', $e->getMessage(), 'no --allow can excuse a directory');
         }
         $this->assertSame([], Storage::disk('artifacts')->allFiles(), 'the commit\'s slot is still free');
     }

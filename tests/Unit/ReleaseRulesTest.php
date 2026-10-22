@@ -46,7 +46,7 @@ class ReleaseRulesTest extends TestCase
 
     public function test_what_the_node_writes_itself_is_named(): void
     {
-        foreach (['RELEASE_SHA', '.slipstream', '.slipstream/manifest.json', 'bootstrap/cache/config.php', 'bootstrap/cache/routes-v7.php'] as $path) {
+        foreach (['RELEASE_SHA', '.slipstream', '.slipstream/manifest.json', 'bootstrap/cache/config.php', 'bootstrap/cache/routes-v7.php', 'bootstrap/cache/views/0a1b.php'] as $path) {
             $this->assertTrue(ReleaseRules::nodeWritten($path), $path);
         }
         foreach (['bootstrap/cache/.gitignore', 'bootstrap/app.php', 'app/RELEASE_SHA'] as $path) {

@@ -109,22 +109,23 @@ class ReleaseVerifier
         $result['unlisted'] = $tree['unlisted'];
         $result['links'] = $tree['links'];
 
-        // The caches the node generated, against the hashes the deploy
-        // recorded just before the swap. The record sits in the release, as
-        // writable as the caches; the deployment row keeps its hash, so a
-        // record deleted or rewritten after the deploy shows up too.
+        // The caches and compiled views the node generated, against the
+        // hashes the deploy recorded just before the swap. The record sits in
+        // the release, as writable as the caches; the deployment row keeps
+        // its hash, so a record deleted or rewritten after the deploy shows
+        // up too.
         $baselineFile = $sidecar.DIRECTORY_SEPARATOR.Baseline::FILE;
         $recordedHash = $this->recordedBaselineHash($release, $manifest->sha);
         if (is_file($baselineFile)) {
             $contents = (string) file_get_contents($baselineFile);
-            $baseline = Baseline::fromJson($contents);
+            $baseline = Baseline::parse($contents);
             $result['baseline'] = true;
             if ($recordedHash !== null && hash('sha256', $contents) !== $recordedHash) {
                 $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes were rewritten after the deploy)';
             }
             $result['generated'] = array_values(array_unique(array_merge(
                 $result['generated'],
-                $baseline === null ? [Baseline::DIRECTORY.' (the recorded hashes are unreadable)'] : Baseline::compare($release, $baseline),
+                $baseline === null ? [Baseline::DIRECTORY.' (the recorded hashes are unreadable)'] : Baseline::compare($release, $baseline['files'], $baseline['format']),
             )));
         } elseif ($recordedHash !== null) {
             $result['generated'][] = Baseline::DIRECTORY.' (the hashes recorded at deploy are gone)';
@@ -197,7 +198,9 @@ class ReleaseVerifier
     /**
      * The links `storage:link` makes and exactly where each leads, relative
      * to the app root: public/storage to storage/app/public, and whatever
-     * filesystems.links adds (a target outside storage is not checked).
+     * filesystems.links adds into storage. A filesystems.links entry whose
+     * target is outside storage is left out, so a link there is drift: what
+     * lies outside storage ships in the release itself.
      *
      * @return array<string, string>
      */

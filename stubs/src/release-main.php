@@ -34,12 +34,14 @@ slipstream-release.php — artifact releases without the framework
 
   verify-tree     --release=<dir> --keys=… --environment=… --state-dir=<dir> [--app-root=<dir>]
                   [--shared=path[=shared/path],…] [--links=path=target,…] [--json]
-                  The live release against its signed manifest and the cache hashes recorded at
-                  deploy, from outside it: run it as root from a copy the deploy user cannot
-                  write, with keys from a root-owned file, and with --state-dir, which pins
-                  what it first saw (without it the in-tree record is only as safe as the tree).
-                  Every link the deploy makes must lead exactly where it points them under the
-                  app root (default: the directory holding releases/): storage, the .env,
+                  The live release against its signed manifest and the hashes of the caches and
+                  compiled views recorded at deploy, from outside it: run it as root from a copy
+                  the deploy user cannot write, with keys from a root-owned file, and with
+                  --state-dir, which pins each release the first time it sees it (first_look in
+                  the output: alarm on one no deploy explains). The app root holds current and
+                  releases/; it comes from --release as given (…/current, …/releases/<dir>) or
+                  --app-root, and the release must be one of its releases/. Every link the
+                  deploy makes must lead exactly where it points it: storage, the .env,
                   auth.json, the shared paths given a target, public/storage to
                   storage/app/public, and each --links pair. Exit 0 clean, 1 drift, 2 usage.
 
@@ -53,8 +55,22 @@ slipstream-release.php — artifact releases without the framework
   rollback        --sha=… --ref=… --environment=… --keys=… --key=… [--key-id=…] --store=… [--by=…]
                   Points the ref at a release already in the store.
 
-Exit 0 on success, 1 on a refusal, drift or error (the reason on stderr), 2 on usage.
+Exit 0 on success, 1 on a refusal, drift or error (the reason on stderr), 2 on usage,
+including an option the command does not take.
 TXT;
+
+/**
+ * The options each command takes. Anything else is refused: a misspelt one
+ * (--statedir=), or one newer than this copy of the tool, would otherwise be
+ * ignored and quietly weaken the check it was meant to set.
+ */
+const SLIPSTREAM_RELEASE_OPTIONS = [
+    'verify-pointer' => ['ref', 'environment', 'keys', 'pointer', 'min-sequence'],
+    'verify-release' => ['sha', 'ref', 'environment', 'keys', 'manifest', 'signature', 'archive', 'extract-to', 'manifest-sha256', 'max-unpacked-bytes', 'max-entries'],
+    'verify-tree' => ['release', 'keys', 'environment', 'state-dir', 'app-root', 'shared', 'links', 'json'],
+    'publish' => ['archive', 'manifest', 'ref', 'environment', 'sha', 'keys', 'key', 'key-id', 'store', 'by', 'generated', 'allow', 'max-unpacked-bytes', 'max-entries'],
+    'rollback' => ['sha', 'ref', 'environment', 'keys', 'key', 'key-id', 'store', 'by'],
+];
 
 /**
  * @return array<string, string|true>
@@ -403,28 +419,38 @@ function slipstream_release_point(array $options, string $sha, string $manifestS
 }
 
 /**
- * The live release against its signed manifest, and the caches the node
- * generated against the hashes the deploy recorded. With a state directory,
- * each release's manifest and recorded hashes are pinned the first time it
- * is seen, so rewriting the copies inside the tree is caught too.
+ * The live release against its signed manifest, and what the node generated
+ * (caches, compiled views) against the hashes the deploy recorded. With a
+ * state directory, each release's manifest and recorded hashes are pinned
+ * the first time it is seen, so rewriting the copies inside the tree is
+ * caught too; first_look says when a run is that first time, which only a
+ * deploy should cause.
  *
+ * @param  string  $release  the release's real path
  * @param  array<string, string|null>  $shared  release path => shared path under the app root (null: not checked)
  * @param  array<string, string>  $storageLinks  release path => target under the app root
  * @return array<string, mixed>
  */
-function slipstream_release_verify_tree(string $release, Keys $keys, string $environment, array $shared, ?string $stateDir, array $storageLinks = Manifest::STORAGE_LINKS, ?string $appRoot = null): array
+function slipstream_release_verify_tree(string $release, string $appRoot, Keys $keys, string $environment, array $shared, ?string $stateDir, array $storageLinks = Manifest::STORAGE_LINKS): array
 {
     $result = [
         'release' => $release, 'sha' => null, 'ok' => false, 'reason' => null, 'files' => 0,
         'modified' => [], 'missing' => [], 'unlisted' => [], 'links' => [], 'generated' => [], 'baseline' => 'none',
-        'app_root' => $appRoot, 'pinned' => $stateDir !== null,
+        'app_root' => $appRoot, 'pinned' => $stateDir !== null, 'first_look' => null,
     ];
     $sidecar = $release.'/.slipstream';
+
+    // Only one of the app root's own releases can be the live release,
+    // wherever current leads: a copy elsewhere brings links of its choosing.
+    $releases = realpath($appRoot.'/releases');
+    $placement = $releases !== false && dirname($release) === str_replace('\\', '/', $releases)
+        ? null
+        : "the release is not one of {$appRoot}/releases/";
 
     $json = @file_get_contents($sidecar.'/manifest.json');
     $signature = @file_get_contents($sidecar.'/manifest.sig');
     if ($json === false || $signature === false) {
-        $result['reason'] = 'no signed manifest in .slipstream/';
+        $result['reason'] = $placement ?? 'no signed manifest in .slipstream/';
 
         return $result;
     }
@@ -434,7 +460,7 @@ function slipstream_release_verify_tree(string $release, Keys $keys, string $env
         $verified = Envelope::verify($signature, Envelope::DOMAIN_MANIFEST, $keys);
         $statement = Statement::fromPayload($verified['payload'], $verified['key_id']);
     } catch (\Throwable $e) {
-        $result['reason'] = 'the manifest does not verify: '.$e->getMessage();
+        $result['reason'] = $placement ?? 'the manifest does not verify: '.$e->getMessage();
 
         return $result;
     }
@@ -449,32 +475,27 @@ function slipstream_release_verify_tree(string $release, Keys $keys, string $env
         $releaseSha !== $manifest->sha => 'RELEASE_SHA is not the manifest\'s commit',
         default => null,
     };
+    $result['reason'] = $placement ?? $result['reason'];
 
     // Every link the deploy makes leads exactly where it points it, under
-    // the app root; without one, only the storage links can be checked (they
-    // resolve through the release's own storage link).
-    if ($appRoot !== null) {
-        $linked = ['storage', ...array_keys($shared)];
-        $targets = Manifest::linkTargets($appRoot, $storageLinks, $shared);
-    } else {
-        $linked = [...Manifest::NODE_LINKED, ...array_keys($shared)];
-        $targets = [];
-        foreach ($storageLinks as $path => $target) {
-            $targets[$path] = $release.'/'.trim($target, '/');
-        }
-    }
+    // the app root.
+    $linked = ['storage', ...array_keys($shared)];
+    $targets = Manifest::linkTargets($appRoot, $storageLinks, $shared);
     $tree = $manifest->verifyTree($release, $linked, array_merge(Manifest::NODE_WRITTEN, $manifest->generated), $targets);
     foreach (['modified', 'missing', 'unlisted', 'links'] as $kind) {
         $result[$kind] = $tree[$kind];
     }
 
     // Every deploy since 0.6.1 records the caches' hashes before the swap,
-    // so a release without the record has lost it.
-    $recorded = is_file($sidecar.'/'.Baseline::FILE) ? Baseline::fromJson((string) file_get_contents($sidecar.'/'.Baseline::FILE)) : null;
+    // so a release without the record has lost it. Each record is compared
+    // over the scope of its format (compiled views from format 2 on).
+    $parsed = is_file($sidecar.'/'.Baseline::FILE) ? Baseline::parse((string) file_get_contents($sidecar.'/'.Baseline::FILE)) : null;
+    $recorded = $parsed['files'] ?? null;
+    $format = $parsed['format'] ?? Baseline::FORMAT;
     if (! is_file($sidecar.'/'.Baseline::FILE)) {
         $result['generated'][] = Baseline::DIRECTORY.' (no hashes recorded: .slipstream/'.Baseline::FILE.' is missing; a release deployed by 0.6.1 or later always has one)';
     } elseif ($recorded === null) {
-        $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes are unreadable)';
+        $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes are unreadable; a record newer than this copy of the tool reads so too)';
     }
     $baseline = $recorded;
     $result['baseline'] = $recorded !== null ? 'recorded' : 'none';
@@ -490,12 +511,17 @@ function slipstream_release_verify_tree(string $release, Keys $keys, string $env
             }
         }
 
+        // Keyed by where the release is: moving or copying one makes the
+        // next run a first look, which pins whatever is there then. Only a
+        // deploy should cause one, so the output says when a run is it.
         $pinFile = rtrim($stateDir, '/').'/'.sha1($release).'.json';
         $pin = is_file($pinFile) ? json_decode((string) file_get_contents($pinFile), true) : null;
         if (! is_array($pin)) {
-            file_put_contents($pinFile, json_encode(['release' => $release, 'manifest_sha256' => hash('sha256', $json), 'generated' => $recorded, 'pinned_at' => gmdate('c')], JSON_UNESCAPED_SLASHES));
+            file_put_contents($pinFile, json_encode(['release' => $release, 'manifest_sha256' => hash('sha256', $json), 'generated' => $recorded, 'format' => $format, 'pinned_at' => gmdate('c')], JSON_UNESCAPED_SLASHES));
             @chmod($pinFile, 0600);
+            $result['first_look'] = true;
         } else {
+            $result['first_look'] = false;
             if (($pin['manifest_sha256'] ?? null) !== hash('sha256', $json)) {
                 $result['reason'] ??= 'the release carries another manifest than when it was first checked';
             }
@@ -503,12 +529,13 @@ function slipstream_release_verify_tree(string $release, Keys $keys, string $env
                 $result['generated'][] = Baseline::DIRECTORY.' (the recorded hashes changed since the release was first checked)';
             }
             $baseline = is_array($pin['generated'] ?? null) ? $pin['generated'] : null;
+            $format = is_int($pin['format'] ?? null) ? $pin['format'] : 1; // pins before 0.6.4 hold format 1 records
         }
         $result['baseline'] = $baseline !== null ? 'pinned' : 'none';
     }
 
     if ($baseline !== null) {
-        $result['generated'] = array_values(array_unique(array_merge($result['generated'], Baseline::compare($release, $baseline))));
+        $result['generated'] = array_values(array_unique(array_merge($result['generated'], Baseline::compare($release, $baseline, $format))));
     }
 
     $result['ok'] = $result['reason'] === null
@@ -524,6 +551,11 @@ if ($command === null || in_array($command, ['-h', '--help', 'help'], true)) {
     exit($command === null ? 2 : 0);
 }
 $options = slipstream_release_options(array_slice($argv, 2));
+foreach (array_keys($options) as $name) {
+    if (isset(SLIPSTREAM_RELEASE_OPTIONS[$command]) && ! in_array($name, SLIPSTREAM_RELEASE_OPTIONS[$command], true)) {
+        slipstream_release_fail("{$command} takes no --{$name}: a misspelling, or an option newer than this copy of the tool", 2);
+    }
+}
 
 try {
     switch ($command) {
@@ -630,16 +662,21 @@ try {
             break;
 
         case 'verify-tree':
-            $release = slipstream_release_need($options, 'release');
+            $release = rtrim(str_replace('\\', '/', slipstream_release_need($options, 'release')), '/');
             $real = realpath($release);
             if ($real === false || ! is_dir($real)) {
                 slipstream_release_fail("no release at {$release}");
             }
             $real = str_replace('\\', '/', $real);
-            $appRoot = slipstream_release_option($options, 'app-root');
-            if ($appRoot === null && basename(dirname($real)) === 'releases') {
-                $appRoot = dirname($real, 2);
-            }
+            // The app root comes from the path the timer names, never through
+            // a link the deploy user can re-aim: <root>/current, or
+            // <root>/releases/<dir>. Without either, it must be given.
+            $appRoot = slipstream_release_option($options, 'app-root') ?? match (true) {
+                basename($release) === 'current' => dirname($release),
+                basename(dirname($release)) === 'releases' => dirname($release, 2),
+                default => slipstream_release_fail("cannot tell the app root from {$release}: pass --app-root, the directory that holds current and releases/", 2),
+            };
+            $appRoot = rtrim(str_replace('\\', '/', $appRoot), '/');
             // path[=target] pairs: the path in the release, the target under
             // the app root. A --links path needs its target (public/storage
             // has a default); a --shared path without one may link anywhere.
@@ -666,18 +703,15 @@ try {
             if ($stateDir === null) {
                 fwrite(STDERR, "slipstream-release: without --state-dir the cache record inside the release is only as safe as the release; for the 11.5.2 check pin it, e.g. --state-dir=/var/lib/slipstream-verify\n");
             }
-            if ($appRoot === null) {
-                fwrite(STDERR, "slipstream-release: no app root (pass --app-root): where storage, the .env, auth.json and the shared paths link to is not checked\n");
-            }
 
             $result = slipstream_release_verify_tree(
                 $real,
+                $appRoot,
                 Keys::parse(slipstream_release_need($options, 'keys')),
                 slipstream_release_need($options, 'environment'),
                 $shared,
                 $stateDir,
                 $storageLinks,
-                $appRoot,
             );
 
             if (isset($options['json'])) {
@@ -688,7 +722,8 @@ try {
                 }
                 slipstream_release_say((string) json_encode($line, JSON_UNESCAPED_SLASHES));
             } elseif ($result['ok']) {
-                slipstream_release_say("ok: {$result['release']} ({$result['sha']}) matches its signed manifest: {$result['files']} files; generated caches ".($result['baseline'] === 'none' ? 'not recorded' : 'match the '.$result['baseline'].' hashes'));
+                slipstream_release_say("ok: {$result['release']} ({$result['sha']}) matches its signed manifest: {$result['files']} files; generated caches ".($result['baseline'] === 'none' ? 'not recorded' : 'match the '.$result['baseline'].' hashes')
+                    .($result['first_look'] === true ? '; first look at this release, pinned now' : ''));
             } else {
                 slipstream_release_say("DRIFT: {$result['release']}".($result['sha'] ? " ({$result['sha']})" : '').($result['reason'] ? ": {$result['reason']}" : ''));
                 foreach (['modified' => 'modified', 'missing' => 'missing', 'unlisted' => 'not in the manifest', 'links' => 'symlinks', 'generated' => 'generated since the deploy'] as $kind => $label) {

@@ -12,9 +12,10 @@ use Slipstream\Support\AuditLog;
 /**
  * The highest pointer a node has accepted for a ref, so an older pointer put
  * back in the store is refused, and so is another release under the same
- * sequence. The mark is that signed pointer itself, kept twice — in the
- * node's own Slipstream database, and in the shared store so a fresh node
- * inherits the fleet's — and verified every time it is read: only a pointer
+ * sequence. The mark is that signed pointer itself, kept twice — in
+ * Slipstream's database (the node's own, or shared with the fleet when its
+ * tables are), and in the shared store so a fresh node inherits the
+ * fleet's — and verified every time it is read: only a pointer
  * the release key signed, for this ref and environment, can raise it. A
  * value written to either place by hand counts for nothing, so no write to
  * the shared store can stop the fleet deploying.
@@ -133,10 +134,11 @@ class ArtifactSequence
      * A stored mark, verified: the sequence and manifest of the signed
      * pointer it holds, or nothing. Anything else is ignored and audited
      * once per value — with one exception: a bare number 0.6.0 or 0.6.1
-     * recorded in the node's own database, already in the past, is a floor
+     * recorded in Slipstream's database, already in the past, is a floor
      * until the next accepted pointer replaces it, so upgrading does not open
-     * a window for an older pointer. (The shared store's copy is not: any
-     * fleet member can write it.)
+     * a window for an older pointer. (The shared store's copy is not: anyone
+     * who can write the cache can put a number there, and a cache write never
+     * reaches the database.)
      *
      * @param  \Closure(): mixed  $read
      * @return array{sequence: int, manifest: ?string, signed: bool}

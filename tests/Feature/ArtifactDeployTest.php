@@ -195,6 +195,49 @@ PHP)->package(str_repeat('f', 40)); // a new commit: a published release is neve
         $this->assertSame(['bootstrap/cache/config.php'], app(ReleaseVerifier::class)->verify($live)['generated']);
     }
 
+    public function test_every_view_is_compiled_into_the_release_before_the_record(): void
+    {
+        config()->set('slipstream.audit.enabled', true);
+        \Illuminate\Support\Facades\Log::spy();
+        // A release whose Slipstream has slipstream:views.
+        $this->fixture->writeCheckout(['vendor/slipstream/slipstream/src/Console/Commands/ViewsCommand.php' => "<?php\n"])->package(str_repeat('f', 40));
+        $this->fixture->publish();
+
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $this->recorded()]);
+        $deployer->runner->during = function (string $command) use ($deployer): void {
+            if (str_contains($command, 'artisan slipstream:views')) {
+                // What the command leaves: the views, compiled in the release.
+                $release = (string) end($deployer->runner->commands)['cwd'];
+                @mkdir($release.'/bootstrap/cache/views', 0777, true);
+                file_put_contents($release.'/bootstrap/cache/views/0a1b.php', '<form><?php echo e($title); ?></form>');
+            }
+        };
+        $deployer->run();
+
+        $live = realpath($this->fixture->appRoot.'/current');
+        $this->assertCount(1, array_filter($deployer->commands(), fn (string $command) => str_contains($command, 'artisan slipstream:views')));
+        $record = \Slipstream\Release\Core\Baseline::parse((string) file_get_contents($live.'/.slipstream/generated.json'));
+        $this->assertSame(2, $record['format']);
+        $this->assertArrayHasKey('bootstrap/cache/views/0a1b.php', $record['files'], 'compiled before the record was taken');
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')->with('slipstream.artifact.baseline', \Mockery::on(
+            fn (array $c) => $c['views'] === 1 && $c['record_sha256'] === hash_file('sha256', $live.'/.slipstream/generated.json'),
+        ))->once();
+        $this->assertTrue(app(ReleaseVerifier::class)->verify($live)['ok']);
+
+        // The payment frame's compiled view, edited after the swap.
+        file_put_contents($live.'/bootstrap/cache/views/0a1b.php', '<form><?php echo e($title); ?></form><script src="https://skim.example/x.js"></script>');
+        $this->assertSame(['bootstrap/cache/views/0a1b.php'], app(ReleaseVerifier::class)->verify($live)['generated']);
+    }
+
+    public function test_a_release_whose_slipstream_predates_the_views_command_deploys_without_it(): void
+    {
+        [$deployer, $deployment] = $this->deployer($this->fixture->sha, ['poll_ref' => 'branch:production', 'pointer' => $this->recorded()]);
+        $deployer->run();
+
+        $this->assertSame(Deployment::STATUS_DEPLOYED, $deployment->refresh()->status);
+        $this->assertSame([], array_values(array_filter($deployer->commands(), fn (string $command) => str_contains($command, 'slipstream:views'))));
+    }
+
     public function test_a_download_left_behind_by_a_killed_deploy_is_pruned(): void
     {
         $stale = $this->fixture->appRoot.'/releases/.incoming-20260101_000000_ddddddd.tar.gz';

@@ -70,6 +70,9 @@ final class ReleaseBuilder
                 }
             }
             $problems = $inspection['problems'];
+            // Only a never-ship name or key material can be let through on
+            // purpose; what the node writes, and an empty directory, cannot.
+            $allowable = array_filter($problems, fn (string $problem): bool => ! str_ends_with($problem, 'is written by the node itself'));
             // Nodes refuse a directory no listed file is in; signed, the
             // commit's write-once slot would be spent on a release no node takes.
             foreach (self::directoriesWithoutFiles($root, array_map('strval', array_keys($files))) as $directory) {
@@ -78,7 +81,7 @@ final class ReleaseBuilder
             if ($problems !== []) {
                 throw new \RuntimeException('Refusing to publish: '.implode('; ', array_slice($problems, 0, 10))
                     .(count($problems) > 10 ? '; and '.(count($problems) - 10).' more' : '')
-                    .'. Leave them out of the build (or name a path that may carry a key with --allow).');
+                    .'. Leave them out of the build'.($allowable !== [] ? ' (or name a path that must ship anyway with --allow)' : '').'.');
             }
         };
     }
