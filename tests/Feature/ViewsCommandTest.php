@@ -3,6 +3,7 @@
 namespace Slipstream\Tests\Feature;
 
 use Illuminate\Foundation\Configuration\ApplicationBuilder;
+use Illuminate\Foundation\Http\HealthCheck;
 use Illuminate\Support\Facades\View;
 use Orchestra\Testbench\Attributes\DefineEnvironment;
 use Slipstream\Tests\TestCase;
@@ -24,6 +25,22 @@ class ViewsCommandTest extends TestCase
         $this->root = sys_get_temp_dir().DIRECTORY_SEPARATOR.'ss-views-'.bin2hex(random_bytes(4));
         mkdir($this->root.DIRECTORY_SEPARATOR.'compiled', 0777, true);
         $app['config']->set('view.compiled', $this->root.DIRECTORY_SEPARATOR.'compiled');
+    }
+
+    /**
+     * The health route as ApplicationBuilder::withRouting(health: '/up')
+     * registers it: through Foundation\Http\HealthCheck from Laravel 13.38,
+     * through a closure in ApplicationBuilder before that.
+     */
+    protected function defineRoutes($router): void
+    {
+        if (class_exists(HealthCheck::class)) {
+            $router->get('up', HealthCheck::class);
+
+            return;
+        }
+
+        $router->get('up', fn () => response(View::file(dirname((string) (new \ReflectionClass(ApplicationBuilder::class))->getFileName()).'/../resources/health-up.blade.php', ['exception' => null])));
     }
 
     protected function artifactMode($app): void
@@ -62,6 +79,22 @@ class ViewsCommandTest extends TestCase
         view('vault::emails.receipt', ['total' => '1.00'])->render();
         view('errors::404')->render();
         View::file(dirname((string) (new \ReflectionClass(ApplicationBuilder::class))->getFileName()).'/../resources/health-up.blade.php', ['exception' => null])->render();
+
+        $this->assertSame($before, $this->compiled(), 'a view compiled after the record reads as drift');
+        $this->artisan('slipstream:views')->expectsOutputToContain('Compiled 0 view(s)')->assertExitCode(0);
+    }
+
+    public function test_serving_the_health_page_compiles_nothing_after_it_has_run(): void
+    {
+        // Load balancers poll /up from the moment a node is in service, so the
+        // page it renders must already be compiled by the path it renders from
+        // (Laravel 13.38 moved that path into Foundation/Http).
+        $this->artisan('slipstream:views')->assertExitCode(0);
+        $before = $this->compiled();
+        $this->assertNotSame([], $before);
+
+        $this->get('/up')->assertOk();
+        $this->get('/up')->assertOk();
 
         $this->assertSame($before, $this->compiled(), 'a view compiled after the record reads as drift');
         $this->artisan('slipstream:views')->expectsOutputToContain('Compiled 0 view(s)')->assertExitCode(0);

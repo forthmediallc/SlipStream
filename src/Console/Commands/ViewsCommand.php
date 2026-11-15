@@ -16,7 +16,8 @@ use Symfony\Component\Finder\Finder;
  * while Laravel renders a package view by the path the package registered
  * (often with "/../" in it), and the compiled file is named by a hash of that
  * path. It never sees the error pages either, a namespace Laravel adds only
- * when it renders one, or the /up health page, which renders by file path.
+ * when it renders one, or the /up health page, which renders by file path
+ * (and by a different one since Laravel 13.38).
  */
 class ViewsCommand extends Command
 {
@@ -56,10 +57,19 @@ class ViewsCommand extends Command
             }
         }
 
-        // The health route renders this file by a path with "/../" in it.
-        $health = dirname((string) (new \ReflectionClass(ApplicationBuilder::class))->getFileName()).'/../resources/health-up.blade.php';
-        if (is_file($health)) {
-            $files[] = $health;
+        // The health route renders this file by a path with "/../" in it,
+        // from the directory of the class that serves the route: a closure in
+        // ApplicationBuilder up to Laravel 13.37, Foundation\Http\HealthCheck
+        // from 13.38. The compiled file is named by a hash of the whole path,
+        // so compile it by each of those paths there is.
+        foreach ([ApplicationBuilder::class, 'Illuminate\\Foundation\\Http\\HealthCheck'] as $class) {
+            if (! class_exists($class)) {
+                continue;
+            }
+            $health = dirname((string) (new \ReflectionClass($class))->getFileName()).'/../resources/health-up.blade.php';
+            if (is_file($health)) {
+                $files[] = $health;
+            }
         }
 
         $files = array_values(array_unique($files));
